@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Called by Claude Code hooks — sends in-app toast + web push notification
+PROJECT=$(basename "$PWD")
+MSG="${1:-Claude needs input in $PROJECT}"
+
+# Find the best matching tmux session (longest path match wins)
+SESSION=""
+BEST_LEN=0
+
+while IFS='|' read -r name spath _; do
+  expanded=$(eval echo "$spath")
+  if [[ "$PWD" == "$expanded"* ]]; then
+    len=${#expanded}
+    if (( len > BEST_LEN )); then
+      BEST_LEN=$len
+      SESSION="$name"
+    fi
+  fi
+done < <(grep -v '^\s*#' "${MATRIX_HOME:-$HOME/.matrix}/projects.conf" 2>/dev/null | grep -v '^\s*$')
+
+# Fallback: detect tmux session we're running inside
+if [ -z "$SESSION" ] && [ -n "$TMUX_PANE" ]; then
+  SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+fi
+
+# Fallback to project folder name
+SESSION="${SESSION:-$PROJECT}"
+
+# Suppress notifications from the matrix (home directory) session — that's the control session
+[[ "$SESSION" == "matrix" ]] && exit 0
+
+# Post to server — handles SSE toast + web push
+curl -s -X POST "http://localhost:${MATRIX_PORT:-7778}/api/notify" \
+  -H 'Content-Type: application/json' \
+  -d "{\"message\":\"$MSG\",\"project\":\"$SESSION\",\"session\":\"$SESSION\"}" \
+  >/dev/null 2>&1

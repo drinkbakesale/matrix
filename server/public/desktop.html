@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Matrix — Desktop</title>
+  <link rel="stylesheet" href="desktop.css?v=21">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <h1>MATRIX</h1>
+      </div>
+      <button id="new-project-btn">Start a New Project</button>
+      <div id="project-list"></div>
+    </aside>
+    <main id="main-panel">
+      <div id="empty-state">
+        <div class="empty-icon">⬡</div>
+        <div class="empty-text">Select a project</div>
+      </div>
+      <div id="chat-view" style="display:none">
+        <header id="chat-header">
+          <span id="chat-title"></span>
+          <span id="chat-status"></span>
+        </header>
+        <pre id="terminal"></pre>
+        <div id="chat-input-bar">
+          <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off" autocorrect="off">
+          <button id="chat-send">Send</button>
+        </div>
+      </div>
+      <div id="new-project-view" style="display:none">
+        <header id="new-project-header">
+          <span>New Project</span>
+        </header>
+        <div id="new-project-form">
+          <div class="np-field">
+            <label>Project Name</label>
+            <input type="text" id="np-name" placeholder="my-project" autocomplete="off">
+          </div>
+          <div class="np-field">
+            <label>Project Path</label>
+            <input type="text" id="np-path" placeholder="~/Projects/my-project" autocomplete="off">
+          </div>
+        </div>
+        <div id="chat-input-bar">
+          <input type="text" id="np-prompt" placeholder="What do you want to work on?" autocomplete="off">
+          <button id="np-send">Start</button>
+        </div>
+      </div>
+    </main>
+    <!-- Output panel (disabled for now — re-enable later)
+    <aside id="output-panel" style="display:none">
+      ...
+    </aside>
+    -->
+  </div>
+  <script src="desktop.js?v=23"></script>
+</body>
+</html>

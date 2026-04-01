@@ -1,0 +1,15 @@
+# Matrix Project Path Registry
+# Maps filesystem paths to canonical project names.
+# Used to identify which project a session is working on,
+# even when the session started in ~ and edits files elsewhere.
+#
+# Format: path|project-name
+# Paths are prefix-matched (more specific paths take priority)
+#
+# DO NOT add paths that appear in every session's scrollback
+# (e.g. ~/.claude/hooks) — those would make every session
+# look like the same project.
+#
+# Examples:
+#   ~/Projects/my-app/src|my-app
+#   ~/Desktop/my-tool|my-tool

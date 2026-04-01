@@ -1,0 +1,17 @@
+{
+  "name": "matrix-console",
+  "description": "Multi-session Claude Code manager — monitor, control, and switch between Claude sessions from your browser or phone",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server/server.js",
+    "setup": "node setup/wizard.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "multer": "^2.1.1",
+    "node-pty": "^1.1.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.20.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Start/stop the Matrix web app server
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$(cd "$SCRIPT_DIR/../server" && pwd)"
+MATRIX_HOME="${MATRIX_HOME:-$HOME/.matrix}"
+PID_FILE="${MATRIX_HOME}/matrix.pid"
+LOG_FILE="${MATRIX_HOME}/logs/matrix.log"
+
+mkdir -p "${MATRIX_HOME}/logs"
+
+case "${1:-start}" in
+  start)
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "Already running (PID $(cat "$PID_FILE"))"
+      exit 0
+    fi
+    cd "$APP_DIR" && node server.js >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 1
+    echo "matrix-app started on http://0.0.0.0:${MATRIX_PORT:-7778} (PID $(cat "$PID_FILE"))"
+    # Show ntfy topic from the log if present
+    grep "ntfy topic" "$LOG_FILE" 2>/dev/null | tail -1 || true
+    ;;
+  stop)
+    if [[ -f "$PID_FILE" ]]; then
+      kill "$(cat "$PID_FILE")" 2>/dev/null
+      rm "$PID_FILE"
+      echo "Stopped"
+    else
+      echo "Not running"
+    fi
+    ;;
+  restart)
+    "$0" stop; sleep 1; "$0" start
+    ;;
+  status)
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "Running (PID $(cat "$PID_FILE"))"
+    else
+      echo "Not running"
+    fi
+    ;;
+  *)
+    echo "Usage: matrix-app [start|stop|restart|status]"
+    ;;
+esac

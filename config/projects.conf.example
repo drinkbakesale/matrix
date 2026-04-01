@@ -1,0 +1,16 @@
+# Matrix — Project Configuration
+# Format: name|path|mode|roles|description
+#
+# name:        Session name (unique identifier)
+# path:        Absolute path to project directory (~ expands to $HOME)
+# mode:        server (recommended) or interactive
+# roles:       Comma-separated role names (interactive mode only)
+# description: Short description shown in the Matrix UI
+#
+# Examples:
+#   myproject|~/Projects/myproject|server||Web app for task management
+#   myproject|~/Projects/myproject|interactive|planner,builder,tester|
+#
+# Add projects with: matrix add <name> <path>
+# Set description:   matrix describe <name> <description>
+# Remove with:       matrix remove <name>

@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="CR">
+  <title>Matrix</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="stylesheet" href="style.css?v=38">
+
+</head>
+<body>
+  <!-- Session List View -->
+  <div id="list-view">
+    <header>
+      <h1>Matrix</h1>
+      <div style="display:flex;gap:6px">
+        <button id="add-btn" title="Add project">+</button>
+        <button id="refresh-btn" title="Refresh">↻</button>
+      </div>
+    </header>
+    <div id="push-debug" style="padding:6px 12px;font-size:11px;color:var(--amber);background:var(--surface);margin:8px 8px 0;border-radius:4px;border:1px solid var(--border)"></div>
+    <div id="push-setup" style="display:none;padding:10px 12px;margin:8px 8px 0;background:var(--surface);border:1px solid var(--green);border-radius:4px;text-align:center">
+      <button id="push-enable-btn" style="background:var(--green);color:#000;border:none;padding:10px 20px;border-radius:4px;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px;width:100%">Enable Notifications</button>
+    </div>
+    <div id="sessions"></div>
+  </div>
+
+  <!-- Project Picker Modal -->
+  <div id="picker-modal" style="display:none">
+    <div id="picker-overlay"></div>
+    <div id="picker-sheet">
+      <div id="picker-header">
+        <span>Start Project</span>
+        <button id="picker-close">✕</button>
+      </div>
+      <div id="picker-list"></div>
+    </div>
+  </div>
+
+  <!-- Terminal View -->
+  <div id="term-view" style="display:none">
+    <header id="term-header">
+      <button id="back-btn">←</button>
+      <span id="term-title"></span>
+    </header>
+    <pre id="terminal"></pre>
+    <button id="talk-btn">TALK</button>
+    <div id="quick-actions">
+      <button class="qa-btn" data-input="y&#10;">y</button>
+      <button class="qa-btn" data-input="n&#10;">n</button>
+      <button class="qa-btn" data-input="1&#10;">1</button>
+      <button class="qa-btn" data-input="2&#10;">2</button>
+      <button class="qa-btn" data-input="3&#10;">3</button>
+      <button class="qa-btn" data-key="Enter">enter</button>
+      <button class="qa-btn" data-key="Escape">esc</button>
+    </div>
+    <div id="input-bar">
+      <input type="text" id="text-input" placeholder="Type a message..." autocomplete="off" autocorrect="on" autocapitalize="sentences" enterkeyhint="send">
+      <button id="send-btn" title="Send">↑</button>
+    </div>
+  </div>
+
+  <script src="app.js?v=39"></script>
+</body>
+</html>
