@@ -504,56 +504,39 @@ app.get('/api/sessions', (req, res) => {
       };
     });
 
-    // Deduplicate: only merge a NAMED tmux session (e.g. "rpgclaw", "matrix")
-    // with a NUMBERED session (iTerm2 tab) when they resolve to the same project.
-    // Never merge two numbered sessions — each iTerm2 tab is distinct.
-    const isNumbered = (name) => /^\d+$/.test(name);
+    // Deduplicate: one entry per displayName. When multiple sessions share
+    // the same project name, keep the most recently active one.
+    // Sessions whose displayName is just their number (undetected) stay individual.
+    const groups = new Map(); // displayName (lowercase) → best session
 
-    // Separate named and numbered sessions
-    const namedSessions = sessions.filter(s => !isNumbered(s.name));
-    const numberedSessions = sessions.filter(s => isNumbered(s.name));
-
-    // Build a map of displayName → named session (named sessions are authoritative)
-    const namedByDisplay = new Map();
-    for (const s of namedSessions) {
-      namedByDisplay.set(s.displayName.toLowerCase(), s);
-    }
-
-    // For each numbered session, check if a named session covers the same project.
-    // If so, merge (keep the one with Claude running / most recent).
-    // If not, keep the numbered session as-is.
-    const result = [];
-    const mergedNamedSessions = new Set(); // track which named sessions got merged
-
-    for (const s of numberedSessions) {
+    for (const s of sessions) {
       const key = s.displayName.toLowerCase();
-      const named = namedByDisplay.get(key);
 
-      if (named && !mergedNamedSessions.has(named.name)) {
-        // This numbered session and a named session share a project.
-        // Keep the one with Claude running; break ties by most recent.
-        const keepNumbered =
-          (s.claudeRunning && !named.claudeRunning) ||
-          (s.claudeRunning === named.claudeRunning && s.lastActivity > named.lastActivity);
-        if (keepNumbered) {
-          result.push(s);
-          mergedNamedSessions.add(named.name);
-        }
-        // else: the named session wins — numbered gets dropped, named added later
+      // Undetected sessions (displayName is just the tmux number) are unique — never merge
+      if (/^\d+$/.test(key)) {
+        groups.set(`__numbered_${s.name}`, s);
+        continue;
+      }
+
+      const existing = groups.get(key);
+      if (!existing) {
+        groups.set(key, s);
       } else {
-        // No matching named session — keep this numbered session
-        result.push(s);
+        // Pick winner: Claude running beats not, then most recent activity
+        const newWins =
+          (s.claudeRunning && !existing.claudeRunning) ||
+          (s.claudeRunning === existing.claudeRunning && s.lastActivity > existing.lastActivity);
+        const winner = newWins ? s : existing;
+        const loser = newWins ? existing : s;
+
+        // Merge attention: if ANY session for this project needs attention, show it
+        if (loser.needsAttention) winner.needsAttention = true;
+
+        groups.set(key, winner);
       }
     }
 
-    // Add named sessions that weren't merged away
-    for (const s of namedSessions) {
-      if (!mergedNamedSessions.has(s.name)) {
-        result.push(s);
-      }
-    }
-
-    const deduped = result;
+    const deduped = [...groups.values()];
 
     // Sort: needs-attention first, then by most recent activity
     deduped.sort((a, b) => {
