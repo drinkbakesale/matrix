@@ -403,26 +403,50 @@ function connectWebSocket(session, windowName) {
   };
 
   let screenLineCount = 0;
+  let pendingText = '';
+
+  function appendMessage(text, role) {
+    const div = document.createElement('div');
+    div.className = `msg msg-${role}`;
+    div.textContent = text;
+    viewer.appendChild(div);
+  }
+
+  function flushPending() {
+    if (!pendingText.trim()) { pendingText = ''; return; }
+    const cleaned = pendingText.replace(/\n{3,}/g, '\n\n');
+    const parts = cleaned.split(/^(> .+)$/m);
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.startsWith('> ')) {
+        appendMessage(part.slice(2), 'human');
+      } else if (part.trim()) {
+        appendMessage(part, 'assistant');
+      }
+    }
+    pendingText = '';
+  }
+
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'output') {
         const clean = filterStatusLines(stripAnsi(msg.data).replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
-        viewer.textContent += clean;
+        pendingText += clean;
+        flushPending();
         screenLineCount = 0;
         viewer.scrollTop = viewer.scrollHeight;
       } else if (msg.type === 'screen') {
-        // Live screen update — replace the last N visible lines
         const clean = filterStatusLines(stripAnsi(msg.data));
-        const lines = viewer.textContent.split('\n');
-        // Remove previous screen overlay lines
-        if (screenLineCount > 0) {
-          lines.splice(-screenLineCount, screenLineCount);
-        }
+        const screenEl = viewer.querySelector('.msg-screen');
+        if (screenEl) screenEl.remove();
         const screenLines = clean.split('\n').filter(l => l.trim());
-        screenLineCount = screenLines.length;
-        lines.push(...screenLines);
-        viewer.textContent = lines.join('\n');
+        if (screenLines.length > 0) {
+          const div = document.createElement('div');
+          div.className = 'msg msg-screen msg-assistant';
+          div.textContent = screenLines.join('\n');
+          viewer.appendChild(div);
+        }
         viewer.scrollTop = viewer.scrollHeight;
       }
     } catch {}
@@ -453,6 +477,7 @@ function openTerminal(session, windowName) {
 
   const viewer = document.getElementById('terminal');
   viewer.textContent = '';
+  viewer.innerHTML = '';
 
   connectWebSocket(session, windowName);
 }
@@ -474,7 +499,10 @@ function sendText() {
   if (!text || !currentSession) return;
   if (ws && ws.readyState === 1) {
     const viewer = document.getElementById('terminal');
-    viewer.textContent += `\n> ${text}\n`;
+    const div = document.createElement('div');
+    div.className = 'msg msg-human';
+    div.textContent = text;
+    viewer.appendChild(div);
     viewer.scrollTop = viewer.scrollHeight;
     ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
     input.value = '';

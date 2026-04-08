@@ -62,12 +62,12 @@ async function loadSessions() {
       }
     });
 
-    // Filter recent projects: not already visible, active within 7 days
-    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    // Filter recent projects: not already visible, active within 14 days
+    const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
     const activeNames = new Set(sessions.map(s => s.name.toLowerCase()));
     const activeDisplayNames = new Set(sessions.map(s => (s.displayName || s.name).toLowerCase()));
     recentProjects = (recentData.projects || []).filter(p =>
-      p.lastActivity > sevenDaysAgo &&
+      p.lastActivity > fourteenDaysAgo &&
       !activeNames.has(p.name.toLowerCase()) &&
       !activeDisplayNames.has(p.name.toLowerCase())
     );
@@ -239,6 +239,7 @@ function selectProject(name) {
   updateChatStatus();
 
   document.getElementById('terminal').textContent = '';
+  document.getElementById('terminal').innerHTML = '';
 
   connectWS(name);
   renderSidebar();
@@ -265,24 +266,55 @@ function connectWS(session) {
     return viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 100;
   }
 
+  let pendingText = '';
+
+  function appendMessage(text, role) {
+    const div = document.createElement('div');
+    div.className = `msg msg-${role}`;
+    div.textContent = text;
+    viewer.appendChild(div);
+  }
+
+  function flushPending() {
+    if (!pendingText.trim()) { pendingText = ''; return; }
+    // Collapse excessive blank lines
+    const cleaned = pendingText.replace(/\n{3,}/g, '\n\n');
+    // Split on user input markers ("> " at start of line)
+    const parts = cleaned.split(/^(> .+)$/m);
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.startsWith('> ')) {
+        appendMessage(part.slice(2), 'human');
+      } else if (part.trim()) {
+        appendMessage(part, 'assistant');
+      }
+    }
+    pendingText = '';
+  }
+
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
       const wasNearBottom = isNearBottom();
       if (msg.type === 'output') {
         const clean = filterStatusLines(stripAnsi(msg.data).replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
-        viewer.textContent += clean;
+        pendingText += clean;
+        flushPending();
         screenLineCount = 0;
         if (wasNearBottom) viewer.scrollTop = viewer.scrollHeight;
         scanTerminalForOutputs(clean);
       } else if (msg.type === 'screen') {
         const clean = filterStatusLines(stripAnsi(msg.data));
-        const lines = viewer.textContent.split('\n');
-        if (screenLineCount > 0) lines.splice(-screenLineCount, screenLineCount);
+        // Remove previous screen overlay
+        const screenEl = viewer.querySelector('.msg-screen');
+        if (screenEl) screenEl.remove();
         const screenLines = clean.split('\n').filter(l => l.trim());
-        screenLineCount = screenLines.length;
-        lines.push(...screenLines);
-        viewer.textContent = lines.join('\n');
+        if (screenLines.length > 0) {
+          const div = document.createElement('div');
+          div.className = 'msg msg-screen msg-assistant';
+          div.textContent = screenLines.join('\n');
+          viewer.appendChild(div);
+        }
         if (wasNearBottom) viewer.scrollTop = viewer.scrollHeight;
       }
     } catch {}
@@ -305,7 +337,10 @@ function sendText() {
   if (!text || !currentSession) return;
   if (ws && ws.readyState === 1) {
     const viewer = document.getElementById('terminal');
-    viewer.textContent += `\n> ${text}\n`;
+    const div = document.createElement('div');
+    div.className = 'msg msg-human';
+    div.textContent = text;
+    viewer.appendChild(div);
     viewer.scrollTop = viewer.scrollHeight;
     ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
     input.value = '';
@@ -638,7 +673,10 @@ async function startNewProject() {
         setTimeout(() => {
           if (ws && ws.readyState === 1) {
             const viewer = document.getElementById('terminal');
-            viewer.textContent += `\n> ${prompt}\n`;
+            const div = document.createElement('div');
+            div.className = 'msg msg-human';
+            div.textContent = prompt;
+            viewer.appendChild(div);
             viewer.scrollTop = viewer.scrollHeight;
             ws.send(JSON.stringify({ type: 'input', data: prompt + '\r' }));
           }
@@ -657,8 +695,125 @@ document.getElementById('np-prompt').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); startNewProject(); }
 });
 
+// ── PTT (Push-to-Talk) via Web Speech API ──
+
+let pttRecognition = null;
+let pttActive = false;
+let pttTranscript = '';
+
+function setupPTT() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    console.log('[ptt] SpeechRecognition not available');
+    return;
+  }
+
+  const source = new EventSource('/api/ptt/stream');
+  source.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type !== 'ptt-state') return;
+      if (data.state === 'recording' && !pttActive) {
+        startPTTRecognition();
+      } else if (data.state === 'idle' && pttActive) {
+        stopPTTRecognition();
+      }
+    } catch {}
+  };
+}
+
+function startPTTRecognition() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) return;
+
+  pttActive = true;
+  pttTranscript = '';
+
+  // Visual indicator
+  const input = document.getElementById('chat-input');
+  input.dataset.origPlaceholder = input.placeholder;
+  input.placeholder = '🎙 Listening...';
+  input.style.borderColor = 'var(--red)';
+  input.style.boxShadow = '0 0 8px rgba(255, 0, 64, 0.4)';
+
+  pttRecognition = new SpeechRecognition();
+  pttRecognition.continuous = true;
+  pttRecognition.interimResults = true;
+  pttRecognition.lang = 'en-US';
+
+  pttRecognition.onresult = (event) => {
+    let interim = '';
+    let final = '';
+    for (let i = 0; i < event.results.length; i++) {
+      if (event.results[i].isFinal) {
+        final += event.results[i][0].transcript;
+      } else {
+        interim += event.results[i][0].transcript;
+      }
+    }
+    pttTranscript = final;
+    // Show live transcript in input field
+    input.value = (final + interim).trim();
+  };
+
+  pttRecognition.onerror = (event) => {
+    console.log('[ptt] recognition error:', event.error);
+    if (event.error === 'not-allowed') {
+      input.placeholder = 'Mic permission denied — check browser settings';
+    }
+  };
+
+  pttRecognition.onend = () => {
+    // If still in PTT mode (button held), restart recognition
+    // (Safari/Chrome auto-stop after silence)
+    if (pttActive) {
+      try { pttRecognition.start(); } catch {}
+    }
+  };
+
+  try {
+    pttRecognition.start();
+  } catch (err) {
+    console.log('[ptt] start error:', err);
+    pttActive = false;
+  }
+}
+
+function stopPTTRecognition() {
+  pttActive = false;
+  const input = document.getElementById('chat-input');
+
+  // Reset visual indicator
+  input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
+  input.style.borderColor = '';
+  input.style.boxShadow = '';
+
+  if (pttRecognition) {
+    pttRecognition.onend = null; // prevent auto-restart
+    try { pttRecognition.stop(); } catch {}
+    pttRecognition = null;
+  }
+
+  // Auto-send if we got a transcript and have an active session
+  const text = input.value.trim();
+  if (text && currentSession && ws && ws.readyState === 1) {
+    const viewer = document.getElementById('terminal');
+    const div = document.createElement('div');
+    div.className = 'msg msg-human';
+    div.textContent = text;
+    viewer.appendChild(div);
+    viewer.scrollTop = viewer.scrollHeight;
+    ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
+    input.value = '';
+    delete sessionAttention[currentSession];
+    updateChatStatus();
+    renderSidebar();
+  }
+}
+
 // ── Init ──
 
 loadSessions();
 setupSSE();
+setupPTT();
 setInterval(loadSessions, 5000);

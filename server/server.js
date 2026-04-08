@@ -17,6 +17,31 @@ const LOGS_DIR = path.join(MATRIX_HOME, 'logs');
 const PYTHON_PATH = process.env.PYTHON_PATH || 'python3';
 const PORT = parseInt(process.env.MATRIX_PORT, 10) || 7778;
 
+// ── Bootstrap ~/.matrix and seed projects.conf from auto-discovery ──
+if (!fs.existsSync(MATRIX_HOME)) {
+  fs.mkdirSync(MATRIX_HOME, { recursive: true });
+}
+if (!fs.existsSync(CONF_PATH)) {
+  const searchDirs = ['~/Desktop', '~/Projects', '~/Downloads', '~/Documents']
+    .map(d => d.replace('~', os.homedir()));
+  const lines = ['# name|path|mode|roles|description'];
+  for (const dir of searchDirs) {
+    try {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!e.isDirectory() || e.name.startsWith('.')) continue;
+        const full = path.join(dir, e.name);
+        if (['CLAUDE.md', '.git', 'package.json', 'setup.py', 'pyproject.toml']
+            .some(f => fs.existsSync(path.join(full, f)))) {
+          const name = e.name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+          lines.push(`${name}|${full}|||`);
+        }
+      }
+    } catch {}
+  }
+  if (lines.length > 1) fs.writeFileSync(CONF_PATH, lines.join('\n') + '\n');
+  console.log(`[matrix] Seeded ${lines.length - 1} projects into ${CONF_PATH}`);
+}
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -362,11 +387,10 @@ app.get('/api/sessions', (req, res) => {
       // Derive display name using a priority chain:
       // 1. tmux @matrix_project variable (explicit, highest priority)
       // 2. Path registry match on pane cwd
-      // 3. Path registry match on file paths found in scrollback
-      // 4. Pane cwd folder name (if not ~)
-      // 5. Scrollback heuristic (most-referenced project folder)
-      // 6. tmux session name (if not a number)
-      // 7. Fallback: raw session name
+      // 3. Pane cwd folder name (if not ~)
+      // 4. Claude pane title (conversation topic set by Claude Code)
+      // 5. tmux session name (if not a number)
+      // 6. Fallback: raw session name
       const homeDir = os.homedir();
       const registry = buildPathRegistry();
       const folderName = projectPath ? path.basename(projectPath) : '';
@@ -389,74 +413,27 @@ app.get('/api/sessions', (req, res) => {
         if (match) displayName = match;
       }
 
-      // Method 3: scan RECENT scrollback (last 50 lines) for file paths,
-      // match against registry. Only recent lines matter — old scrollback
-      // contains stale references from previous work in this session.
-      let scrollback = '';
-      const systemNoisePaths = [
-        '/.claude/hooks', '/.claude/settings', '/.claude/projects/',
-        '/.claude/telemetry', '/.claude/rules/', '/.claude/plugins/',
-        '/.pyenv/', '/.npm/', '/.nvm/', '/.ssh/', '/Library/',
-      ];
-      if (!displayName) {
-        try {
-          scrollback = execSync(
-            `tmux capture-pane -t '${name}:0' -p -S -50 2>/dev/null`,
-            { encoding: 'utf8', timeout: 2000 }
-          );
-          const pathRe = /(?:\/Users\/\w+|~)\/[^\s"',;:()[\]{}|>]+/g;
-          const projectHits = {};
-          let m;
-          while ((m = pathRe.exec(scrollback)) !== null) {
-            const filePath = m[0];
-            const resolved = filePath.replace(/^~/, homeDir);
-            if (systemNoisePaths.some(noise => resolved.includes(noise))) continue;
-            const proj = matchProject(filePath, registry);
-            if (proj) {
-              projectHits[proj] = (projectHits[proj] || 0) + 1;
-            }
-          }
-          // Require ≥3 hits in recent scrollback to be confident
-          const sorted = Object.entries(projectHits)
-            .filter(([, count]) => count >= 3)
-            .sort((a, b) => b[1] - a[1]);
-          if (sorted.length > 0) {
-            displayName = sorted[0][0];
-          }
-        } catch {}
-      }
-
-      // Method 4: pane is in a project directory (not ~)
+      // Method 3: pane is in a project directory (not ~)
       if (!displayName && !isHomeDir && folderName) {
         displayName = folderName;
       }
 
-      // Method 5: scrollback heuristic — most-referenced project folder in recent lines
-      if (!displayName) {
-        try {
-          if (!scrollback) {
-            scrollback = execSync(
-              `tmux capture-pane -t '${name}:0' -p -S -50 2>/dev/null`,
-              { encoding: 'utf8', timeout: 2000 }
-            );
-          }
-          const re = /(?:~|\/Users\/\w+)\/(Desktop|Projects|Downloads|Documents)\/([^\s/"',;:()[\]{}]+)/g;
-          const projCounts = {};
-          let m;
-          while ((m = re.exec(scrollback)) !== null) {
-            const dir = m[2];
-            if (dir.length > 2 && !dir.startsWith('.')) {
-              projCounts[dir] = (projCounts[dir] || 0) + 1;
-            }
-          }
-          const sorted = Object.entries(projCounts).sort((a, b) => b[1] - a[1]);
-          if (sorted.length > 0) {
-            displayName = sorted[0][0];
-          }
-        } catch {}
+      // Method 4: use Claude's pane title (conversation topic)
+      // Claude Code sets pane_title to things like "✳ Resume polymarket app development"
+      // Strip leading spinner/status chars and the hostname default
+      if (!displayName && paneTitle) {
+        const cleaned = paneTitle
+          .replace(/^[\u2800-\u28FF\u2732\u2733\u2734\u2022\s]+/, '') // strip braille spinners, asterisks
+          .replace(/^Claude Code\s*$/i, '')  // skip generic "Claude Code" title
+          .trim();
+        const hostname = os.hostname();
+        if (cleaned && !cleaned.includes(hostname) && cleaned.length > 2) {
+          // Truncate long titles to a reasonable display name
+          displayName = cleaned.length > 50 ? cleaned.slice(0, 47) + '...' : cleaned;
+        }
       }
 
-      // Method 6: derive from tmux session name (strip numeric suffix)
+      // Method 5: derive from tmux session name (strip numeric suffix)
       if (!displayName) {
         const baseName = name.replace(/-\d+$/, '');
         if (!/^\d+$/.test(baseName)) {
@@ -464,7 +441,7 @@ app.get('/api/sessions', (req, res) => {
         }
       }
 
-      // Method 7: fallback to session name
+      // Method 6: fallback to session name
       if (!displayName) {
         displayName = name;
       }
@@ -971,6 +948,72 @@ setInterval(() => {
   }
 }, 10000);
 
+// ── PTT (Push-to-Talk) USB Mic Support ──
+
+// SSE clients for PTT state changes (desktop frontend listens here)
+const pttClients = new Set();
+let pttState = 'idle'; // 'idle' | 'recording'
+
+app.get('/api/ptt/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  res.write(`data: ${JSON.stringify({ type: 'ptt-state', state: pttState })}\n\n`);
+  pttClients.add(res);
+  req.on('close', () => pttClients.delete(res));
+});
+
+app.post('/api/ptt-event', (req, res) => {
+  const { event } = req.body;
+  if (event === 'start' && pttState !== 'recording') {
+    pttState = 'recording';
+    const payload = `data: ${JSON.stringify({ type: 'ptt-state', state: 'recording' })}\n\n`;
+    for (const client of pttClients) client.write(payload);
+    res.json({ ok: true, state: 'recording' });
+  } else if (event === 'stop' && pttState !== 'idle') {
+    pttState = 'idle';
+    const payload = `data: ${JSON.stringify({ type: 'ptt-state', state: 'idle' })}\n\n`;
+    for (const client of pttClients) client.write(payload);
+    res.json({ ok: true, state: 'idle' });
+  } else {
+    res.json({ ok: true, state: pttState, unchanged: true });
+  }
+});
+
+// Auto-launch PTT daemon
+function launchPTTDaemon() {
+  const pttScript = path.join(os.homedir(), '.claude-remote', 'ptt-daemon', 'ptt-keymon.py');
+  const pythonPath = process.env.MATRIX_PYTHON || '/Users/williamkehler/.pyenv/versions/3.11.8/bin/python';
+  if (!fs.existsSync(pttScript)) {
+    console.log(`[ptt] Daemon script not found at ${pttScript} — PTT disabled`);
+    return null;
+  }
+  try {
+    const child = exec(`${pythonPath} "${pttScript}"`, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', (d) => process.stdout.write(`[ptt] ${d}`));
+    child.stderr.on('data', (d) => process.stderr.write(`[ptt:err] ${d}`));
+    child.on('exit', (code) => {
+      console.log(`[ptt] Daemon exited with code ${code}`);
+      // Auto-restart after 5s if it wasn't killed intentionally
+      if (code !== null && code !== 0) {
+        console.log('[ptt] Restarting in 5s...');
+        setTimeout(launchPTTDaemon, 5000);
+      }
+    });
+    console.log(`[ptt] Daemon launched (pid ${child.pid})`);
+    return child;
+  } catch (err) {
+    console.error(`[ptt] Failed to launch daemon: ${err.message}`);
+    return null;
+  }
+}
+
+let pttDaemon = null;
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Matrix running on http://0.0.0.0:${PORT}`);
   console.log(`Config directory: ${MATRIX_HOME}`);
@@ -978,4 +1021,16 @@ server.listen(PORT, '0.0.0.0', () => {
   if (!vapid) {
     console.log('WARNING: Push notifications disabled — run "npm run setup" to configure VAPID keys');
   }
+  // Launch PTT daemon after server is ready
+  pttDaemon = launchPTTDaemon();
+});
+
+// Clean shutdown
+process.on('SIGINT', () => {
+  if (pttDaemon) { try { pttDaemon.kill(); } catch {} }
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  if (pttDaemon) { try { pttDaemon.kill(); } catch {} }
+  process.exit(0);
 });

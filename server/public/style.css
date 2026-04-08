@@ -396,19 +396,42 @@ body {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  background: #000;
+  background: #080c08;
   width: 100%;
   margin: 0;
-  padding: 8px 10px;
+  padding: 12px 14px;
   font-family: 'SF Mono', 'Menlo', 'Courier New', monospace;
   font-size: 15px;
-  line-height: 1.4;
-  color: var(--green);
+  line-height: 1.6;
+  color: #b5e8c0;
   white-space: pre-wrap;
   word-wrap: break-word;
   overflow-wrap: break-word;
   word-break: normal;
   -webkit-overflow-scrolling: touch;
+  text-shadow: none;
+}
+
+/* Chat message blocks */
+#terminal .msg {
+  padding: 6px 10px;
+  margin: 2px 0;
+  border-radius: var(--radius);
+}
+
+#terminal .msg-human {
+  background: #1a2233;
+  border-left: 3px solid #58a6ff;
+  color: #e6edf3;
+}
+
+#terminal .msg-assistant {
+  background: #0d1117;
+  color: #b5e8c0;
+}
+
+#terminal .msg + .msg-human {
+  margin-top: 12px;
 }
 
 /* ── Quick Action Buttons ── */

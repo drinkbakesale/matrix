@@ -303,15 +303,38 @@ body {
 #terminal {
   flex: 1;
   overflow-y: auto;
-  background: #000;
-  padding: 12px 16px;
+  background: #080c08;
+  padding: 14px 18px;
   font-family: 'SF Mono', 'Menlo', 'Courier New', monospace;
   font-size: 14px;
-  line-height: 1.5;
-  color: var(--green);
+  line-height: 1.7;
+  color: #b5e8c0;
   white-space: pre-wrap;
   word-wrap: break-word;
   scrollbar-color: var(--green) transparent;
+  text-shadow: none;
+}
+
+/* Chat message blocks */
+#terminal .msg {
+  padding: 8px 12px;
+  margin: 4px 0;
+  border-radius: var(--radius);
+}
+
+#terminal .msg-human {
+  background: #1a2233;
+  border-left: 3px solid #58a6ff;
+  color: #e6edf3;
+}
+
+#terminal .msg-assistant {
+  background: #0d1117;
+  color: #b5e8c0;
+}
+
+#terminal .msg + .msg-human {
+  margin-top: 14px;
 }
 
 #terminal::-webkit-scrollbar {
@@ -730,6 +753,18 @@ body {
 @keyframes toastSlideIn {
   from { transform: translateX(100%); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
+}
+
+/* ── PTT Recording Indicator ── */
+#chat-input.ptt-active {
+  border-color: var(--red) !important;
+  box-shadow: 0 0 8px rgba(255, 0, 64, 0.4) !important;
+  animation: pttPulse 1s ease-in-out infinite;
+}
+
+@keyframes pttPulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(255, 0, 64, 0.4); }
+  50% { box-shadow: 0 0 16px rgba(255, 0, 64, 0.6); }
 }
 
 @keyframes pulse {
