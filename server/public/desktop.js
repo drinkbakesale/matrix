@@ -702,39 +702,100 @@ const ptt = {
   mediaRecorder: null,
   audioChunks: [],
   micDeviceId: null,
+  speakerDeviceId: null,
 };
 
-// Find the UACDemoV1.0 mic device ID
+// Find the UACDemoV1.0 mic and speaker device IDs
 async function pttFindDevices() {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     for (const d of devices) {
       if (d.label.includes('UACDemoV1.0') || d.label.includes('Jieli')) {
         if (d.kind === 'audioinput') ptt.micDeviceId = d.deviceId;
+        if (d.kind === 'audiooutput') ptt.speakerDeviceId = d.deviceId;
       }
     }
-    console.log('[PTT] mic:', ptt.micDeviceId ? 'found' : 'not found');
+    console.log('[PTT] mic:', ptt.micDeviceId ? 'found' : 'not found',
+                'speaker:', ptt.speakerDeviceId ? 'found' : 'not found');
+    pttRouteSpeaker();
   } catch (err) {
     console.error('[PTT] device enumeration failed:', err);
   }
 }
 
-function setupPTT() {
-  // Listen for PTT state from daemon via SSE
-  const source = new EventSource('/api/ptt/stream');
-  source.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      if (data.type !== 'ptt-state') return;
-      if (data.state === 'recording' && !ptt.active) {
-        pttStart();
-      } else if (data.state === 'idle' && ptt.active) {
-        pttStop();
-      }
-    } catch {}
-  };
+// Preload squelch sounds
+const squelchOpenEl = new Audio('/audio/squelch-open.wav');
+const squelchCloseEl = new Audio('/audio/squelch-close.wav');
+squelchOpenEl.preload = 'auto';
+squelchCloseEl.preload = 'auto';
 
-  // Request mic permission on load and find devices
+let squelchAudioCtx = null;
+let squelchOpenBuf = null;
+let squelchCloseBuf = null;
+
+async function pttPreloadSquelch() {
+  try {
+    squelchAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const [openResp, closeResp] = await Promise.all([
+      fetch('/audio/squelch-open.wav'),
+      fetch('/audio/squelch-close.wav'),
+    ]);
+    squelchOpenBuf = await squelchAudioCtx.decodeAudioData(await openResp.arrayBuffer());
+    squelchCloseBuf = await squelchAudioCtx.decodeAudioData(await closeResp.arrayBuffer());
+    console.log('[PTT] squelch sounds preloaded');
+  } catch (e) {
+    console.error('[PTT] squelch preload failed:', e);
+  }
+}
+
+async function pttRouteSpeaker() {
+  if (ptt.speakerDeviceId) {
+    try {
+      if (squelchOpenEl.setSinkId) await squelchOpenEl.setSinkId(ptt.speakerDeviceId);
+      if (squelchCloseEl.setSinkId) await squelchCloseEl.setSinkId(ptt.speakerDeviceId);
+      console.log('[PTT] squelch routed to USB speaker');
+    } catch (e) {
+      console.warn('[PTT] setSinkId failed, using default output:', e);
+    }
+  }
+}
+
+function pttPlaySquelch(type) {
+  // Web Audio API (instant, bypasses autoplay restrictions)
+  if (squelchAudioCtx && (type === 'open' ? squelchOpenBuf : squelchCloseBuf)) {
+    if (squelchAudioCtx.state === 'suspended') squelchAudioCtx.resume();
+    const source = squelchAudioCtx.createBufferSource();
+    source.buffer = type === 'open' ? squelchOpenBuf : squelchCloseBuf;
+    source.connect(squelchAudioCtx.destination);
+    source.start();
+  }
+  // Audio element fallback (for setSinkId routing to USB speaker)
+  const el = type === 'open' ? squelchOpenEl : squelchCloseEl;
+  el.currentTime = 0;
+  el.play().catch(() => {});
+}
+
+pttPreloadSquelch();
+
+// F2 keydown/keyup from QX18A PTT button (direct — no SSE relay needed)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'F2' || e.code === 'F2') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!ptt.active) pttStart();
+  }
+}, true);
+
+document.addEventListener('keyup', (e) => {
+  if (e.key === 'F2' || e.code === 'F2') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (ptt.active) pttStop();
+  }
+}, true);
+
+function setupPTT() {
+  // Request mic permission on load and find USB mic device
   navigator.mediaDevices.getUserMedia({ audio: true })
     .then(stream => { stream.getTracks().forEach(t => t.stop()); pttFindDevices(); })
     .catch(() => console.warn('[PTT] mic permission denied'));
@@ -744,6 +805,8 @@ async function pttStart() {
   if (ptt.active) return;
   ptt.active = true;
   ptt.audioChunks = [];
+
+  pttPlaySquelch('open');
 
   // Visual indicator
   const input = document.getElementById('chat-input');
@@ -780,6 +843,8 @@ async function pttStart() {
 function pttStop() {
   if (!ptt.active) return;
   ptt.active = false;
+
+  pttPlaySquelch('close');
 
   const input = document.getElementById('chat-input');
   input.placeholder = input.dataset.origPlaceholder || 'Type a message...';

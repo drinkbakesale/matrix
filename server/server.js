@@ -1020,38 +1020,6 @@ app.post('/api/ptt-event', (req, res) => {
   }
 });
 
-// Auto-launch PTT daemon
-function launchPTTDaemon() {
-  const pttScript = path.join(os.homedir(), '.claude-remote', 'ptt-daemon', 'ptt-keymon.py');
-  const pythonPath = process.env.MATRIX_PYTHON || '/Users/williamkehler/.pyenv/versions/3.11.8/bin/python';
-  if (!fs.existsSync(pttScript)) {
-    console.log(`[ptt] Daemon script not found at ${pttScript} — PTT disabled`);
-    return null;
-  }
-  try {
-    const child = exec(`${pythonPath} "${pttScript}"`, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    child.stdout.on('data', (d) => process.stdout.write(`[ptt] ${d}`));
-    child.stderr.on('data', (d) => process.stderr.write(`[ptt:err] ${d}`));
-    child.on('exit', (code) => {
-      console.log(`[ptt] Daemon exited with code ${code}`);
-      // Auto-restart after 5s if it wasn't killed intentionally
-      if (code !== null && code !== 0) {
-        console.log('[ptt] Restarting in 5s...');
-        setTimeout(launchPTTDaemon, 5000);
-      }
-    });
-    console.log(`[ptt] Daemon launched (pid ${child.pid})`);
-    return child;
-  } catch (err) {
-    console.error(`[ptt] Failed to launch daemon: ${err.message}`);
-    return null;
-  }
-}
-
-let pttDaemon = null;
-
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Matrix running on http://0.0.0.0:${PORT}`);
   console.log(`Config directory: ${MATRIX_HOME}`);
@@ -1059,16 +1027,4 @@ server.listen(PORT, '0.0.0.0', () => {
   if (!vapid) {
     console.log('WARNING: Push notifications disabled — run "npm run setup" to configure VAPID keys');
   }
-  // Launch PTT daemon after server is ready
-  pttDaemon = launchPTTDaemon();
-});
-
-// Clean shutdown
-process.on('SIGINT', () => {
-  if (pttDaemon) { try { pttDaemon.kill(); } catch {} }
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  if (pttDaemon) { try { pttDaemon.kill(); } catch {} }
-  process.exit(0);
 });
