@@ -699,8 +699,8 @@ document.getElementById('np-prompt').addEventListener('keydown', (e) => {
 
 const ptt = {
   active: false,
-  mediaRecorder: null,
-  audioChunks: [],
+  recognition: null,
+  finalTranscript: '',
   micDeviceId: null,
   speakerDeviceId: null,
 };
@@ -761,18 +761,19 @@ async function pttRouteSpeaker() {
 }
 
 function pttPlaySquelch(type) {
-  // Web Audio API (instant, bypasses autoplay restrictions)
-  if (squelchAudioCtx && (type === 'open' ? squelchOpenBuf : squelchCloseBuf)) {
+  if (ptt.speakerDeviceId) {
+    // USB speaker available — use Audio element only (supports setSinkId)
+    const el = type === 'open' ? squelchOpenEl : squelchCloseEl;
+    el.currentTime = 0;
+    el.play().catch(() => {});
+  } else if (squelchAudioCtx && (type === 'open' ? squelchOpenBuf : squelchCloseBuf)) {
+    // No USB speaker — fall back to Web Audio API (default output)
     if (squelchAudioCtx.state === 'suspended') squelchAudioCtx.resume();
     const source = squelchAudioCtx.createBufferSource();
     source.buffer = type === 'open' ? squelchOpenBuf : squelchCloseBuf;
     source.connect(squelchAudioCtx.destination);
     source.start();
   }
-  // Audio element fallback (for setSinkId routing to USB speaker)
-  const el = type === 'open' ? squelchOpenEl : squelchCloseEl;
-  el.currentTime = 0;
-  el.play().catch(() => {});
 }
 
 pttPreloadSquelch();
@@ -803,40 +804,59 @@ function setupPTT() {
 
 async function pttStart() {
   if (ptt.active) return;
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    console.error('[PTT] SpeechRecognition not available');
+    return;
+  }
+
   ptt.active = true;
-  ptt.audioChunks = [];
+  ptt.finalTranscript = '';
 
   pttPlaySquelch('open');
 
-  // Visual indicator
   const input = document.getElementById('chat-input');
   input.dataset.origPlaceholder = input.placeholder;
   input.placeholder = '🎙 Listening...';
   input.style.borderColor = 'var(--green)';
   input.style.boxShadow = '0 0 8px var(--green-glow)';
 
-  // Start recording from USB mic
+  ptt.recognition = new SpeechRecognition();
+  ptt.recognition.continuous = true;
+  ptt.recognition.interimResults = true;
+  ptt.recognition.lang = 'en-US';
+
+  ptt.recognition.onresult = (event) => {
+    let interim = '';
+    let final = '';
+    for (let i = 0; i < event.results.length; i++) {
+      if (event.results[i].isFinal) {
+        final += event.results[i][0].transcript;
+      } else {
+        interim += event.results[i][0].transcript;
+      }
+    }
+    ptt.finalTranscript = final;
+    input.value = (final + interim).trim();
+  };
+
+  ptt.recognition.onerror = (event) => {
+    console.log('[PTT] recognition error:', event.error);
+  };
+
+  ptt.recognition.onend = () => {
+    // If button is still held, restart (browser auto-stops after silence)
+    if (ptt.active) {
+      try { ptt.recognition.start(); } catch {}
+    }
+  };
+
   try {
-    const constraints = { audio: ptt.micDeviceId ? { deviceId: { exact: ptt.micDeviceId } } : true };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    ptt.mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    ptt.mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) ptt.audioChunks.push(e.data);
-    };
-    ptt.mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      if (ptt.audioChunks.length === 0) return;
-      const blob = new Blob(ptt.audioChunks, { type: 'audio/webm' });
-      pttTranscribe(blob);
-    };
-    ptt.mediaRecorder.start();
-    console.log('[PTT] recording started');
+    ptt.recognition.start();
+    console.log('[PTT] live recognition started');
   } catch (err) {
-    console.error('[PTT] mic error:', err);
+    console.error('[PTT] start error:', err);
     ptt.active = false;
-    input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
-    input.style.borderColor = '';
-    input.style.boxShadow = '';
   }
 }
 
@@ -847,36 +867,41 @@ function pttStop() {
   pttPlaySquelch('close');
 
   const input = document.getElementById('chat-input');
-  input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
   input.style.borderColor = '';
   input.style.boxShadow = '';
 
-  // 500ms tail buffer so the end of speech isn't cut off
-  setTimeout(() => {
-    if (ptt.mediaRecorder && ptt.mediaRecorder.state === 'recording') {
-      ptt.mediaRecorder.stop();
-      console.log('[PTT] recording stopped (with tail buffer)');
-    }
-  }, 500);
+  if (ptt.recognition) {
+    ptt.recognition.onend = null;
+    try { ptt.recognition.stop(); } catch {}
+    ptt.recognition = null;
+  }
+
+  // Second pass: clean up the transcript
+  const rawText = input.value.trim();
+  if (rawText) {
+    input.placeholder = 'Cleaning up...';
+    pttCleanup(rawText).then(cleaned => {
+      input.value = cleaned;
+      input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
+      input.focus();
+      console.log('[PTT] cleaned:', cleaned);
+    });
+  } else {
+    input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
+  }
 }
 
-async function pttTranscribe(blob) {
-  const input = document.getElementById('chat-input');
-  input.placeholder = 'Transcribing...';
+async function pttCleanup(rawText) {
   try {
-    const formData = new FormData();
-    formData.append('audio', blob, 'recording.webm');
-    const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+    const res = await fetch('/api/ptt/cleanup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: rawText }),
+    });
     const { text } = await res.json();
-    if (text && text.trim()) {
-      input.value = (input.value ? input.value + ' ' : '') + text.trim();
-      input.focus();
-      console.log('[PTT] transcribed:', text.trim());
-    }
-  } catch (err) {
-    console.error('[PTT] transcribe error:', err);
-  } finally {
-    input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
+    return text || rawText;
+  } catch {
+    return rawText;
   }
 }
 

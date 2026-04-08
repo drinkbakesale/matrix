@@ -986,6 +986,32 @@ setInterval(() => {
   }
 }, 10000);
 
+// ── PTT Transcript Cleanup ──
+
+app.post('/api/ptt/cleanup', async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.json({ text: '' });
+
+  // Quick local cleanup: capitalize first letter, fix common STT issues
+  let cleaned = text.trim();
+
+  // Capitalize first letter
+  cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+
+  // Remove repeated words (common STT artifact: "the the", "I I")
+  cleaned = cleaned.replace(/\b(\w+)\s+\1\b/gi, '$1');
+
+  // Collapse multiple spaces
+  cleaned = cleaned.replace(/\s{2,}/g, ' ');
+
+  // Add period if no ending punctuation
+  if (cleaned && !/[.!?]$/.test(cleaned)) {
+    cleaned += '.';
+  }
+
+  res.json({ text: cleaned });
+});
+
 // ── PTT (Push-to-Talk) USB Mic Support ──
 
 // SSE clients for PTT state changes (desktop frontend listens here)
