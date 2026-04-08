@@ -162,27 +162,65 @@ app.post('/api/notify', (req, res) => {
   res.json({ ok: true, delivered: sseClients.size, pushSubs: pushSubscriptions.length });
 });
 
-// POST: transcribe audio (voice-to-text via whisper)
+// POST: transcribe audio (voice-to-text via Apple SFSpeechRecognizer, fallback to whisper)
 const audioUploadDir = path.join(os.tmpdir(), 'matrix-audio');
 const upload = require('multer')({ dest: audioUploadDir });
+const STT_TOOL = path.join(os.homedir(), '.claude-remote', 'stt-tool', '.build', 'release', 'stt-tool');
+const WHISPER_SOCKET = '/tmp/matrix-whisper.sock';
+const net = require('net');
+
+// Start persistent Whisper server if not already running
+function ensureWhisperServer() {
+  if (fs.existsSync(WHISPER_SOCKET)) return;
+  const whisperPy = path.join(os.homedir(), '.claude-remote', 'app', 'whisper-server.py');
+  if (!fs.existsSync(whisperPy)) { console.log('[whisper] server script not found'); return; }
+  const child = exec(`${PYTHON_PATH} "${whisperPy}"`, { stdio: ['ignore', 'inherit', 'inherit'] });
+  child.unref();
+  console.log('[whisper] started persistent server, PID:', child.pid);
+}
+ensureWhisperServer();
+
+function whisperTranscribe(wavPath) {
+  return new Promise((resolve) => {
+    const client = net.createConnection(WHISPER_SOCKET, () => {
+      client.write(wavPath);
+    });
+    let data = '';
+    client.on('data', (chunk) => { data += chunk; });
+    client.on('end', () => {
+      try { resolve(JSON.parse(data).text || ''); }
+      catch { resolve(''); }
+    });
+    client.on('error', () => resolve(''));
+    setTimeout(() => { client.destroy(); resolve(''); }, 15000);
+  });
+}
+
 app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'no audio' });
   const webmPath = req.file.path;
   const wavPath = webmPath + '.wav';
   try {
-    // Convert webm to wav
     execSync(`ffmpeg -y -i '${webmPath}' -ar 16000 -ac 1 '${wavPath}' 2>/dev/null`);
-    // Transcribe with whisper (tiny model for speed)
-    const result = execSync(
-      `${PYTHON_PATH} -c "
-import whisper, json, sys
-model = whisper.load_model('tiny')
-r = model.transcribe('${wavPath}', fp16=False)
-print(json.dumps({'text': r['text'].strip()}))
-"`,
-      { encoding: 'utf8', timeout: 30000 }
-    );
-    const { text } = JSON.parse(result.trim());
+
+    let text = '';
+    // Try Apple on-device STT first (near-instant)
+    if (fs.existsSync(STT_TOOL)) {
+      try {
+        const result = execSync(`'${STT_TOOL}' '${wavPath}'`, { encoding: 'utf8', timeout: 15000 });
+        text = JSON.parse(result.trim()).text || '';
+        if (text) console.log('[transcribe] Apple STT:', text);
+      } catch (sttErr) {
+        console.log('[transcribe] Apple STT failed, falling back to Whisper:', sttErr.message);
+      }
+    }
+
+    // Fallback to persistent Whisper server
+    if (!text) {
+      text = await whisperTranscribe(wavPath);
+      if (text) console.log('[transcribe] Whisper:', text);
+    }
+
     res.json({ text });
   } catch (err) {
     console.error('[transcribe] error:', err.message);

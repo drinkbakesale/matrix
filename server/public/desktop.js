@@ -695,39 +695,55 @@ document.getElementById('np-prompt').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); startNewProject(); }
 });
 
-// ── PTT (Push-to-Talk) via Web Speech API ──
+// ── PTT (Push-to-Talk) via MediaRecorder + server-side Apple STT ──
 
-let pttRecognition = null;
-let pttActive = false;
-let pttTranscript = '';
+const ptt = {
+  active: false,
+  mediaRecorder: null,
+  audioChunks: [],
+  micDeviceId: null,
+};
+
+// Find the UACDemoV1.0 mic device ID
+async function pttFindDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    for (const d of devices) {
+      if (d.label.includes('UACDemoV1.0') || d.label.includes('Jieli')) {
+        if (d.kind === 'audioinput') ptt.micDeviceId = d.deviceId;
+      }
+    }
+    console.log('[PTT] mic:', ptt.micDeviceId ? 'found' : 'not found');
+  } catch (err) {
+    console.error('[PTT] device enumeration failed:', err);
+  }
+}
 
 function setupPTT() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    console.log('[ptt] SpeechRecognition not available');
-    return;
-  }
-
+  // Listen for PTT state from daemon via SSE
   const source = new EventSource('/api/ptt/stream');
   source.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
       if (data.type !== 'ptt-state') return;
-      if (data.state === 'recording' && !pttActive) {
-        startPTTRecognition();
-      } else if (data.state === 'idle' && pttActive) {
-        stopPTTRecognition();
+      if (data.state === 'recording' && !ptt.active) {
+        pttStart();
+      } else if (data.state === 'idle' && ptt.active) {
+        pttStop();
       }
     } catch {}
   };
+
+  // Request mic permission on load and find devices
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(stream => { stream.getTracks().forEach(t => t.stop()); pttFindDevices(); })
+    .catch(() => console.warn('[PTT] mic permission denied'));
 }
 
-function startPTTRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) return;
-
-  pttActive = true;
-  pttTranscript = '';
+async function pttStart() {
+  if (ptt.active) return;
+  ptt.active = true;
+  ptt.audioChunks = [];
 
   // Visual indicator
   const input = document.getElementById('chat-input');
@@ -736,78 +752,66 @@ function startPTTRecognition() {
   input.style.borderColor = 'var(--green)';
   input.style.boxShadow = '0 0 8px var(--green-glow)';
 
-  pttRecognition = new SpeechRecognition();
-  pttRecognition.continuous = true;
-  pttRecognition.interimResults = true;
-  pttRecognition.lang = 'en-US';
-
-  pttRecognition.onresult = (event) => {
-    let interim = '';
-    let final = '';
-    for (let i = 0; i < event.results.length; i++) {
-      if (event.results[i].isFinal) {
-        final += event.results[i][0].transcript;
-      } else {
-        interim += event.results[i][0].transcript;
-      }
-    }
-    pttTranscript = final;
-    // Show live transcript in input field
-    input.value = (final + interim).trim();
-  };
-
-  pttRecognition.onerror = (event) => {
-    console.log('[ptt] recognition error:', event.error);
-    if (event.error === 'not-allowed') {
-      input.placeholder = 'Mic permission denied — check browser settings';
-    }
-  };
-
-  pttRecognition.onend = () => {
-    // If still in PTT mode (button held), restart recognition
-    // (Safari/Chrome auto-stop after silence)
-    if (pttActive) {
-      try { pttRecognition.start(); } catch {}
-    }
-  };
-
+  // Start recording from USB mic
   try {
-    pttRecognition.start();
+    const constraints = { audio: ptt.micDeviceId ? { deviceId: { exact: ptt.micDeviceId } } : true };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    ptt.mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    ptt.mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) ptt.audioChunks.push(e.data);
+    };
+    ptt.mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      if (ptt.audioChunks.length === 0) return;
+      const blob = new Blob(ptt.audioChunks, { type: 'audio/webm' });
+      pttTranscribe(blob);
+    };
+    ptt.mediaRecorder.start();
+    console.log('[PTT] recording started');
   } catch (err) {
-    console.log('[ptt] start error:', err);
-    pttActive = false;
+    console.error('[PTT] mic error:', err);
+    ptt.active = false;
+    input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
+    input.style.borderColor = '';
+    input.style.boxShadow = '';
   }
 }
 
-function stopPTTRecognition() {
-  pttActive = false;
-  const input = document.getElementById('chat-input');
+function pttStop() {
+  if (!ptt.active) return;
+  ptt.active = false;
 
-  // Reset visual indicator
+  const input = document.getElementById('chat-input');
   input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
   input.style.borderColor = '';
   input.style.boxShadow = '';
 
-  if (pttRecognition) {
-    pttRecognition.onend = null; // prevent auto-restart
-    try { pttRecognition.stop(); } catch {}
-    pttRecognition = null;
-  }
+  // 500ms tail buffer so the end of speech isn't cut off
+  setTimeout(() => {
+    if (ptt.mediaRecorder && ptt.mediaRecorder.state === 'recording') {
+      ptt.mediaRecorder.stop();
+      console.log('[PTT] recording stopped (with tail buffer)');
+    }
+  }, 500);
+}
 
-  // Auto-send if we got a transcript and have an active session
-  const text = input.value.trim();
-  if (text && currentSession && ws && ws.readyState === 1) {
-    const viewer = document.getElementById('terminal');
-    const div = document.createElement('div');
-    div.className = 'msg msg-human';
-    div.textContent = text;
-    viewer.appendChild(div);
-    viewer.scrollTop = viewer.scrollHeight;
-    ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
-    input.value = '';
-    delete sessionAttention[currentSession];
-    updateChatStatus();
-    renderSidebar();
+async function pttTranscribe(blob) {
+  const input = document.getElementById('chat-input');
+  input.placeholder = 'Transcribing...';
+  try {
+    const formData = new FormData();
+    formData.append('audio', blob, 'recording.webm');
+    const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+    const { text } = await res.json();
+    if (text && text.trim()) {
+      input.value = (input.value ? input.value + ' ' : '') + text.trim();
+      input.focus();
+      console.log('[PTT] transcribed:', text.trim());
+    }
+  } catch (err) {
+    console.error('[PTT] transcribe error:', err);
+  } finally {
+    input.placeholder = input.dataset.origPlaceholder || 'Type a message...';
   }
 }
 
