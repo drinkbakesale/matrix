@@ -733,8 +733,8 @@ function startPTTRecognition() {
   const input = document.getElementById('chat-input');
   input.dataset.origPlaceholder = input.placeholder;
   input.placeholder = '🎙 Listening...';
-  input.style.borderColor = 'var(--red)';
-  input.style.boxShadow = '0 0 8px rgba(255, 0, 64, 0.4)';
+  input.style.borderColor = 'var(--green)';
+  input.style.boxShadow = '0 0 8px var(--green-glow)';
 
   pttRecognition = new SpeechRecognition();
   pttRecognition.continuous = true;

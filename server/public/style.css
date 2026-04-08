@@ -414,24 +414,16 @@ body {
 
 /* Chat message blocks */
 #terminal .msg {
-  padding: 6px 10px;
-  margin: 2px 0;
-  border-radius: var(--radius);
+  padding: 4px 0;
+  margin: 0;
 }
 
 #terminal .msg-human {
-  background: #1a2233;
-  border-left: 3px solid #58a6ff;
-  color: #e6edf3;
-}
-
-#terminal .msg-assistant {
-  background: #0d1117;
   color: #b5e8c0;
 }
 
-#terminal .msg + .msg-human {
-  margin-top: 12px;
+#terminal .msg-assistant {
+  color: #b5e8c0;
 }
 
 /* ── Quick Action Buttons ── */
@@ -503,9 +495,9 @@ body {
 }
 
 #talk-btn.recording {
-  background: var(--red);
-  color: #fff;
-  box-shadow: 0 2px 12px rgba(255, 0, 64, 0.4), 0 0 20px rgba(255, 0, 64, 0.2);
+  background: var(--green);
+  color: #000;
+  box-shadow: 0 2px 12px var(--green-glow), 0 0 20px var(--green-glow);
   animation: pulse 1s ease-in-out infinite;
 }
 
