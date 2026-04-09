@@ -228,6 +228,11 @@ document.addEventListener('keydown', (e) => {
 function selectProject(name) {
   if (currentSession === name) return;
 
+  // Dismiss alert on the session we're leaving
+  if (currentSession && sessionAttention[currentSession]) {
+    delete sessionAttention[currentSession];
+  }
+
   currentSession = name;
   detectedPorts = [];
   const session = sessions.find(s => s.name === name);
@@ -331,6 +336,11 @@ function connectWS(session) {
 
 // ── Text Input ──
 
+function autoResizeInput(el) {
+  el.style.height = 'auto';
+  el.style.height = el.scrollHeight + 'px';
+}
+
 function sendText() {
   const input = document.getElementById('chat-input');
   const text = input.value.trim();
@@ -344,11 +354,71 @@ function sendText() {
     viewer.scrollTop = viewer.scrollHeight;
     ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
     input.value = '';
+    input.style.height = 'auto';
+    document.getElementById('slash-autocomplete').style.display = 'none';
     delete sessionAttention[currentSession];
     updateChatStatus();
     renderSidebar();
   }
 }
+
+document.getElementById('chat-input').addEventListener('input', function() {
+  autoResizeInput(this);
+  updateSlashAutocomplete(this);
+});
+
+// ── Slash Command Autocomplete ──
+
+const slash = { skills: [], fetched: false, activeIdx: -1 };
+
+async function fetchSkills() {
+  if (slash.fetched) return slash.skills;
+  try {
+    const res = await fetch('/api/skills');
+    slash.skills = await res.json();
+  } catch { slash.skills = []; }
+  slash.fetched = true;
+  return slash.skills;
+}
+
+function updateSlashAutocomplete(input) {
+  const menu = document.getElementById('slash-autocomplete');
+  const val = input.value;
+
+  // Only trigger when the entire input starts with /
+  if (!val.startsWith('/') || val.includes('\n')) {
+    menu.style.display = 'none';
+    slash.activeIdx = -1;
+    return;
+  }
+
+  const query = val.slice(1).toLowerCase();
+  fetchSkills().then(skills => {
+    const matches = skills.filter(s => s.includes(query)).slice(0, 15);
+    if (matches.length === 0) {
+      menu.style.display = 'none';
+      slash.activeIdx = -1;
+      return;
+    }
+
+    slash.activeIdx = -1;
+    menu.innerHTML = matches.map((s, i) =>
+      `<div class="slash-item" data-idx="${i}" data-skill="${s}"><span class="slash-prefix">/</span>${s}</div>`
+    ).join('');
+    menu.style.display = 'block';
+
+    menu.querySelectorAll('.slash-item').forEach(el => {
+      el.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        input.value = '/' + el.dataset.skill + ' ';
+        menu.style.display = 'none';
+        autoResizeInput(input);
+        input.focus();
+      });
+    });
+  });
+}
+
 
 function updateChatStatus() {
   if (!currentSession) return;
@@ -391,7 +461,40 @@ function setupSSE() {
 // ── Keyboard Shortcuts ──
 
 document.getElementById('chat-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); sendText(); }
+  const menu = document.getElementById('slash-autocomplete');
+  const menuOpen = menu.style.display !== 'none';
+  const items = menuOpen ? menu.querySelectorAll('.slash-item') : [];
+
+  if (menuOpen && items.length > 0) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      slash.activeIdx = Math.min(slash.activeIdx + 1, items.length - 1);
+      items.forEach((el, i) => el.classList.toggle('active', i === slash.activeIdx));
+      items[slash.activeIdx].scrollIntoView({ block: 'nearest' });
+      return;
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      slash.activeIdx = Math.max(slash.activeIdx - 1, 0);
+      items.forEach((el, i) => el.classList.toggle('active', i === slash.activeIdx));
+      items[slash.activeIdx].scrollIntoView({ block: 'nearest' });
+      return;
+    } else if (e.key === 'Tab' || (e.key === 'Enter' && slash.activeIdx >= 0)) {
+      e.preventDefault();
+      const selected = items[slash.activeIdx >= 0 ? slash.activeIdx : 0];
+      e.target.value = '/' + selected.dataset.skill + ' ';
+      menu.style.display = 'none';
+      slash.activeIdx = -1;
+      autoResizeInput(e.target);
+      return;
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      menu.style.display = 'none';
+      slash.activeIdx = -1;
+      return;
+    }
+  }
+
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
   if (e.key === 'Escape') { document.getElementById('chat-input').blur(); }
 });
 
@@ -695,88 +798,22 @@ document.getElementById('np-prompt').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); startNewProject(); }
 });
 
-// ── PTT (Push-to-Talk) via MediaRecorder + server-side Apple STT ──
+// ── PTT (Push-to-Talk) — Live SpeechRecognition + server-side sounds ──
 
 const ptt = {
   active: false,
   recognition: null,
   finalTranscript: '',
-  micDeviceId: null,
-  speakerDeviceId: null,
 };
 
-// Find the UACDemoV1.0 mic and speaker device IDs
-async function pttFindDevices() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    for (const d of devices) {
-      if (d.label.includes('UACDemoV1.0') || d.label.includes('Jieli')) {
-        if (d.kind === 'audioinput') ptt.micDeviceId = d.deviceId;
-        if (d.kind === 'audiooutput') ptt.speakerDeviceId = d.deviceId;
-      }
-    }
-    console.log('[PTT] mic:', ptt.micDeviceId ? 'found' : 'not found',
-                'speaker:', ptt.speakerDeviceId ? 'found' : 'not found');
-    pttRouteSpeaker();
-  } catch (err) {
-    console.error('[PTT] device enumeration failed:', err);
-  }
-}
-
-// Preload squelch sounds
-const squelchOpenEl = new Audio('/audio/squelch-open.wav');
-const squelchCloseEl = new Audio('/audio/squelch-close.wav');
-squelchOpenEl.preload = 'auto';
-squelchCloseEl.preload = 'auto';
-
-let squelchAudioCtx = null;
-let squelchOpenBuf = null;
-let squelchCloseBuf = null;
-
-async function pttPreloadSquelch() {
-  try {
-    squelchAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const [openResp, closeResp] = await Promise.all([
-      fetch('/audio/squelch-open.wav'),
-      fetch('/audio/squelch-close.wav'),
-    ]);
-    squelchOpenBuf = await squelchAudioCtx.decodeAudioData(await openResp.arrayBuffer());
-    squelchCloseBuf = await squelchAudioCtx.decodeAudioData(await closeResp.arrayBuffer());
-    console.log('[PTT] squelch sounds preloaded');
-  } catch (e) {
-    console.error('[PTT] squelch preload failed:', e);
-  }
-}
-
-async function pttRouteSpeaker() {
-  if (ptt.speakerDeviceId) {
-    try {
-      if (squelchOpenEl.setSinkId) await squelchOpenEl.setSinkId(ptt.speakerDeviceId);
-      if (squelchCloseEl.setSinkId) await squelchCloseEl.setSinkId(ptt.speakerDeviceId);
-      console.log('[PTT] squelch routed to USB speaker');
-    } catch (e) {
-      console.warn('[PTT] setSinkId failed, using default output:', e);
-    }
-  }
-}
-
+// Sounds play server-side through USB mic speaker via sounddevice
 function pttPlaySquelch(type) {
-  if (ptt.speakerDeviceId) {
-    // USB speaker available — use Audio element only (supports setSinkId)
-    const el = type === 'open' ? squelchOpenEl : squelchCloseEl;
-    el.currentTime = 0;
-    el.play().catch(() => {});
-  } else if (squelchAudioCtx && (type === 'open' ? squelchOpenBuf : squelchCloseBuf)) {
-    // No USB speaker — fall back to Web Audio API (default output)
-    if (squelchAudioCtx.state === 'suspended') squelchAudioCtx.resume();
-    const source = squelchAudioCtx.createBufferSource();
-    source.buffer = type === 'open' ? squelchOpenBuf : squelchCloseBuf;
-    source.connect(squelchAudioCtx.destination);
-    source.start();
-  }
+  fetch('/api/ptt/sound', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type }),
+  }).catch(() => {});
 }
-
-pttPreloadSquelch();
 
 // F2 keydown/keyup from QX18A PTT button (direct — no SSE relay needed)
 document.addEventListener('keydown', (e) => {
@@ -796,10 +833,7 @@ document.addEventListener('keyup', (e) => {
 }, true);
 
 function setupPTT() {
-  // Request mic permission on load and find USB mic device
-  navigator.mediaDevices.getUserMedia({ audio: true })
-    .then(stream => { stream.getTracks().forEach(t => t.stop()); pttFindDevices(); })
-    .catch(() => console.warn('[PTT] mic permission denied'));
+  // Nothing to set up — F2 key listeners handle everything
 }
 
 async function pttStart() {
@@ -816,6 +850,7 @@ async function pttStart() {
   pttPlaySquelch('open');
 
   const input = document.getElementById('chat-input');
+  input.value = '';
   input.dataset.origPlaceholder = input.placeholder;
   input.placeholder = '🎙 Listening...';
   input.style.borderColor = 'var(--green)';
@@ -826,10 +861,14 @@ async function pttStart() {
   ptt.recognition.interimResults = true;
   ptt.recognition.lang = 'en-US';
 
+  // Track where this session's results start so we don't repeat old ones
+  let resultStartIdx = -1;
+
   ptt.recognition.onresult = (event) => {
+    if (resultStartIdx < 0) resultStartIdx = event.resultIndex;
     let interim = '';
     let final = '';
-    for (let i = 0; i < event.results.length; i++) {
+    for (let i = resultStartIdx; i < event.results.length; i++) {
       if (event.results[i].isFinal) {
         final += event.results[i][0].transcript;
       } else {
@@ -838,6 +877,7 @@ async function pttStart() {
     }
     ptt.finalTranscript = final;
     input.value = (final + interim).trim();
+    autoResizeInput(input);
   };
 
   ptt.recognition.onerror = (event) => {

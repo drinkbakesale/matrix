@@ -353,6 +353,8 @@ body {
   background: var(--surface);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+  align-items: flex-end;
+  position: relative;
 }
 
 #chat-input {
@@ -366,6 +368,10 @@ body {
   font-size: 14px;
   outline: none;
   caret-color: var(--green);
+  resize: none;
+  overflow-y: auto;
+  max-height: 50vh;
+  line-height: 1.4;
 }
 
 #chat-input::placeholder { color: var(--dim); }
@@ -762,4 +768,36 @@ body {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
+}
+
+/* ── Slash Command Autocomplete ── */
+#slash-autocomplete {
+  position: absolute;
+  bottom: 100%;
+  left: 16px;
+  right: 16px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 4px;
+  z-index: 100;
+}
+
+#slash-autocomplete .slash-item {
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--green);
+  font-family: inherit;
+}
+
+#slash-autocomplete .slash-item:hover,
+#slash-autocomplete .slash-item.active {
+  background: rgba(0, 255, 65, 0.1);
+}
+
+#slash-autocomplete .slash-item .slash-prefix {
+  color: var(--dim);
 }

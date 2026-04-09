@@ -27,7 +27,8 @@
         </header>
         <pre id="terminal"></pre>
         <div id="chat-input-bar">
-          <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off" autocorrect="off">
+          <div id="slash-autocomplete" style="display:none"></div>
+          <textarea id="chat-input" placeholder="Type a message..." autocomplete="off" autocorrect="off" rows="1"></textarea>
           <button id="chat-send">Send</button>
         </div>
       </div>

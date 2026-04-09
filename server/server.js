@@ -141,6 +141,11 @@ app.post('/api/notify', (req, res) => {
   const { message, project, session } = req.body;
   const sess = session || project || '';
   const msg = message || 'Claude needs input';
+
+  // Ignore the "how is Claude doing" session check — not a real question
+  if (/how is claude/i.test(msg)) {
+    return res.json({ ok: true, ignored: true });
+  }
   const notification = {
     type: 'notification',
     message: msg,
@@ -456,8 +461,31 @@ app.get('/api/sessions', (req, res) => {
         displayName = folderName;
       }
 
-      // Method 4: use Claude's pane title (conversation topic)
-      // Claude Code sets pane_title to things like "✳ Resume polymarket app development"
+      // Method 4: for home-dir sessions, quick scrollback scan for project paths
+      if (!displayName && isHomeDir && claudeRunning) {
+        try {
+          const scrollback = execSync(
+            `tmux capture-pane -t '${name}:0' -p -S -20 2>/dev/null`,
+            { encoding: 'utf8', timeout: 1000 }
+          );
+          const pathRe = /(?:\/Users\/\w+|~)\/(Desktop|Projects|Downloads)\/(?:projects\/)?([^\s/"',;:()[\]{}]+)/g;
+          const skipNames = new Set(['projects', 'desktop', 'downloads', 'documents', 'src', 'lib', 'node_modules', 'output']);
+          const hits = {};
+          let m;
+          while ((m = pathRe.exec(scrollback)) !== null) {
+            const dir = m[2];
+            if (dir.length > 2 && !dir.startsWith('.') && !skipNames.has(dir.toLowerCase())) {
+              hits[dir] = (hits[dir] || 0) + 1;
+            }
+          }
+          const best = Object.entries(hits).sort((a, b) => b[1] - a[1]);
+          if (best.length > 0) {
+            displayName = best[0][0];
+          }
+        } catch {}
+      }
+
+      // Method 5: use Claude's pane title (conversation topic)
       // Strip leading spinner/status chars and the hostname default
       if (!displayName && paneTitle) {
         const cleaned = paneTitle
@@ -471,7 +499,7 @@ app.get('/api/sessions', (req, res) => {
         }
       }
 
-      // Method 5: derive from tmux session name (strip numeric suffix)
+      // Method 6: derive from tmux session name (strip numeric suffix)
       if (!displayName) {
         const baseName = name.replace(/-\d+$/, '');
         if (!/^\d+$/.test(baseName)) {
@@ -479,7 +507,7 @@ app.get('/api/sessions', (req, res) => {
         }
       }
 
-      // Method 6: fallback to session name
+      // Method 7: fallback to session name
       if (!displayName) {
         displayName = name;
       }
@@ -553,9 +581,17 @@ app.get('/api/sessions', (req, res) => {
 
     const deduped = [...groups.values()];
 
-    // Sort: needs-attention first, then by most recent activity
+    // Strip leading "_ " from display names
+    for (const s of deduped) {
+      s.displayName = s.displayName.replace(/^_\s+/, '');
+    }
+
+    // Sort: attention first, then named projects above numbered ones, then by activity
     deduped.sort((a, b) => {
       if (a.needsAttention !== b.needsAttention) return a.needsAttention ? -1 : 1;
+      const aNumbered = /^\d+$/.test(a.displayName);
+      const bNumbered = /^\d+$/.test(b.displayName);
+      if (aNumbered !== bNumbered) return aNumbered ? 1 : -1;
       return b.lastActivity - a.lastActivity;
     });
 
@@ -574,6 +610,12 @@ app.post('/api/send', (req, res) => {
     execSync(`tmux send-keys -t '${session}' ${JSON.stringify(text)} Enter`);
     delete pendingAttention[session];
     delete lastSeenQuestions[session];
+    const sessData = global._lastSessions || [];
+    const match = sessData.find(s => s.name === session);
+    if (match) {
+      delete pendingAttention[match.displayName];
+      delete pendingAttention[match.displayName.toLowerCase()];
+    }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -940,8 +982,15 @@ wss.on('connection', (ws, req) => {
         const hex = Buffer.from(msg.data).toString('hex').match(/.{2}/g).map(h => '0x' + h).join(' ');
         execSync(`tmux send-keys -t '${target}' -H ${hex} 2>/dev/null`);
         // Clear attention — user just sent input
+        // Clear all possible keys (tmux name, display name variants)
         delete pendingAttention[session];
         delete lastSeenQuestions[session];
+        const sessData = global._lastSessions || [];
+        const match = sessData.find(s => s.name === session);
+        if (match) {
+          delete pendingAttention[match.displayName];
+          delete pendingAttention[match.displayName.toLowerCase()];
+        }
       } else if (msg.type === 'resize') {
         // Re-send pane size (phone may have rotated or keyboard toggled)
         const size = getPaneSize();
@@ -1029,21 +1078,78 @@ app.get('/api/ptt/stream', (req, res) => {
   req.on('close', () => pttClients.delete(res));
 });
 
+// Play squelch sound through USB mic speaker via persistent sound server
+const SOUND_SOCKET = '/tmp/matrix-sound.sock';
+
+function playSquelch(name) {
+  try {
+    const client = net.createConnection(SOUND_SOCKET, () => {
+      client.write(name);
+      client.end();
+    });
+    client.on('error', () => {}); // sound server not running, ignore
+  } catch {}
+}
+
+// Launch persistent sound server
+function ensureSoundServer() {
+  if (fs.existsSync(SOUND_SOCKET)) return;
+  const soundScript = path.join(__dirname, 'sound-server.py');
+  if (!fs.existsSync(soundScript)) return;
+  const child = exec(`${PYTHON_PATH} "${soundScript}"`, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  child.unref();
+  console.log('[sound] Started sound server, PID:', child.pid);
+}
+ensureSoundServer();
+
 app.post('/api/ptt-event', (req, res) => {
   const { event } = req.body;
   if (event === 'start' && pttState !== 'recording') {
     pttState = 'recording';
+    playSquelch('squelch_open');
     const payload = `data: ${JSON.stringify({ type: 'ptt-state', state: 'recording' })}\n\n`;
     for (const client of pttClients) client.write(payload);
     res.json({ ok: true, state: 'recording' });
   } else if (event === 'stop' && pttState !== 'idle') {
     pttState = 'idle';
+    playSquelch('squelch_close');
     const payload = `data: ${JSON.stringify({ type: 'ptt-state', state: 'idle' })}\n\n`;
     for (const client of pttClients) client.write(payload);
     res.json({ ok: true, state: 'idle' });
   } else {
     res.json({ ok: true, state: pttState, unchanged: true });
   }
+});
+
+// Also play sounds on direct F2-triggered PTT from browser
+app.post('/api/ptt/sound', (req, res) => {
+  const { type } = req.body;
+  if (type === 'open') playSquelch('squelch_open');
+  else if (type === 'close') playSquelch('squelch_close');
+  res.json({ ok: true });
+});
+
+// ── Skills List (for slash-command autocomplete) ──
+const SKILLS_DIR = path.join(os.homedir(), '.claude', 'skills');
+let skillsCache = [];
+let skillsCacheTime = 0;
+
+app.get('/api/skills', (req, res) => {
+  const now = Date.now();
+  if (now - skillsCacheTime > 30000) {
+    try {
+      skillsCache = fs.readdirSync(SKILLS_DIR)
+        .filter(name => {
+          try { return fs.statSync(path.join(SKILLS_DIR, name)).isDirectory(); }
+          catch { return false; }
+        })
+        .sort();
+    } catch { skillsCache = []; }
+    skillsCacheTime = now;
+  }
+  res.json(skillsCache);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
