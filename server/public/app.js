@@ -1,6 +1,33 @@
 let ws = null;
 let currentSession = null;
 let notifSource = null;
+let userScrolledUp = false;
+
+const MAX_DOM_MESSAGES = 1000;
+
+// ── Scroll Tracking ──
+
+function isNearBottom(viewer) {
+  return viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 100;
+}
+
+function autoScroll(viewer) {
+  if (!userScrolledUp) {
+    viewer.scrollTop = viewer.scrollHeight;
+  }
+}
+
+function pruneMessages(viewer) {
+  const msgs = viewer.querySelectorAll('.msg');
+  if (msgs.length <= MAX_DOM_MESSAGES) return;
+  const toRemove = msgs.length - MAX_DOM_MESSAGES;
+  const prevHeight = viewer.scrollHeight;
+  for (let i = 0; i < toRemove; i++) msgs[i].remove();
+  // Adjust scroll position so view doesn't jump
+  if (userScrolledUp) {
+    viewer.scrollTop -= (prevHeight - viewer.scrollHeight);
+  }
+}
 
 // ── Notifications ──
 
@@ -21,7 +48,7 @@ function setupNotifications() {
 
 async function subscribeToPush() {
   const dbg = document.getElementById('push-debug');
-  function setDebug(msg) { if (dbg) dbg.textContent = msg; }
+  function setDebug(msg) { if (dbg) { dbg.textContent = msg; dbg.style.display = msg ? 'block' : 'none'; } }
 
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     setDebug(`No push: SW=${'serviceWorker' in navigator} PM=${'PushManager' in window}`);
@@ -42,7 +69,12 @@ async function subscribeToPush() {
     }
     setDebug('Fetching VAPID key...');
     const res = await fetch('/api/push/vapid-key');
-    const { publicKey } = await res.json();
+    const json = await res.json();
+    const publicKey = json.publicKey;
+    if (!publicKey) {
+      setDebug('VAPID key not configured — run "npm run setup"');
+      return false;
+    }
     setDebug('Subscribing to push...');
     sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,
@@ -97,8 +129,6 @@ async function resolveSession(nameOrProject) {
 }
 
 function showToast(data) {
-  // New notification clears dismissed state and re-sorts list
-  undismissSession(data.session);
   if (!currentSession) loadSessions();
   if (currentSession === data.session) return;
   document.querySelector('.notification-toast')?.remove();
@@ -123,7 +153,7 @@ function showToast(data) {
 // ── Notification Permission Banner ──
 
 async function checkNotificationBanner() {
-  const banner = document.getElementById('notif-banner');
+  const banner = document.getElementById('push-setup');
   if (!banner) return;
 
   const isStandalone = navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
@@ -146,13 +176,14 @@ async function checkNotificationBanner() {
     return;
   }
 
-  banner.style.display = 'flex';
+  banner.style.display = 'block';
   const span = banner.querySelector('span');
-  const btn = document.getElementById('notif-enable-btn');
+  const btn = document.getElementById('push-enable-btn');
 
   if (!isStandalone) {
     span.textContent = 'Add to Home Screen first, then open from there to enable notifications';
     btn.textContent = 'OK';
+    btn.onclick = () => { banner.style.display = 'none'; };
   } else if (!hasNotif || !hasPush) {
     // Web push needs HTTPS — ntfy handles notifications, just hide the banner
     banner.style.display = 'none';
@@ -166,7 +197,7 @@ async function checkNotificationBanner() {
 }
 
 async function enableNotifications() {
-  const banner = document.getElementById('notif-banner');
+  const banner = document.getElementById('push-setup');
   const ok = await subscribeToPush();
   if (ok) {
     banner.style.display = 'none';
@@ -191,6 +222,12 @@ function dismissSession(name) {
   const d = getDismissed();
   d[name] = Date.now();
   localStorage.setItem('dismissed', JSON.stringify(d));
+  // Clear attention server-side so polling doesn't re-highlight
+  fetch('/api/dismiss', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session: name }),
+  }).catch(() => {});
 }
 
 function undismissSession(name) {
@@ -390,12 +427,24 @@ function filterStatusLines(text) {
 }
 
 function connectWebSocket(session, windowName) {
-  if (ws) { ws.close(); ws = null; }
+  if (ws) {
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    ws.close();
+    ws = null;
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${proto}//${location.host}/?session=${encodeURIComponent(session)}${windowName ? `&window=${encodeURIComponent(windowName)}` : ''}`;
   ws = new WebSocket(wsUrl);
 
   const viewer = document.getElementById('terminal');
+
+  // Track user scroll — detect when user scrolls up, re-enable when they scroll back down
+  viewer.addEventListener('scroll', () => {
+    userScrolledUp = !isNearBottom(viewer);
+  }, { passive: true });
 
   ws.onopen = () => {
     console.log('[ws] connected to', session);
@@ -410,6 +459,7 @@ function connectWebSocket(session, windowName) {
     div.className = `msg msg-${role}`;
     div.textContent = text;
     viewer.appendChild(div);
+    pruneMessages(viewer);
   }
 
   function flushPending() {
@@ -435,7 +485,7 @@ function connectWebSocket(session, windowName) {
         pendingText += clean;
         flushPending();
         screenLineCount = 0;
-        viewer.scrollTop = viewer.scrollHeight;
+        autoScroll(viewer);
       } else if (msg.type === 'screen') {
         const clean = filterStatusLines(stripAnsi(msg.data));
         const screenEl = viewer.querySelector('.msg-screen');
@@ -447,7 +497,7 @@ function connectWebSocket(session, windowName) {
           div.textContent = screenLines.join('\n');
           viewer.appendChild(div);
         }
-        viewer.scrollTop = viewer.scrollHeight;
+        autoScroll(viewer);
       }
     } catch {}
   };
@@ -467,9 +517,17 @@ function connectWebSocket(session, windowName) {
 }
 
 function openTerminal(session, windowName) {
-  if (ws) { ws.close(); ws = null; }
+  if (ws) {
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    ws.close();
+    ws = null;
+  }
 
   currentSession = session;
+  userScrolledUp = false;
   document.getElementById('list-view').style.display = 'none';
   document.getElementById('term-view').style.display = 'flex';
   document.getElementById('term-title').textContent = windowName ? `${session} → ${windowName}` : session;
@@ -503,6 +561,7 @@ function sendText() {
     div.className = 'msg msg-human';
     div.textContent = text;
     viewer.appendChild(div);
+    userScrolledUp = false;
     viewer.scrollTop = viewer.scrollHeight;
     ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
     input.value = '';
@@ -659,9 +718,8 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 window.visualViewport?.addEventListener('resize', () => {
-  // Scroll to bottom when keyboard shows/hides
   const viewer = document.getElementById('terminal');
-  if (viewer) viewer.scrollTop = viewer.scrollHeight;
+  if (viewer) autoScroll(viewer);
 });
 
 if ('serviceWorker' in navigator) {

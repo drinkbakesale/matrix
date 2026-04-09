@@ -135,6 +135,7 @@ app.post('/api/push/subscribe', (req, res) => {
 let pendingAlerts = [];
 let pendingAttention = {}; // session → true when notification fired, cleared when user sends input
 let lastSeenQuestions = {}; // session → last question text (to avoid re-triggering)
+let dismissedUntilChange = {}; // session → dismissed message text; suppress until message changes
 
 // POST: receive notification from cr-notify hook
 app.post('/api/notify', (req, res) => {
@@ -146,6 +147,16 @@ app.post('/api/notify', (req, res) => {
   if (/how is claude/i.test(msg)) {
     return res.json({ ok: true, ignored: true });
   }
+
+  // If this session was dismissed, suppress until a genuinely new notification arrives.
+  // '*' sentinel means suppress everything; specific message means suppress only that exact repeat.
+  const dismissedMsg = dismissedUntilChange[sess];
+  if (dismissedMsg && (dismissedMsg === '*' || dismissedMsg === msg)) {
+    return res.json({ ok: true, suppressed: true });
+  }
+  // New/different message — this is a genuinely new question, clear the dismiss
+  delete dismissedUntilChange[sess];
+
   const notification = {
     type: 'notification',
     message: msg,
@@ -157,6 +168,7 @@ app.post('/api/notify', (req, res) => {
   pendingAlerts.push({ session: sess, message: msg, timestamp: Date.now() });
   // Mark session as needing attention (cleared when user sends input via /api/send or WS)
   pendingAttention[sess] = true;
+  lastSeenQuestions[sess] = msg;
   // SSE toast (in-app)
   const payload = `data: ${JSON.stringify(notification)}\n\n`;
   for (const client of sseClients) {
@@ -602,6 +614,29 @@ app.get('/api/sessions', (req, res) => {
   }
 });
 
+// API: dismiss attention for a session (user snoozed it)
+app.post('/api/dismiss', (req, res) => {
+  const { session } = req.body;
+  if (!session) return res.status(400).json({ error: 'session required' });
+  // Remember the last notification message so we can suppress repeats of the same question.
+  // If no specific message was tracked, use '*' sentinel to suppress ALL re-notifications
+  // until the session gets new input or a genuinely different notification.
+  const lastMsg = lastSeenQuestions[session] || '*';
+  dismissedUntilChange[session] = lastMsg;
+  delete pendingAttention[session];
+  delete lastSeenQuestions[session];
+  // Also clear by display name variants
+  const sessData = global._lastSessions || [];
+  const match = sessData.find(s => s.name === session);
+  if (match) {
+    delete pendingAttention[match.displayName];
+    delete pendingAttention[match.displayName.toLowerCase()];
+    dismissedUntilChange[match.displayName] = lastMsg;
+    dismissedUntilChange[match.displayName.toLowerCase()] = lastMsg;
+  }
+  res.json({ ok: true });
+});
+
 // API: send text to a tmux pane
 app.post('/api/send', (req, res) => {
   const { session, text } = req.body;
@@ -610,11 +645,14 @@ app.post('/api/send', (req, res) => {
     execSync(`tmux send-keys -t '${session}' ${JSON.stringify(text)} Enter`);
     delete pendingAttention[session];
     delete lastSeenQuestions[session];
+    delete dismissedUntilChange[session];
     const sessData = global._lastSessions || [];
     const match = sessData.find(s => s.name === session);
     if (match) {
       delete pendingAttention[match.displayName];
       delete pendingAttention[match.displayName.toLowerCase()];
+      delete dismissedUntilChange[match.displayName];
+      delete dismissedUntilChange[match.displayName.toLowerCase()];
     }
     res.json({ ok: true });
   } catch (e) {
@@ -848,6 +886,9 @@ app.delete('/api/sessions/:name', (req, res) => {
 
 // ── WebSocket: tmux pane streaming via capture-pane polling ──
 
+// Track last-sent line count per tmux target so reconnects send only new content
+const targetLineTracker = {};
+
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const session = url.searchParams.get('session');
@@ -914,14 +955,26 @@ wss.on('connection', (ws, req) => {
     const size = getPaneSize();
     ws.send(JSON.stringify({ type: 'pane-size', cols: size.cols, rows: size.rows }));
 
-    // Send full scrollback + visible screen on connect
+    // Send scrollback on connect — on reconnect, only send lines since last disconnect
     const all = captureAll();
-    if (all.trim()) {
+    const allLines = all.split('\n');
+    const prevCount = targetLineTracker[target] || 0;
+
+    if (prevCount > 0 && prevCount < allLines.length) {
+      // Reconnect — only send new lines since last disconnect
+      const newLines = allLines.slice(prevCount);
+      if (newLines.join('').trim()) {
+        ws.send(JSON.stringify({ type: 'output', data: newLines.join('\r\n') + '\r\n' }));
+      }
+    } else if (all.trim()) {
+      // First connect or line count reset — send full scrollback
       ws.send(JSON.stringify({ type: 'output', data: all.replace(/\n/g, '\r\n') }));
     }
-    const lines = all.split('\n');
+
+    const lines = allLines;
     lastLineCount = lines.length;
     lastFullText = all;
+    targetLineTracker[target] = lastLineCount;
 
     // Poll for new content at ~100ms for near-realtime updates.
     // Sends new scrollback lines AND visible-screen changes.
@@ -959,6 +1012,7 @@ wss.on('connection', (ws, req) => {
 
         lastLineCount = currentLines.length;
         lastFullText = current;
+        targetLineTracker[target] = lastLineCount;
       } catch {
         captureErrors++;
         if (captureErrors > 20) {
@@ -985,11 +1039,14 @@ wss.on('connection', (ws, req) => {
         // Clear all possible keys (tmux name, display name variants)
         delete pendingAttention[session];
         delete lastSeenQuestions[session];
+        delete dismissedUntilChange[session];
         const sessData = global._lastSessions || [];
         const match = sessData.find(s => s.name === session);
         if (match) {
           delete pendingAttention[match.displayName];
           delete pendingAttention[match.displayName.toLowerCase()];
+          delete dismissedUntilChange[match.displayName];
+          delete dismissedUntilChange[match.displayName.toLowerCase()];
         }
       } else if (msg.type === 'resize') {
         // Re-send pane size (phone may have rotated or keyboard toggled)

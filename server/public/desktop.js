@@ -35,6 +35,12 @@ function getDismissed() { return dismissed; }
 
 function dismissSession(name) {
   dismissed[name] = Date.now();
+  // Clear attention server-side so polling doesn't re-highlight
+  fetch('/api/dismiss', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session: name }),
+  }).catch(() => {});
   renderSidebar();
 }
 
@@ -53,11 +59,11 @@ async function loadSessions() {
     const sessData = await sessRes.json();
     const recentData = await recentRes.json();
     sessions = sessData.sessions || [];
-    // Sync attention from server's tmux detection + SSE notifications
+    // Sync attention from server — but respect client-side dismissals
     sessions.forEach(s => {
-      if (s.needsAttention) {
+      if (s.needsAttention && !dismissed[s.name]) {
         sessionAttention[s.name] = true;
-      } else {
+      } else if (!s.needsAttention) {
         delete sessionAttention[s.name];
       }
     });
@@ -230,6 +236,7 @@ function selectProject(name) {
 
   // Dismiss alert on the session we're leaving
   if (currentSession && sessionAttention[currentSession]) {
+    dismissSession(currentSession);
     delete sessionAttention[currentSession];
   }
 
@@ -445,7 +452,10 @@ function setupSSE() {
       if (session && session !== 'matrix') {
         const wasAlreadyWaiting = sessionAttention[session];
         sessionAttention[session] = true;
-        undismissSession(session);
+        // Only undismiss for genuinely NEW alerts — don't override user's dismiss
+        if (!wasAlreadyWaiting) {
+          undismissSession(session);
+        }
         renderSidebar();
         updateChatStatus();
 
