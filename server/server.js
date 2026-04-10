@@ -439,19 +439,16 @@ app.get('/api/sessions', (req, res) => {
         if (parts?.[2]) paneTitle = parts[2];
       } catch {}
 
-      // Derive display name using a priority chain:
-      // 1. tmux @matrix_project variable (explicit, highest priority)
-      // 2. Path registry match on pane cwd
-      // 3. Pane cwd folder name (if not ~)
-      // 4. Claude pane title (conversation topic set by Claude Code)
-      // 5. tmux session name (if not a number)
-      // 6. Fallback: raw session name
+      // Derive display name using a priority chain.
+      // Methods 1-3 give "confirmed" project names (safe to dedup).
+      // Methods 4-6 give "guessed" names (never dedup — too noisy).
       const homeDir = os.homedir();
       const registry = buildPathRegistry();
       const folderName = projectPath ? path.basename(projectPath) : '';
       const isHomeDir = !projectPath || projectPath === homeDir || folderName === os.userInfo().username;
 
       let displayName = '';
+      let projectConfirmed = false; // true = reliable project identity, safe to dedup
 
       // Method 1: explicit tmux variable (set by session or hook)
       try {
@@ -459,45 +456,22 @@ app.get('/api/sessions', (req, res) => {
           `tmux show-option -t '${name}' -v @matrix_project 2>/dev/null`,
           { encoding: 'utf8', timeout: 1000 }
         ).trim();
-        if (explicit) displayName = explicit;
+        if (explicit) { displayName = explicit; projectConfirmed = true; }
       } catch {}
 
       // Method 2: match pane cwd against path registry (skip home dir — too broad)
       if (!displayName && projectPath && projectPath !== homeDir) {
         const match = matchProject(projectPath, registry);
-        if (match) displayName = match;
+        if (match) { displayName = match; projectConfirmed = true; }
       }
 
       // Method 3: pane is in a project directory (not ~)
       if (!displayName && !isHomeDir && folderName) {
         displayName = folderName;
+        projectConfirmed = true;
       }
 
-      // Method 4: for home-dir sessions, quick scrollback scan for project paths
-      if (!displayName && isHomeDir && claudeRunning) {
-        try {
-          const scrollback = execSync(
-            `tmux capture-pane -t '${name}:0' -p -S -20 2>/dev/null`,
-            { encoding: 'utf8', timeout: 1000 }
-          );
-          const pathRe = /(?:\/Users\/\w+|~)\/(Desktop|Projects|Downloads)\/(?:projects\/)?([^\s/"',;:()[\]{}]+)/g;
-          const skipNames = new Set(['projects', 'desktop', 'downloads', 'documents', 'src', 'lib', 'node_modules', 'output']);
-          const hits = {};
-          let m;
-          while ((m = pathRe.exec(scrollback)) !== null) {
-            const dir = m[2];
-            if (dir.length > 2 && !dir.startsWith('.') && !skipNames.has(dir.toLowerCase())) {
-              hits[dir] = (hits[dir] || 0) + 1;
-            }
-          }
-          const best = Object.entries(hits).sort((a, b) => b[1] - a[1]);
-          if (best.length > 0) {
-            displayName = best[0][0];
-          }
-        } catch {}
-      }
-
-      // Method 5: use Claude's pane title (conversation topic)
+      // Method 4: use Claude's pane title (conversation topic)
       // Strip leading spinner/status chars and the hostname default
       if (!displayName && paneTitle) {
         const cleaned = paneTitle
@@ -511,15 +485,16 @@ app.get('/api/sessions', (req, res) => {
         }
       }
 
-      // Method 6: derive from tmux session name (strip numeric suffix)
+      // Method 5: derive from tmux session name (strip numeric suffix)
       if (!displayName) {
         const baseName = name.replace(/-\d+$/, '');
         if (!/^\d+$/.test(baseName)) {
           displayName = baseName;
+          projectConfirmed = true; // named tmux sessions are intentional
         }
       }
 
-      // Method 7: fallback to session name
+      // Method 6: fallback to session name
       if (!displayName) {
         displayName = name;
       }
@@ -555,39 +530,45 @@ app.get('/api/sessions', (req, res) => {
         windowList,
         claudeRunning,
         needsAttention,
-        lastActivity
+        lastActivity,
+        projectConfirmed
       };
     });
 
-    // Deduplicate: one entry per displayName. When multiple sessions share
-    // the same project name, keep the most recently active one.
-    // Sessions whose displayName is just their number (undetected) stay individual.
+    // Deduplicate: only merge sessions that have a CONFIRMED project identity.
+    // Guessed names (from pane titles, scrollback) are too noisy to dedup on —
+    // two unrelated sessions can mention the same project path in scrollback.
     const groups = new Map(); // displayName (lowercase) → best session
 
     for (const s of sessions) {
       const key = s.displayName.toLowerCase();
 
-      // Undetected sessions (displayName is just the tmux number) are unique — never merge
-      if (/^\d+$/.test(key)) {
-        groups.set(`__numbered_${s.name}`, s);
-        continue;
-      }
+      // Only merge when BOTH sessions have confirmed project identity
+      // and share the same displayName. Otherwise treat as unique.
+      if (s.projectConfirmed && !/^\d+$/.test(key)) {
+        const existing = groups.get(key);
+        if (existing && existing.projectConfirmed) {
+          // Both confirmed same project — pick winner
+          const newWins =
+            (s.claudeRunning && !existing.claudeRunning) ||
+            (s.claudeRunning === existing.claudeRunning && s.lastActivity > existing.lastActivity);
+          const winner = newWins ? s : existing;
+          const loser = newWins ? existing : s;
 
-      const existing = groups.get(key);
-      if (!existing) {
-        groups.set(key, s);
+          // Merge attention: if ANY session for this project needs attention, show it
+          if (loser.needsAttention) winner.needsAttention = true;
+
+          groups.set(key, winner);
+        } else if (!existing) {
+          // First confirmed session with this name — store under display name for merging
+          groups.set(key, s);
+        } else {
+          // Existing is unconfirmed, new is confirmed — confirmed wins
+          groups.set(key, s);
+        }
       } else {
-        // Pick winner: Claude running beats not, then most recent activity
-        const newWins =
-          (s.claudeRunning && !existing.claudeRunning) ||
-          (s.claudeRunning === existing.claudeRunning && s.lastActivity > existing.lastActivity);
-        const winner = newWins ? s : existing;
-        const loser = newWins ? existing : s;
-
-        // Merge attention: if ANY session for this project needs attention, show it
-        if (loser.needsAttention) winner.needsAttention = true;
-
-        groups.set(key, winner);
+        // Unconfirmed or numeric — unique, never merge
+        groups.set(`__unique_${s.name}`, s);
       }
     }
 
