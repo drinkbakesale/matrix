@@ -77,6 +77,22 @@ function buildRegistry() {
   // From ~/.claude/projects/ — every project Claude Code has ever been opened
   // in. This lets the hook auto-tag sessions for projects that were never
   // manually registered, which is most of them in practice.
+  //
+  // Rule: skip broad container directories like ~/Desktop, ~/Downloads,
+  // ~/Documents, ~/Projects. Those are user-workspace roots, not projects —
+  // getting an entry for them would tag every session working anywhere under
+  // Desktop as the useless name "desktop".
+  const broadContainers = new Set([
+    homeDir,
+    path.join(homeDir, 'Desktop'),
+    path.join(homeDir, 'Downloads'),
+    path.join(homeDir, 'Documents'),
+    path.join(homeDir, 'Projects'),
+    path.join(homeDir, 'Pictures'),
+    path.join(homeDir, 'Music'),
+    path.join(homeDir, 'Movies'),
+    path.join(homeDir, 'Library'),
+  ]);
   try {
     const claudeProjectsDir = path.join(homeDir, '.claude', 'projects');
     for (const name of fs.readdirSync(claudeProjectsDir)) {
@@ -84,9 +100,9 @@ function buildRegistry() {
       if (name.startsWith('-private-')) continue;                  // temp battle dirs
       if (name.includes('--claude-mem-')) continue;                // mem-observer
       if (name.includes('generated-apps-')) continue;              // generated scratch dirs
-      if (name === '-Users-' + (process.env.USER || '')) continue; // plain home, too broad
       const decoded = decodeClaudeProjectPath(name);
-      if (!decoded || decoded === homeDir) continue;
+      if (!decoded) continue;
+      if (broadContainers.has(decoded)) continue;                  // not a project
       const projectName = path.basename(decoded).toLowerCase().replace(/[^a-z0-9-]/g, '-');
       if (projectName) entries.push({ prefix: decoded, name: projectName });
     }
