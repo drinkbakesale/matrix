@@ -47,10 +47,13 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // ── Web Push Setup ──
+// VAPID "sub" claim must be a valid mailto:/https: URI with a routable domain.
+// Apple Push Services rejects localhost/non-routable domains with 403 BadJwtToken.
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:matrix@example.com';
 let vapid = null;
 try {
   vapid = JSON.parse(fs.readFileSync(VAPID_PATH, 'utf8'));
-  webpush.setVapidDetails('mailto:matrix@localhost', vapid.publicKey, vapid.privateKey);
+  webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 } catch (err) {
   console.warn(`[web-push] Could not load VAPID keys from ${VAPID_PATH}`);
   console.warn('[web-push] Run "npm run setup" to generate VAPID keys, or create vapid.json manually.');
@@ -78,7 +81,8 @@ async function sendPush(title, body, session) {
       await webpush.sendNotification(pushSubscriptions[i], payload);
       console.log(`[push] sent to sub ${i}`);
     } catch (err) {
-      console.error(`[push] failed sub ${i}:`, err.statusCode || err.message, err.body || '');
+      const detail = err.statusCode || err.message || err.code || err.name || String(err);
+      console.error(`[push] failed sub ${i}: ${detail}`, err.body || '');
       if (err.statusCode === 404 || err.statusCode === 410) dead.push(i);
     }
   }
@@ -471,26 +475,34 @@ app.get('/api/sessions', (req, res) => {
         projectConfirmed = true;
       }
 
-      // Method 4: use Claude's pane title (conversation topic)
-      // Strip leading spinner/status chars and the hostname default
+      // Method 4: derive from tmux session name (strip numeric suffix).
+      // A named tmux session is explicit user intent — preferred over pane title,
+      // which is Claude's conversation topic and changes constantly (slice_003).
+      if (!displayName) {
+        const baseName = name.replace(/-\d+$/, '');
+        if (!/^\d+$/.test(baseName)) {
+          displayName = baseName;
+          projectConfirmed = true; // named tmux sessions are intentional
+        }
+      }
+
+      // Method 5: Claude's pane title — ONLY if it looks like a project identifier,
+      // not a sentence. Pane titles reflect conversation topics like "Update X" and
+      // shouldn't become displayNames (slice_003).
       if (!displayName && paneTitle) {
         const cleaned = paneTitle
           .replace(/^[\u2800-\u28FF\u2732\u2733\u2734\u2022\s]+/, '') // strip braille spinners, asterisks
           .replace(/^Claude Code\s*$/i, '')  // skip generic "Claude Code" title
           .trim();
         const hostname = os.hostname();
-        if (cleaned && !cleaned.includes(hostname) && cleaned.length > 2) {
-          // Truncate long titles to a reasonable display name
-          displayName = cleaned.length > 50 ? cleaned.slice(0, 47) + '...' : cleaned;
-        }
-      }
-
-      // Method 5: derive from tmux session name (strip numeric suffix)
-      if (!displayName) {
-        const baseName = name.replace(/-\d+$/, '');
-        if (!/^\d+$/.test(baseName)) {
-          displayName = baseName;
-          projectConfirmed = true; // named tmux sessions are intentional
+        const words = cleaned.split(/\s+/);
+        const looksLikeSentence =
+          words.length > 2 ||
+          /^(Update|Fix|Add|Create|Set|Build|Debug|Refactor|Write|Test|Implement|Remove|Delete|Check|Make|Get|Run|Launch|Start|Investigate|Analyze|Review|Design|Plan)\b/i.test(cleaned) ||
+          /[.!?]$/.test(cleaned);
+        if (cleaned && !cleaned.includes(hostname) && cleaned.length > 2 && !looksLikeSentence) {
+          displayName = cleaned;
+          // Pane titles are guessed — never set projectConfirmed.
         }
       }
 
@@ -1054,20 +1066,53 @@ wss.on('connection', (ws, req) => {
 });
 
 // Periodically clear pendingAttention for sessions where Claude is no longer idle
-// (user responded via iTerm or Claude started processing a new task)
+// (user responded via iTerm or Claude started processing a new task).
+// slice_002: pendingAttention may be keyed by tmux session name OR displayName
+// (cr-notify passes displayName). Resolve via _lastSessions so both variants get
+// cleared, and prune orphans (keys that no longer match any live tmux session).
 setInterval(() => {
-  for (const name of Object.keys(pendingAttention)) {
+  if (Object.keys(pendingAttention).length === 0) return;
+
+  const sessData = global._lastSessions || [];
+  if (sessData.length === 0) return; // dashboard hasn't polled yet; try again next tick
+
+  // Build the set of all valid keys from live sessions
+  const validKeys = new Set();
+  for (const s of sessData) {
+    validKeys.add(s.name);
+    if (s.displayName) {
+      validKeys.add(s.displayName);
+      validKeys.add(s.displayName.toLowerCase());
+    }
+  }
+
+  // Prune orphans — keys that no longer correspond to any live session
+  for (const key of Object.keys(pendingAttention)) {
+    if (!validKeys.has(key)) {
+      delete pendingAttention[key];
+      delete dismissedUntilChange[key];
+      delete lastSeenQuestions[key];
+    }
+  }
+
+  // For each live session with any pending-attention variant, check if Claude
+  // is actively processing. If so, clear all variants for that session.
+  for (const s of sessData) {
+    const keys = [s.name];
+    if (s.displayName) keys.push(s.displayName, s.displayName.toLowerCase());
+    const hasPending = keys.some(k => pendingAttention[k]);
+    if (!hasPending) continue;
+
     try {
       const tail = execSync(
-        `tmux capture-pane -t '${name}:0' -p -S -5 2>/dev/null`,
+        `tmux capture-pane -t '${s.name}:0' -p -S -5 2>/dev/null`,
         { encoding: 'utf8', timeout: 1000 }
       );
       const lines = tail.split('\n').map(l => l.trim()).filter(Boolean);
-      // If the last non-status lines show active processing, clear attention
       const hasSpinner = lines.some(l => /^[✻✳⏺]\s/.test(l) || /Running…|Working/i.test(l));
       const hasProgress = lines.some(l => /\d+%/.test(l) && (l.includes('░') || l.includes('█')));
       if (hasSpinner || hasProgress) {
-        delete pendingAttention[name];
+        for (const k of keys) delete pendingAttention[k];
       }
     } catch {}
   }

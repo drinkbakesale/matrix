@@ -3,31 +3,44 @@
 PROJECT=$(basename "$PWD")
 MSG="${1:-Claude needs input in $PROJECT}"
 
-# Find the best matching tmux session (longest path match wins)
 SESSION=""
-BEST_LEN=0
+TMUX_SESSION=""
 
-while IFS='|' read -r name spath _; do
-  expanded=$(eval echo "$spath")
-  if [[ "$PWD" == "$expanded"* ]]; then
-    len=${#expanded}
-    if (( len > BEST_LEN )); then
-      BEST_LEN=$len
-      SESSION="$name"
-    fi
-  fi
-done < <(grep -v '^\s*#' "${MATRIX_HOME:-$HOME/.matrix}/projects.conf" 2>/dev/null | grep -v '^\s*$')
-
-# Fallback: detect tmux session we're running inside
-if [ -z "$SESSION" ] && [ -n "$TMUX_PANE" ]; then
-  SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+# Priority 1: tmux @matrix_project variable (set by matrix-project-tag.js hook)
+if [ -n "$TMUX_PANE" ]; then
+  TMUX_SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  SESSION=$(tmux show-option -t "$TMUX_SESSION" -v @matrix_project 2>/dev/null || true)
 fi
 
-# Fallback to project folder name
+# Priority 2: match $PWD against projects.conf (longest path wins)
+if [ -z "$SESSION" ]; then
+  BEST_LEN=0
+  while IFS='|' read -r name spath _; do
+    expanded=$(eval echo "$spath")
+    if [[ "$PWD" == "$expanded"* ]]; then
+      len=${#expanded}
+      if (( len > BEST_LEN )); then
+        BEST_LEN=$len
+        SESSION="$name"
+      fi
+    fi
+  done < <(grep -v '^\s*#' "${MATRIX_HOME:-$HOME/.matrix}/projects.conf" 2>/dev/null | grep -v '^\s*$')
+fi
+
+# Priority 3: tmux session name itself
+if [ -z "$SESSION" ] && [ -n "$TMUX_SESSION" ]; then
+  SESSION="$TMUX_SESSION"
+fi
+
+# Priority 4: folder name
 SESSION="${SESSION:-$PROJECT}"
 
-# Suppress notifications from the matrix (home directory) session — that's the control session
-[[ "$SESSION" == "matrix" ]] && exit 0
+# Suppress notifications from the actual matrix control session (home directory).
+# Only when @matrix_project explicitly says "matrix" AND tmux session is "matrix" —
+# don't suppress numbered sessions that happen to have PWD=~.
+if [[ "$SESSION" == "matrix" && "$TMUX_SESSION" == "matrix" ]]; then
+  exit 0
+fi
 
 # Post to server — handles SSE toast + web push
 curl -s -X POST "http://localhost:${MATRIX_PORT:-7778}/api/notify" \
