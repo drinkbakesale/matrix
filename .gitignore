@@ -2,3 +2,5 @@ node_modules/
 *.pid
 *.log
 graphify-out/
+__pycache__/
+.build/

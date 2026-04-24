@@ -405,24 +405,19 @@ def cleanup_transcription(text):
 
 
 def _transcribe(wav_path):
-    """Apple STT first (fast, on-device). Whisper socket as fallback."""
-    if os.path.exists(STT_TOOL):
-        try:
-            out = subprocess.run(
-                [STT_TOOL, wav_path],
-                capture_output=True, text=True, timeout=15,
-            )
-            if out.stdout.strip():
-                data = json.loads(out.stdout.strip())
-                text = (data.get('text') or '').strip()
-                if text:
-                    return text
-        except Exception as e:
-            print(f'[DICTATE] Apple STT failed: {e}', flush=True)
+    """Whisper is primary (handles arbitrary audio length reliably); Apple STT
+    is a fallback when the Whisper server isn't running.
+
+    Historical note: Apple STT used to be primary for speed, but
+    SFSpeechRecognizer has a hard ~10s window in practice and silently returned
+    only the tail of long recordings. Whisper `base` handles any length and
+    produces more accurate transcripts, at a cost of ~1-3s extra latency.
+    """
+    # Whisper first — reliable at any audio length
     if os.path.exists(WHISPER_SOCKET):
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(15)
+            s.settimeout(60)  # base model on 30s+ audio can need several seconds
             s.connect(WHISPER_SOCKET)
             s.sendall(wav_path.encode())
             resp = b''
@@ -433,9 +428,25 @@ def _transcribe(wav_path):
                 resp += chunk
             s.close()
             if resp:
-                return (json.loads(resp.decode()).get('text') or '').strip()
+                text = (json.loads(resp.decode()).get('text') or '').strip()
+                if text:
+                    return text
         except Exception as e:
             print(f'[DICTATE] Whisper failed: {e}', flush=True)
+    # Apple STT fallback — only used when Whisper server is unreachable
+    if os.path.exists(STT_TOOL):
+        try:
+            out = subprocess.run(
+                [STT_TOOL, wav_path],
+                capture_output=True, text=True, timeout=65,
+            )
+            if out.stdout.strip():
+                data = json.loads(out.stdout.strip())
+                text = (data.get('text') or '').strip()
+                if text:
+                    return text
+        except Exception as e:
+            print(f'[DICTATE] Apple STT failed: {e}', flush=True)
     return ''
 
 
