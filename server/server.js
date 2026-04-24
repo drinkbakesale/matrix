@@ -511,17 +511,36 @@ app.get('/api/sessions', (req, res) => {
         displayName = name;
       }
 
-      // Look up description from projects.conf or auto-detect
+      // Look up description from projects.conf or auto-detect.
+      // Don't match by path when path is home dir — that would give every numeric
+      // home-dir session the generic "home directory" description and mask the
+      // more useful pane-title fallback below.
       const confProjects = readProjects();
       let description = '';
       const confMatch = confProjects.find(p =>
         p.name === name || p.name === displayName?.toLowerCase() ||
-        p.path === projectPath
+        (p.path === projectPath && projectPath !== homeDir)
       );
       if (confMatch?.description) {
         description = confMatch.description;
       } else {
         description = detectDescription(projectPath);
+      }
+
+      // If displayName is an unhelpful fallback (numeric tmux name with no confirmed
+      // project) AND pane title looks like a Claude conversation topic, surface the
+      // title as description so the user sees what the session is working on.
+      if (!description && !projectConfirmed && paneTitle) {
+        // Strip leading spinner chars (unicode when LANG is set; `_` when tmux
+        // downgrades to ASCII without a UTF-8 locale).
+        const cleanedTitle = paneTitle
+          .replace(/^[⠀-⣿✲✳✴•_\s]+/, '')
+          .replace(/^Claude Code\s*$/i, '')
+          .trim();
+        const hostname = os.hostname();
+        if (cleanedTitle && !cleanedTitle.includes(hostname) && cleanedTitle.length > 2) {
+          description = cleanedTitle.length > 80 ? cleanedTitle.slice(0, 77) + '...' : cleanedTitle;
+        }
       }
 
       // needsAttention is driven by notification hooks, not tmux parsing.
@@ -747,6 +766,93 @@ function detectDescription(projectPath) {
   return '';
 }
 
+// ── Claude Code project history integration ──
+// Claude Code stores a session log directory per project at ~/.claude/projects/
+// encoded as `-Users-williamkehler-Desktop-projects-landing-page-optimizer`.
+// Decoding requires greedy forward-matching against the real filesystem because
+// dashes appear both as path separators AND inside folder names.
+function decodeClaudeProjectPath(encoded) {
+  const parts = encoded.replace(/^-+/, '').split('-');
+  if (parts.length === 0) return null;
+  let current = '/';
+  let i = 0;
+  while (i < parts.length) {
+    let matched = false;
+    // Try longest-first: combine parts[i..j] with dash until an existing dir is found
+    for (let j = parts.length; j > i; j--) {
+      const candidate = parts.slice(i, j).join('-');
+      if (!candidate) continue;
+      const next = path.join(current, candidate);
+      try {
+        if (fs.statSync(next).isDirectory()) {
+          current = next;
+          i = j;
+          matched = true;
+          break;
+        }
+      } catch {}
+    }
+    if (!matched) return null;
+  }
+  return current;
+}
+
+// Enumerate ~/.claude/projects/ and return projects with last-activity timestamps
+// derived from the most recent .jsonl file mtime in each project directory.
+function readClaudeProjectHistory() {
+  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const out = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(claudeProjectsDir, { withFileTypes: true });
+  } catch { return out; }
+
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const encoded = e.name;
+    // Skip non-project entries: temp battle dirs, plain home, mem-observer, etc.
+    if (encoded.startsWith('-private-')) continue;
+    if (encoded === '-Users-' + os.userInfo().username) continue;
+    if (encoded.includes('--claude-mem-')) continue;
+    if (encoded.includes('generated-apps-')) continue;
+
+    const decoded = decodeClaudeProjectPath(encoded);
+    if (!decoded) continue;
+    if (decoded === os.homedir()) continue;
+
+    // Use the encoded project directory mtime as lastActivity — reflects the last
+    // time Claude Code was launched in that project (creates/touches session files),
+    // which is more accurate than the newest .jsonl mtime (which only reflects
+    // writes to one existing session, and can be very old even when the project
+    // was reopened recently).
+    const encodedDir = path.join(claudeProjectsDir, encoded);
+    let lastActivity = 0;
+    try {
+      lastActivity = fs.statSync(encodedDir).mtimeMs;
+    } catch {}
+    // Fallback: most-recent .jsonl mtime
+    if (!lastActivity) {
+      try {
+        for (const f of fs.readdirSync(encodedDir)) {
+          if (!f.endsWith('.jsonl')) continue;
+          try {
+            const stat = fs.statSync(path.join(encodedDir, f));
+            if (stat.mtimeMs > lastActivity) lastActivity = stat.mtimeMs;
+          } catch {}
+        }
+      } catch {}
+    }
+    if (!lastActivity) continue;
+
+    out.push({
+      name: path.basename(decoded).toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+      path: decoded,
+      lastActivity,
+    });
+  }
+  return out;
+}
+
 // Auto-discover projects: scan common dirs for CLAUDE.md or .git
 app.get('/api/projects/discover', (req, res) => {
   const searchDirs = ['~/Desktop', '~/Projects', '~/Downloads', '~/Documents'].map(d => d.replace('~', os.homedir()));
@@ -773,7 +879,9 @@ app.get('/api/projects/discover', (req, res) => {
   res.json({ projects: available });
 });
 
-// API: list configured but not-running projects with last activity timestamps
+// API: list not-running projects with last activity timestamps.
+// Merges projects.conf (manually curated, has custom names + descriptions) with
+// ~/.claude/projects/ history (authoritative — everything Claude Code has touched).
 app.get('/api/projects/inactive', (req, res) => {
   const configured = readProjects();
   let running = new Set();
@@ -782,40 +890,68 @@ app.get('/api/projects/inactive', (req, res) => {
     running = new Set(raw.split('\n').filter(Boolean));
   } catch {}
 
-  // Also check which displayNames are active (to dedup against scrollback-detected names)
+  // Also filter by active displayNames + paths (don't re-show something that's
+  // already rendered as a live session with a different name).
   let activeDisplayNames = new Set();
+  let activePaths = new Set();
   try {
     const sessData = global._lastSessions || [];
     for (const s of sessData) {
       activeDisplayNames.add(s.displayName.toLowerCase());
       activeDisplayNames.add(s.name.toLowerCase());
+      if (s.path) activePaths.add(s.path);
     }
   } catch {}
 
-  const inactive = configured
-    .filter(p => !running.has(p.name) && !activeDisplayNames.has(p.name.toLowerCase()))
-    .map(p => {
-      let lastActivity = 0;
-      const projPath = p.path;
-      // Try git log for last commit date
+  // Merge sources: projects.conf entries win on name/description; Claude history
+  // contributes additional projects keyed by path.
+  const byPath = new Map();
+
+  for (const p of configured) {
+    if (!p.path) continue;
+    byPath.set(p.path, { name: p.name, path: p.path, description: p.description || '' });
+  }
+
+  for (const p of readClaudeProjectHistory()) {
+    if (byPath.has(p.path)) {
+      // Backfill lastActivity from Claude history even if conf already has the project
+      byPath.get(p.path).lastActivity = p.lastActivity;
+    } else {
+      byPath.set(p.path, { name: p.name, path: p.path, description: '', lastActivity: p.lastActivity });
+    }
+  }
+
+  // Compute lastActivity for entries that came from projects.conf only
+  const merged = [];
+  for (const p of byPath.values()) {
+    if (running.has(p.name) || activeDisplayNames.has(p.name.toLowerCase())) continue;
+    if (activePaths.has(p.path)) continue;
+
+    let lastActivity = p.lastActivity || 0;
+    if (!lastActivity) {
+      // Prefer Claude project directory mtime (most accurate "last opened")
+      const encoded = '-' + p.path.replace(/^\//, '').split('/').join('-');
+      const claudeDir = path.join(os.homedir(), '.claude', 'projects', encoded);
+      try { lastActivity = fs.statSync(claudeDir).mtimeMs; } catch {}
+    }
+    if (!lastActivity) {
+      // Fallback: git log
       try {
         const ts = execSync(
-          `git -C '${projPath}' log -1 --format=%ct 2>/dev/null`,
+          `git -C '${p.path}' log -1 --format=%ct 2>/dev/null`,
           { encoding: 'utf8', timeout: 3000 }
         ).trim();
         if (ts) lastActivity = parseInt(ts) * 1000;
       } catch {}
-      // Fallback: directory mtime
-      if (!lastActivity) {
-        try {
-          const stat = fs.statSync(projPath);
-          lastActivity = stat.mtimeMs;
-        } catch {}
-      }
-      return { ...p, lastActivity };
-    });
+    }
+    if (!lastActivity) {
+      // Final fallback: directory mtime
+      try { lastActivity = fs.statSync(p.path).mtimeMs; } catch {}
+    }
+    merged.push({ ...p, lastActivity });
+  }
 
-  res.json({ projects: inactive });
+  res.json({ projects: merged });
 });
 
 // API: add a project to projects.conf and start it
