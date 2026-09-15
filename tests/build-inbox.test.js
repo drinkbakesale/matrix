@@ -45,6 +45,13 @@ test('bounds item counts and field lengths, keeps markup as inert text', () => {
   assert.equal(r.running[0].project, '<img src=x onerror=alert(1)>');
 });
 
+test('control characters in controller fields become spaces', () => {
+  const nul = String.fromCharCode(0);
+  const esc = String.fromCharCode(27);
+  const r = parseBuildInbox(JSON.stringify({ needs_you: [], running: [{ task_id: 't-9', repo: `vo${nul}c${esc}[31m`, state: 'BUILDING' }], finished: [] }));
+  assert.equal(r.running[0].project, 'vo c [31m');
+});
+
 function fakeBinary(t, body) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matrix-buildctl-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

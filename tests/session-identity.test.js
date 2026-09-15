@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  cleanLabel,
   matchProject,
   resolveProjectIdentity,
   assignInstanceLabels,
@@ -105,6 +106,15 @@ test('project label resolves to its live session, exact name first', () => {
 test('a project with several live sessions resolves to its most recently active one', () => {
   const r = resolveNotificationTarget({ session: 'angles-to-ads' }, sessions);
   assert.deepEqual(r, { targetSession: '49', projectName: 'angles-to-ads', via: 'project-most-recent' });
+});
+
+test('labels drop control characters', () => {
+  const nul = String.fromCharCode(0);
+  const unit = String.fromCharCode(31);
+  const del = String.fromCharCode(127);
+  assert.equal(cleanLabel(`vo${nul}c-mi${unit}ner${del}\n`), 'voc-miner');
+  assert.equal(cleanLabel(42), '42');
+  assert.equal(cleanLabel({}), '');
 });
 
 test('unknown labels resolve to no target', () => {
