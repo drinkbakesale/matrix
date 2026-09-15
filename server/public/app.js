@@ -3,7 +3,51 @@ let currentSession = null;
 let notifSource = null;
 let userScrolledUp = false;
 
+let lastSessionList = [];
+let lastNotificationIntentAt = 0;
+let deferredScreenUpdate = null;
+
 const MAX_DOM_MESSAGES = 1000;
+
+// Labels that name the Matrix control surface rather than a project (mirrors
+// server/lib/session-identity.js); they never identify a terminal on their own.
+const GENERIC_CONTROL_LABELS = new Set(['matrix']);
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// Row label: canonical project name, plus an instance suffix when sessions share a project.
+function sessionLabel(s) {
+  if (!s) return '';
+  if (s.projectName) return s.instanceSuffix ? `${s.projectName} · ${s.instanceSuffix}` : s.projectName;
+  return s.displayName || s.name;
+}
+
+// ── Text Selection ──
+
+function hasActiveSelection() {
+  const sel = window.getSelection ? window.getSelection() : null;
+  return !!sel && sel.rangeCount > 0 && !sel.isCollapsed;
+}
+
+function terminalSelectionActive() {
+  if (!hasActiveSelection()) return false;
+  const terminal = document.getElementById('terminal');
+  const sel = window.getSelection();
+  return !!terminal && (terminal.contains(sel.anchorNode) || terminal.contains(sel.focusNode));
+}
+
+// Apply a screen refresh that was held back while the user was selecting transcript text.
+document.addEventListener('selectionchange', () => {
+  if (deferredScreenUpdate && !terminalSelectionActive()) {
+    const apply = deferredScreenUpdate;
+    deferredScreenUpdate = null;
+    apply();
+  }
+});
 
 // ── Scroll Tracking ──
 
@@ -12,7 +56,8 @@ function isNearBottom(viewer) {
 }
 
 function autoScroll(viewer) {
-  if (!userScrolledUp) {
+  // Jumping to the bottom mid-selection would drag the selection handles away.
+  if (!userScrolledUp && !terminalSelectionActive()) {
     viewer.scrollTop = viewer.scrollHeight;
   }
 }
@@ -104,47 +149,71 @@ function urlBase64ToUint8Array(base64String) {
   return arr;
 }
 
-// Resolve a session name or project name to an actual tmux session
-async function resolveSession(nameOrProject) {
-  try {
-    const res = await fetch('/api/sessions');
-    const { sessions } = await res.json();
-    if (!sessions || !sessions.length) return nameOrProject;
-    // Exact tmux session name match
-    const exact = sessions.find(s => s.name === nameOrProject);
-    if (exact) return exact.name;
-    // Match by displayName (case-insensitive)
-    const byDisplay = sessions.find(s =>
-      s.displayName && s.displayName.toLowerCase() === nameOrProject.toLowerCase()
-    );
-    if (byDisplay) return byDisplay.name;
-    // Partial match on displayName or path
-    const partial = sessions.find(s =>
-      (s.displayName && s.displayName.toLowerCase().includes(nameOrProject.toLowerCase())) ||
-      (s.path && s.path.toLowerCase().includes(nameOrProject.toLowerCase()))
-    );
-    if (partial) return partial.name;
-  } catch {}
-  return nameOrProject;
+async function fetchSessions() {
+  const res = await fetch('/api/sessions');
+  const { sessions } = await res.json();
+  lastSessionList = Array.isArray(sessions) ? sessions : [];
+  return lastSessionList;
+}
+
+// Exact tmux identity first. A case-insensitive match is accepted only when it is unique and
+// not the generic Matrix label, so a stale label can never open a different project.
+function findSessionForTarget(sessions, target) {
+  if (!Array.isArray(sessions) || !target) return null;
+  const exact = sessions.find(s => s.name === target);
+  if (exact) return exact;
+  const lower = target.toLowerCase();
+  const byName = sessions.filter(s => String(s.name).toLowerCase() === lower);
+  if (byName.length === 1) return byName[0];
+  if (GENERIC_CONTROL_LABELS.has(lower)) return null;
+  const byProject = sessions.filter(s => s.projectName && s.projectName.toLowerCase() === lower);
+  return byProject.length === 1 ? byProject[0] : null;
+}
+
+function noteNotificationIntent() {
+  lastNotificationIntentAt = Date.now();
+}
+
+function hasRecentNotificationIntent() {
+  return Date.now() - lastNotificationIntentAt < 5000;
+}
+
+// Open the terminal a notification targets once session data is loaded; when the target is
+// missing or no longer live, show the project list instead of any other terminal.
+async function openNotificationTarget(target) {
+  const wanted = typeof target === 'string' ? target.trim() : '';
+  let match = null;
+  if (wanted) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        match = findSessionForTarget(await fetchSessions(), wanted);
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  }
+  if (match) openTerminal(match.name);
+  else closeTerminal();
 }
 
 function showToast(data) {
   if (!currentSession) loadSessions();
-  if (currentSession === data.session) return;
+  const targetSession = typeof data.targetSession === 'string' ? data.targetSession : '';
+  if (targetSession && currentSession === targetSession) return;
   document.querySelector('.notification-toast')?.remove();
   const toast = document.createElement('div');
   toast.className = 'notification-toast';
   toast.innerHTML = `
     <div class="toast-dot"></div>
     <div class="toast-content">
-      <div class="toast-project">${data.project}</div>
-      <div class="toast-message">${data.message}</div>
+      <div class="toast-project">${escapeHtml(data.project)}</div>
+      <div class="toast-message">${escapeHtml(data.message)}</div>
     </div>
     <div class="toast-action">Open</div>`;
-  toast.addEventListener('click', async () => {
+  toast.addEventListener('click', () => {
     toast.remove();
-    const resolved = await resolveSession(data.session);
-    openTerminal(resolved);
+    openNotificationTarget(targetSession);
   });
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 8000);
@@ -240,8 +309,7 @@ function undismissSession(name) {
 
 async function loadSessions() {
   try {
-    const res = await fetch('/api/sessions');
-    const { sessions } = await res.json();
+    const sessions = await fetchSessions();
     const container = document.getElementById('sessions');
 
     if (!sessions || sessions.length === 0) {
@@ -275,14 +343,14 @@ async function loadSessions() {
       const badge = showAttention ? 'Waiting' : (isDismissed && s.needsAttention ? 'Snoozed' : (s.claudeRunning ? 'Claude' : (s.attached ? 'attached' : `${s.windows} win`)));
       const cardClass = showAttention ? 'session-card attention' : (isDismissed ? 'session-card dismissed' : 'session-card');
       const descHtml = s.description
-        ? `<div class="session-desc">${s.description}</div>`
+        ? `<div class="session-desc">${escapeHtml(s.description)}</div>`
         : '';
       return `
-        <div class="${cardClass}" data-session="${s.name}" data-attention="${s.needsAttention ? '1' : '0'}">
+        <div class="${cardClass}" data-session="${escapeHtml(s.name)}" data-attention="${s.needsAttention ? '1' : '0'}">
           <div class="session-inner">
             <div class="session-top">
               <span class="session-dot ${dotClass}"></span>
-              <span class="session-name">${s.displayName || s.name}</span>
+              <span class="session-name">${escapeHtml(sessionLabel(s))}</span>
               <span class="session-badge">${badge}</span>
             </div>
             ${descHtml}
@@ -459,7 +527,7 @@ function connectWebSocket(session, windowName) {
     div.className = `msg msg-${role}`;
     div.textContent = text;
     viewer.appendChild(div);
-    pruneMessages(viewer);
+    if (!terminalSelectionActive()) pruneMessages(viewer);
   }
 
   function flushPending() {
@@ -487,17 +555,27 @@ function connectWebSocket(session, windowName) {
         screenLineCount = 0;
         autoScroll(viewer);
       } else if (msg.type === 'screen') {
-        const clean = filterStatusLines(stripAnsi(msg.data));
-        const screenEl = viewer.querySelector('.msg-screen');
-        if (screenEl) screenEl.remove();
-        const screenLines = clean.split('\n').filter(l => l.trim());
-        if (screenLines.length > 0) {
-          const div = document.createElement('div');
-          div.className = 'msg msg-screen msg-assistant';
-          div.textContent = screenLines.join('\n');
-          viewer.appendChild(div);
+        const applyScreen = () => {
+          const clean = filterStatusLines(stripAnsi(msg.data));
+          const screenEl = viewer.querySelector('.msg-screen');
+          if (screenEl) screenEl.remove();
+          const screenLines = clean.split('\n').filter(l => l.trim());
+          if (screenLines.length > 0) {
+            const div = document.createElement('div');
+            div.className = 'msg msg-screen msg-assistant';
+            div.textContent = screenLines.join('\n');
+            viewer.appendChild(div);
+          }
+          autoScroll(viewer);
+        };
+        // Replacing the live screen block destroys any selection inside it, so hold the
+        // newest screen until the user finishes selecting.
+        if (terminalSelectionActive()) {
+          deferredScreenUpdate = applyScreen;
+        } else {
+          deferredScreenUpdate = null;
+          applyScreen();
         }
-        autoScroll(viewer);
       }
     } catch {}
   };
@@ -528,9 +606,12 @@ function openTerminal(session, windowName) {
 
   currentSession = session;
   userScrolledUp = false;
+  deferredScreenUpdate = null;
   document.getElementById('list-view').style.display = 'none';
+  document.getElementById('build-inbox-view').style.display = 'none';
   document.getElementById('term-view').style.display = 'flex';
-  document.getElementById('term-title').textContent = windowName ? `${session} → ${windowName}` : session;
+  const label = sessionLabel(lastSessionList.find(s => s.name === session)) || session;
+  document.getElementById('term-title').textContent = windowName ? `${label} → ${windowName}` : label;
   document.querySelector('.notification-toast')?.remove();
 
   const viewer = document.getElementById('terminal');
@@ -543,10 +624,108 @@ function openTerminal(session, windowName) {
 function closeTerminal() {
   if (ws) { ws.close(); ws = null; }
   currentSession = null;
+  deferredScreenUpdate = null;
   document.getElementById('terminal').textContent = '';
   document.getElementById('term-view').style.display = 'none';
+  document.getElementById('build-inbox-view').style.display = 'none';
   document.getElementById('list-view').style.display = 'flex';
   loadSessions();
+}
+
+// ── Build Inbox (read-only controller summary) ──
+
+let buildInboxLoading = false;
+
+const BUILD_INBOX_GROUPS = [
+  { key: 'needsYou', title: 'Needs you', className: 'needs-you', detail: item => item.reason },
+  { key: 'running', title: 'Running', className: 'running', detail: item => item.stage },
+  { key: 'finished', title: 'Recently finished', className: 'finished', detail: item => item.result },
+];
+
+function isBuildInboxOpen() {
+  return document.getElementById('build-inbox-view').style.display !== 'none';
+}
+
+function openBuildInbox() {
+  document.getElementById('list-view').style.display = 'none';
+  document.getElementById('term-view').style.display = 'none';
+  document.getElementById('build-inbox-view').style.display = 'flex';
+  loadBuildInbox();
+}
+
+function closeBuildInbox() {
+  document.getElementById('build-inbox-view').style.display = 'none';
+  document.getElementById('list-view').style.display = 'flex';
+  loadSessions();
+}
+
+// Controller-derived strings are only ever assigned through textContent.
+function textEl(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text !== undefined) el.textContent = String(text ?? '');
+  return el;
+}
+
+async function loadBuildInbox() {
+  if (buildInboxLoading) return;
+  buildInboxLoading = true;
+  const status = document.getElementById('build-inbox-status');
+  status.className = 'build-inbox-status';
+  status.textContent = 'Loading…';
+  try {
+    const res = await fetch('/api/build-inbox', { cache: 'no-store' });
+    let data = null;
+    try { data = await res.json(); } catch {}
+    if (!res.ok || !data || data.ok !== true) {
+      const reason = data && typeof data.message === 'string' ? data.message : `HTTP ${res.status}`;
+      renderBuildInboxError(`Build inbox unavailable: ${reason}`);
+      return;
+    }
+    renderBuildInbox(data);
+  } catch {
+    renderBuildInboxError('Build inbox unavailable: could not reach Matrix');
+  } finally {
+    buildInboxLoading = false;
+  }
+}
+
+function renderBuildInboxError(message) {
+  const status = document.getElementById('build-inbox-status');
+  status.className = 'build-inbox-status error';
+  status.textContent = message;
+  document.getElementById('build-inbox-content').replaceChildren();
+}
+
+function renderBuildInbox(data) {
+  const fragment = document.createDocumentFragment();
+  let total = 0;
+  for (const group of BUILD_INBOX_GROUPS) {
+    const items = Array.isArray(data[group.key]) ? data[group.key] : [];
+    const count = Number.isInteger(data.counts?.[group.key]) ? data.counts[group.key] : items.length;
+    total += count;
+    const section = textEl('section', `inbox-group ${group.className}`);
+    section.appendChild(textEl('h2', 'inbox-group-title', `${group.title} (${count})`));
+    if (items.length === 0) section.appendChild(textEl('div', 'inbox-empty', 'None'));
+    for (const item of items) {
+      const row = textEl('div', 'inbox-item');
+      const top = textEl('div', 'inbox-item-top');
+      top.appendChild(textEl('span', 'inbox-project', item.project || 'unknown project'));
+      top.appendChild(textEl('span', 'inbox-detail', group.detail(item) || ''));
+      const meta = textEl('div', 'inbox-item-meta');
+      meta.appendChild(textEl('span', 'inbox-task', item.taskId));
+      if (item.updated) meta.appendChild(textEl('span', 'inbox-updated', item.updated));
+      row.append(top, meta);
+      section.appendChild(row);
+    }
+    fragment.appendChild(section);
+  }
+  document.getElementById('build-inbox-content').replaceChildren(fragment);
+  const status = document.getElementById('build-inbox-status');
+  status.className = 'build-inbox-status';
+  status.textContent = total === 0
+    ? 'Nothing needs you, running, or recently finished'
+    : `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
 }
 
 // ── Text Input ──
@@ -654,6 +833,9 @@ document.getElementById('refresh-btn').addEventListener('click', loadSessions);
 document.getElementById('add-btn').addEventListener('click', showPicker);
 document.getElementById('picker-close').addEventListener('click', closePicker);
 document.getElementById('picker-overlay').addEventListener('click', closePicker);
+document.getElementById('build-inbox-pin').addEventListener('click', openBuildInbox);
+document.getElementById('build-inbox-back').addEventListener('click', closeBuildInbox);
+document.getElementById('build-inbox-refresh').addEventListener('click', loadBuildInbox);
 
 const textInput = document.getElementById('text-input');
 textInput.addEventListener('keydown', (e) => {
@@ -661,12 +843,17 @@ textInput.addEventListener('keydown', (e) => {
 });
 document.getElementById('send-btn').addEventListener('click', sendText);
 
-// Swipe down to dismiss keyboard
+// Swipe down to dismiss keyboard — only for gestures outside the transcript. Gestures that
+// start in #terminal (long-press selection, handle drags, scrolling) and any active text
+// selection are left to the browser so native select and Copy keep working.
 let touchStartY = 0;
+let touchStartedInTerminal = false;
 document.getElementById('term-view').addEventListener('touchstart', (e) => {
   touchStartY = e.touches[0].clientY;
+  touchStartedInTerminal = e.target instanceof Element && !!e.target.closest('#terminal');
 }, { passive: true });
 document.getElementById('term-view').addEventListener('touchend', (e) => {
+  if (touchStartedInTerminal || hasActiveSelection()) return;
   const deltaY = e.changedTouches[0].clientY - touchStartY;
   if (deltaY > 50) {
     textInput.blur();
@@ -698,22 +885,27 @@ document.querySelectorAll('.qa-btn').forEach(btn => {
 
 // Auto-refresh session list when app comes to foreground + check pending alerts
 document.addEventListener('visibilitychange', async () => {
-  if (!document.hidden) {
-    // Check if there's a pending notification to auto-open
-    try {
-      const res = await fetch('/api/pending-alert');
-      const { alert } = await res.json();
-      if (alert && alert.session) {
-        const resolved = await resolveSession(alert.session);
-        openTerminal(resolved);
-        return;
-      }
-    } catch {}
-    if (currentSession) {
-      if (!ws || ws.readyState > 1) connectWebSocket(currentSession);
-    } else {
-      loadSessions();
+  if (document.hidden) return;
+  // Check if there's a pending notification to auto-open
+  try {
+    const res = await fetch('/api/pending-alert');
+    const { alert } = await res.json();
+    // Tapping a notification delivers its own target (URL or service-worker message), which
+    // must win over the newest pending alert — give that message a moment to arrive.
+    await new Promise(r => setTimeout(r, 400));
+    if (hasRecentNotificationIntent()) return;
+    if (alert && alert.targetSession) {
+      openNotificationTarget(alert.targetSession);
+      return;
     }
+  } catch {}
+  if (hasRecentNotificationIntent()) return;
+  if (currentSession) {
+    if (!ws || ws.readyState > 1) connectWebSocket(currentSession);
+  } else if (isBuildInboxOpen()) {
+    loadBuildInbox();
+  } else {
+    loadSessions();
   }
 });
 
@@ -724,12 +916,12 @@ window.visualViewport?.addEventListener('resize', () => {
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => reg.update());
-  // Handle notification click → open session
-  navigator.serviceWorker.addEventListener('message', async (e) => {
-    if (e.data?.type === 'open-session' && e.data.session) {
-      const resolved = await resolveSession(e.data.session);
-      openTerminal(resolved);
-    }
+  // Handle notification click on an already-open app → open that exact session.
+  // Only the server-resolved targetSession is trusted; without one, show the project list.
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type !== 'open-session') return;
+    noteNotificationIntent();
+    openNotificationTarget(typeof e.data.targetSession === 'string' ? e.data.targetSession : '');
   });
   // Show setup button if permission not yet granted, auto-subscribe if already granted
   const isStandalone = navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
@@ -770,11 +962,13 @@ if ('serviceWorker' in navigator) {
   }
 }
 
-// Check URL for ?open=session (from notification click when app wasn't open)
+// Check URL for ?open=<tmux session> (from notification click when app wasn't open).
+// Consume the one-shot intent first so a reload never re-opens a stale alert.
 const openParam = new URLSearchParams(location.search).get('open');
-if (openParam) {
-  history.replaceState(null, '', '/');
-  resolveSession(openParam).then(resolved => openTerminal(resolved));
+if (openParam !== null) {
+  history.replaceState(null, '', location.pathname || '/');
+  noteNotificationIntent();
+  openNotificationTarget(openParam);
 } else {
   loadSessions();
 }

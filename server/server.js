@@ -1,11 +1,18 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
-const { execSync, exec } = require('child_process');
+const { execSync, exec, execFile } = require('child_process');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const webpush = require('web-push');
+const {
+  cleanLabel,
+  resolveProjectIdentity,
+  assignInstanceLabels,
+  resolveNotificationTarget,
+} = require('./lib/session-identity');
+const { BuildInboxError, runBuildInbox, buildInboxErrorStatus } = require('./lib/build-inbox');
 
 // ── Configurable Paths ──
 const MATRIX_HOME = process.env.MATRIX_HOME || path.join(os.homedir(), '.matrix');
@@ -16,6 +23,8 @@ const SUBS_PATH = path.join(MATRIX_HOME, 'push-subscriptions.json');
 const LOGS_DIR = path.join(MATRIX_HOME, 'logs');
 const PYTHON_PATH = process.env.PYTHON_PATH || 'python3';
 const PORT = parseInt(process.env.MATRIX_PORT, 10) || 7778;
+// Absolute path to the build controller CLI used by the read-only build inbox.
+const BUILDCTL_PATH = process.env.MATRIX_BUILDCTL || path.join(os.homedir(), '.local', 'bin', 'buildctl');
 
 // ── Bootstrap ~/.matrix and seed projects.conf from auto-discovery ──
 if (!fs.existsSync(MATRIX_HOME)) {
@@ -72,9 +81,10 @@ function saveSubs() {
   }
 }
 
-async function sendPush(title, body, session) {
+// targetSession is the resolved tmux session ('' when none); project is the human label.
+async function sendPush(title, body, targetSession, project) {
   if (!vapid) return; // Push not configured
-  const payload = JSON.stringify({ title, body, session });
+  const payload = JSON.stringify({ title, body, session: targetSession, targetSession, project });
   const dead = [];
   for (let i = 0; i < pushSubscriptions.length; i++) {
     try {
@@ -142,45 +152,65 @@ let lastSeenQuestions = {}; // session → last question text (to avoid re-trigg
 let dismissedUntilChange = {}; // session → dismissed message text; suppress until message changes
 
 // POST: receive notification from cr-notify hook
+// The hook sends a project/session label and (newer hooks) its own tmux session. Resolve that
+// to one live tmux session; when nothing resolves, deliver the alert with no target so no
+// client opens a terminal for it.
 app.post('/api/notify', (req, res) => {
-  const { message, project, session } = req.body;
-  const sess = session || project || '';
-  const msg = message || 'Claude needs input';
+  const body = req.body || {};
+  const msg = typeof body.message === 'string' && body.message ? body.message : 'Claude needs input';
 
   // Ignore the "how is Claude doing" session check — not a real question
   if (/how is claude/i.test(msg)) {
     return res.json({ ok: true, ignored: true });
   }
 
+  const target = resolveLiveNotificationTarget({
+    tmuxSession: body.tmuxSession,
+    session: body.session,
+    project: body.project,
+  });
+  const targetSession = target.targetSession || '';
+  const projectLabel = target.projectName || cleanLabel(body.project) || cleanLabel(body.session) || 'Matrix';
+  const dismissKey = targetSession || cleanLabel(body.session) || cleanLabel(body.project);
+
   // If this session was dismissed, suppress until a genuinely new notification arrives.
   // '*' sentinel means suppress everything; specific message means suppress only that exact repeat.
-  const dismissedMsg = dismissedUntilChange[sess];
+  const dismissedMsg = dismissedUntilChange[dismissKey];
   if (dismissedMsg && (dismissedMsg === '*' || dismissedMsg === msg)) {
     return res.json({ ok: true, suppressed: true });
   }
   // New/different message — this is a genuinely new question, clear the dismiss
-  delete dismissedUntilChange[sess];
+  delete dismissedUntilChange[dismissKey];
 
   const notification = {
     type: 'notification',
     message: msg,
-    project: project || '',
-    session: sess,
+    project: projectLabel,
+    session: targetSession,
+    targetSession,
     timestamp: Date.now(),
   };
-  // Track pending alert so PWA can auto-open session on foreground
-  pendingAlerts.push({ session: sess, message: msg, timestamp: Date.now() });
-  // Mark session as needing attention (cleared when user sends input via /api/send or WS)
-  pendingAttention[sess] = true;
-  lastSeenQuestions[sess] = msg;
+  // Track pending alert so PWA can auto-open the exact session on foreground
+  pendingAlerts.push({ session: targetSession, targetSession, project: projectLabel, message: msg, timestamp: Date.now() });
+  if (targetSession) {
+    // Mark session as needing attention (cleared when user sends input via /api/send or WS)
+    pendingAttention[targetSession] = true;
+    lastSeenQuestions[targetSession] = msg;
+  }
   // SSE toast (in-app)
   const payload = `data: ${JSON.stringify(notification)}\n\n`;
   for (const client of sseClients) {
     client.write(payload);
   }
   // Web Push (works when app is backgrounded)
-  sendPush(project || 'Matrix', msg, sess);
-  res.json({ ok: true, delivered: sseClients.size, pushSubs: pushSubscriptions.length });
+  sendPush(projectLabel, msg, targetSession, projectLabel);
+  res.json({
+    ok: true,
+    delivered: sseClients.size,
+    pushSubs: pushSubscriptions.length,
+    targetSession: targetSession || null,
+    via: target.via,
+  });
 });
 
 // POST: transcribe audio (voice-to-text via Apple SFSpeechRecognizer, fallback to whisper)
@@ -391,7 +421,8 @@ app.post('/api/test-notify', (req, res) => {
     type: 'notification',
     message: req.body.message || 'Test notification from Matrix',
     project: 'test',
-    session: 'test',
+    session: '',
+    targetSession: '',
     timestamp: Date.now(),
   };
   const payload = `data: ${JSON.stringify(notification)}\n\n`;
@@ -401,9 +432,14 @@ app.post('/api/test-notify', (req, res) => {
   res.json({ ok: true, delivered: sseClients.size });
 });
 
-// API: list tmux sessions with window info
-app.get('/api/sessions', (req, res) => {
+// List live tmux sessions with canonical project identity. Every live session is returned;
+// `name`/`targetSession` is the tmux routing name and `projectName` the project it works on.
+function listLiveSessions() {
   try {
+    const homeDir = os.homedir();
+    const username = os.userInfo().username;
+    const registry = buildPathRegistry();
+    const confProjects = readProjects();
     const raw = execSync(
       `tmux list-sessions -F '#{session_name}|#{session_windows}|#{session_attached}|#{session_path}|#{session_activity}' 2>/dev/null`,
       { encoding: 'utf8' }
@@ -443,82 +479,33 @@ app.get('/api/sessions', (req, res) => {
         if (parts?.[2]) paneTitle = parts[2];
       } catch {}
 
-      // Derive display name using a priority chain.
-      // Methods 1-3 give "confirmed" project names (safe to dedup).
-      // Methods 4-6 give "guessed" names (never dedup — too noisy).
-      const homeDir = os.homedir();
-      const registry = buildPathRegistry();
-      const folderName = projectPath ? path.basename(projectPath) : '';
-      const isHomeDir = !projectPath || projectPath === homeDir || folderName === os.userInfo().username;
-
-      let displayName = '';
-      let projectConfirmed = false; // true = reliable project identity, safe to dedup
-
-      // Method 1: explicit tmux variable (set by session or hook)
+      // Canonical project identity — the evidence chain lives in lib/session-identity.js.
+      // Pane titles are conversation topics, so they only ever feed the description below.
+      let explicitProject = '';
       try {
-        const explicit = execSync(
+        explicitProject = execSync(
           `tmux show-option -t '${name}' -v @matrix_project 2>/dev/null`,
           { encoding: 'utf8', timeout: 1000 }
         ).trim();
-        if (explicit) { displayName = explicit; projectConfirmed = true; }
       } catch {}
-
-      // Method 2: match pane cwd against path registry (skip home dir — too broad)
-      if (!displayName && projectPath && projectPath !== homeDir) {
-        const match = matchProject(projectPath, registry);
-        if (match) { displayName = match; projectConfirmed = true; }
-      }
-
-      // Method 3: pane is in a project directory (not ~)
-      if (!displayName && !isHomeDir && folderName) {
-        displayName = folderName;
-        projectConfirmed = true;
-      }
-
-      // Method 4: derive from tmux session name (strip numeric suffix).
-      // A named tmux session is explicit user intent — preferred over pane title,
-      // which is Claude's conversation topic and changes constantly (slice_003).
-      if (!displayName) {
-        const baseName = name.replace(/-\d+$/, '');
-        if (!/^\d+$/.test(baseName)) {
-          displayName = baseName;
-          projectConfirmed = true; // named tmux sessions are intentional
-        }
-      }
-
-      // Method 5: Claude's pane title — ONLY if it looks like a project identifier,
-      // not a sentence. Pane titles reflect conversation topics like "Update X" and
-      // shouldn't become displayNames (slice_003).
-      if (!displayName && paneTitle) {
-        const cleaned = paneTitle
-          .replace(/^[\u2800-\u28FF\u2732\u2733\u2734\u2022\s]+/, '') // strip braille spinners, asterisks
-          .replace(/^Claude Code\s*$/i, '')  // skip generic "Claude Code" title
-          .trim();
-        const hostname = os.hostname();
-        const words = cleaned.split(/\s+/);
-        const looksLikeSentence =
-          words.length > 2 ||
-          /^(Update|Fix|Add|Create|Set|Build|Debug|Refactor|Write|Test|Implement|Remove|Delete|Check|Make|Get|Run|Launch|Start|Investigate|Analyze|Review|Design|Plan)\b/i.test(cleaned) ||
-          /[.!?]$/.test(cleaned);
-        if (cleaned && !cleaned.includes(hostname) && cleaned.length > 2 && !looksLikeSentence) {
-          displayName = cleaned;
-          // Pane titles are guessed — never set projectConfirmed.
-        }
-      }
-
-      // Method 6: fallback to session name
-      if (!displayName) {
-        displayName = name;
-      }
+      const identity = resolveProjectIdentity({
+        sessionName: name,
+        explicitProject,
+        cwd: projectPath,
+        homeDir,
+        username,
+        registry,
+      });
+      const projectName = identity.projectName;
+      const projectConfirmed = identity.confirmed;
 
       // Look up description from projects.conf or auto-detect.
       // Don't match by path when path is home dir — that would give every numeric
       // home-dir session the generic "home directory" description and mask the
       // more useful pane-title fallback below.
-      const confProjects = readProjects();
       let description = '';
       const confMatch = confProjects.find(p =>
-        p.name === name || p.name === displayName?.toLowerCase() ||
+        p.name === name || p.name === projectName.toLowerCase() ||
         (p.path === projectPath && projectPath !== homeDir)
       );
       if (confMatch?.description) {
@@ -544,16 +531,16 @@ app.get('/api/sessions', (req, res) => {
       }
 
       // needsAttention is driven by notification hooks, not tmux parsing.
-      // Check by session name AND by displayName (cr-notify may use either)
-      let needsAttention = !!pendingAttention[name] ||
-        !!pendingAttention[displayName] ||
-        !!pendingAttention[displayName.toLowerCase()];
+      // /api/notify keys attention by the resolved tmux session.
+      const needsAttention = !!pendingAttention[name];
 
       const lastActivity = parseInt(activityTs) || 0;
 
       return {
         name,
-        displayName,
+        targetSession: name,
+        projectName,
+        projectSource: identity.source,
         description,
         windows: parseInt(windows),
         attached: attached === '1',
@@ -566,64 +553,39 @@ app.get('/api/sessions', (req, res) => {
       };
     });
 
-    // Deduplicate: only merge sessions that have a CONFIRMED project identity.
-    // Guessed names (from pane titles, scrollback) are too noisy to dedup on —
-    // two unrelated sessions can mention the same project path in scrollback.
-    const groups = new Map(); // displayName (lowercase) → best session
+    // Every live session stays addressable. Sessions sharing a project get an instance
+    // suffix in displayName (the legacy label field) instead of being merged away.
+    const labeled = assignInstanceLabels(sessions);
 
-    for (const s of sessions) {
-      const key = s.displayName.toLowerCase();
-
-      // Only merge when BOTH sessions have confirmed project identity
-      // and share the same displayName. Otherwise treat as unique.
-      if (s.projectConfirmed && !/^\d+$/.test(key)) {
-        const existing = groups.get(key);
-        if (existing && existing.projectConfirmed) {
-          // Both confirmed same project — pick winner
-          const newWins =
-            (s.claudeRunning && !existing.claudeRunning) ||
-            (s.claudeRunning === existing.claudeRunning && s.lastActivity > existing.lastActivity);
-          const winner = newWins ? s : existing;
-          const loser = newWins ? existing : s;
-
-          // Merge attention: if ANY session for this project needs attention, show it
-          if (loser.needsAttention) winner.needsAttention = true;
-
-          groups.set(key, winner);
-        } else if (!existing) {
-          // First confirmed session with this name — store under display name for merging
-          groups.set(key, s);
-        } else {
-          // Existing is unconfirmed, new is confirmed — confirmed wins
-          groups.set(key, s);
-        }
-      } else {
-        // Unconfirmed or numeric — unique, never merge
-        groups.set(`__unique_${s.name}`, s);
-      }
-    }
-
-    const deduped = [...groups.values()];
-
-    // Strip leading "_ " from display names
-    for (const s of deduped) {
-      s.displayName = s.displayName.replace(/^_\s+/, '');
-    }
-
-    // Sort: attention first, then named projects above numbered ones, then by activity
-    deduped.sort((a, b) => {
+    // Sort: attention first, then identified projects above fallback names, then by activity
+    labeled.sort((a, b) => {
       if (a.needsAttention !== b.needsAttention) return a.needsAttention ? -1 : 1;
-      const aNumbered = /^\d+$/.test(a.displayName);
-      const bNumbered = /^\d+$/.test(b.displayName);
-      if (aNumbered !== bNumbered) return aNumbered ? 1 : -1;
+      if (a.projectConfirmed !== b.projectConfirmed) return a.projectConfirmed ? -1 : 1;
       return b.lastActivity - a.lastActivity;
     });
 
-    global._lastSessions = deduped;
-    res.json({ sessions: deduped });
+    global._lastSessions = labeled;
+    global._lastSessionsAt = Date.now();
+    return labeled;
   } catch {
-    res.json({ sessions: [] });
+    return [];
   }
+}
+
+// Resolve a notification against recent session data; re-list tmux when that data is
+// stale or does not contain the target.
+function resolveLiveNotificationTarget(input) {
+  const cached = global._lastSessions;
+  if (cached && Date.now() - (global._lastSessionsAt || 0) < 5000) {
+    const hit = resolveNotificationTarget(input, cached);
+    if (hit.targetSession) return hit;
+  }
+  return resolveNotificationTarget(input, listLiveSessions());
+}
+
+// API: list tmux sessions with window info
+app.get('/api/sessions', (req, res) => {
+  res.json({ sessions: listLiveSessions() });
 });
 
 // API: dismiss attention for a session (user snoozed it)
@@ -717,18 +679,6 @@ function buildPathRegistry() {
   // Sort longest prefix first (most specific match wins)
   entries.sort((a, b) => b.prefix.length - a.prefix.length);
   return entries;
-}
-
-// Match a file path against the registry
-function matchProject(filePath, registry) {
-  if (!filePath) return null;
-  const resolved = filePath.replace(/^~/, os.homedir());
-  for (const entry of registry) {
-    if (resolved.startsWith(entry.prefix)) {
-      return entry.name;
-    }
-  }
-  return null;
 }
 
 // Auto-detect a project description from common files
@@ -899,6 +849,7 @@ app.get('/api/projects/inactive', (req, res) => {
     for (const s of sessData) {
       activeDisplayNames.add(s.displayName.toLowerCase());
       activeDisplayNames.add(s.name.toLowerCase());
+      if (s.projectName) activeDisplayNames.add(s.projectName.toLowerCase());
       if (s.path) activePaths.add(s.path);
     }
   } catch {}
@@ -1348,6 +1299,30 @@ app.post('/api/ptt/sound', (req, res) => {
   if (type === 'open') playSquelch('squelch_open');
   else if (type === 'close') playSquelch('squelch_close');
   res.json({ ok: true });
+});
+
+// ── Build Inbox (read-only controller summary for the mobile pinned row) ──
+// Fixed command: the absolute buildctl binary with `inbox --json`. No request data is used.
+const BUILD_INBOX_ARGS = Object.freeze(['inbox', '--json']);
+let buildInboxInFlight = null;
+
+app.get('/api/build-inbox', async (req, res) => {
+  try {
+    if (!buildInboxInFlight) {
+      buildInboxInFlight = runBuildInbox({ binary: BUILDCTL_PATH, args: BUILD_INBOX_ARGS, execFile })
+        .finally(() => { buildInboxInFlight = null; });
+    }
+    const summary = await buildInboxInFlight;
+    res.json({ ok: true, generatedAt: Date.now(), ...summary });
+  } catch (err) {
+    const known = err instanceof BuildInboxError;
+    console.error(`[build-inbox] ${known ? err.code : 'error'}: ${err.message}`);
+    res.status(buildInboxErrorStatus(err)).json({
+      ok: false,
+      error: known ? err.code : 'failed',
+      message: known ? err.message : 'Build inbox unavailable',
+    });
+  }
 });
 
 // ── Skills List (for slash-command autocomplete) ──

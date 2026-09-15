@@ -9,7 +9,7 @@
   <title>Matrix</title>
   <link rel="manifest" href="/manifest.json">
   <link rel="apple-touch-icon" href="/icon-192.png">
-  <link rel="stylesheet" href="style.css?v=39">
+  <link rel="stylesheet" href="style.css?v=40">
 
 </head>
 <body>
@@ -27,7 +27,23 @@
       <span style="display:block;margin-bottom:8px;font-size:13px;color:var(--text)"></span>
       <button id="push-enable-btn" style="background:var(--green);color:#000;border:none;padding:10px 20px;border-radius:4px;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px;width:100%">Enable Notifications</button>
     </div>
+    <button id="build-inbox-pin" class="build-inbox-pin" type="button">
+      <span class="build-inbox-pin-icon" aria-hidden="true">▤</span>
+      <span class="build-inbox-pin-label">Build Inbox</span>
+      <span class="session-badge">Pinned</span>
+    </button>
     <div id="sessions"></div>
+  </div>
+
+  <!-- Build Inbox View (read-only controller summary) -->
+  <div id="build-inbox-view" style="display:none">
+    <header id="build-inbox-header">
+      <button id="build-inbox-back" type="button" title="Back">←</button>
+      <span id="build-inbox-title">Build Inbox</span>
+      <button id="build-inbox-refresh" type="button" title="Refresh">↻</button>
+    </header>
+    <div id="build-inbox-status" class="build-inbox-status" role="status"></div>
+    <div id="build-inbox-content"></div>
   </div>
 
   <!-- Project Picker Modal -->
@@ -65,6 +81,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=42"></script>
+  <script src="app.js?v=43"></script>
 </body>
 </html>

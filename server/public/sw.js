@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v5';
+const CACHE_VERSION = 'v6';
 
 // Force activate immediately
 self.addEventListener('install', () => self.skipWaiting());
@@ -19,36 +19,48 @@ self.addEventListener('fetch', (e) => {
 // Web Push: show notification when received
 self.addEventListener('push', (e) => {
   if (!e.data) return;
-  const data = e.data.json();
+  let data = {};
+  try { data = e.data.json() || {}; } catch {}
+  // targetSession is the tmux session the server resolved ('' when none could be resolved).
+  const targetSession = typeof data.targetSession === 'string' ? data.targetSession : '';
   e.waitUntil(
     self.registration.showNotification(data.title || 'Matrix', {
       body: data.body || 'Claude needs input',
       icon: '/icon-192.png',
       badge: '/icon-192.png',
-      tag: `cr-${data.session || 'default'}`,
+      tag: `cr-${targetSession || 'default'}`,
       renotify: true,
-      data: { session: data.session || '' },
+      data: { targetSession, project: typeof data.project === 'string' ? data.project : '' },
     })
   );
 });
 
-// Notification click: open the app to that session
+// URL the app consumes on launch; no target means the plain project list.
+function notificationUrl(targetSession) {
+  return targetSession ? `/?open=${encodeURIComponent(targetSession)}` : '/';
+}
+
+// Notification click: open the app to that exact session
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
-  const session = e.notification.data?.session || '';
+  const data = e.notification.data || {};
+  // Only a server-resolved target may open a terminal. Older notifications carried a project
+  // label in `session`, which is what used to open the wrong project.
+  const targetSession = typeof data.targetSession === 'string' ? data.targetSession : '';
+  const message = { type: 'open-session', targetSession, session: targetSession, project: data.project || '' };
 
   e.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windowClients => {
-      // If app is already open, focus it and navigate
+      // If app is already open, focus it and hand it the same target
       for (const client of windowClients) {
-        if (client.url.includes(self.location.origin)) {
-          client.focus();
-          client.postMessage({ type: 'open-session', session });
-          return;
+        if (new URL(client.url).origin === self.location.origin) {
+          return Promise.resolve(client.focus ? client.focus() : client)
+            .catch(() => client)
+            .then(focused => (focused || client).postMessage(message));
         }
       }
-      // Otherwise open the app
-      return clients.openWindow(`/?open=${encodeURIComponent(session)}`);
+      // Otherwise open the app with the target encoded in the URL
+      return clients.openWindow(notificationUrl(targetSession));
     })
   );
 });
