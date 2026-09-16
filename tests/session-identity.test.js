@@ -7,6 +7,7 @@ const {
   resolveProjectIdentity,
   assignInstanceLabels,
   resolveNotificationTarget,
+  describeFromPaneTitle,
 } = require('../server/lib/session-identity');
 
 const HOME = '/Users/dev';
@@ -48,6 +49,32 @@ test('generic matrix control session is only a fallback identity', () => {
 test('pane titles play no part in identity', () => {
   const r = identity({ sessionName: '41', cwd: HOME, paneTitle: 'angles-to-ads' });
   assert.equal(r.projectName, '41');
+});
+
+function describe(paneTitle, cwd = HOME, homeDir = HOME) {
+  return describeFromPaneTitle({ paneTitle, cwd, homeDir, username: 'dev', hostname: 'devs-Mac.local' });
+}
+
+test('a Claude conversation topic in the pane title becomes the description', () => {
+  assert.equal(describe('✳ Amazon reviews scraping for VOC mining'), 'Amazon reviews scraping for VOC mining');
+  assert.equal(describe('_ Yoro proposal'), 'Yoro proposal');
+  assert.equal(describe('x'.repeat(90)), 'x'.repeat(77) + '...');
+});
+
+test('a pane title that only echoes the user, host, or folder is not a description', () => {
+  // Codex titles every home-directory session with the folder name, i.e. the username.
+  assert.equal(describe('dev'), '');
+  assert.equal(describe('DEV'), '');
+  assert.equal(describe('scratch', '/Users/dev/scratch'), '');
+  assert.equal(describe('devs-Mac.local'), '');
+  assert.equal(describe('✳ Claude Code'), '');
+  assert.equal(describe(''), '');
+  assert.equal(describe('devhome', '/home/devhome', '/home/devhome'), '');
+});
+
+test('a topic that merely mentions the user or folder is still a description', () => {
+  assert.equal(describe('dev server logs'), 'dev server logs');
+  assert.equal(describe('✳ Fix scratch loader', '/Users/dev/scratch'), 'Fix scratch loader');
 });
 
 function live(name, projectName, extra = {}) {

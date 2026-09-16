@@ -9,6 +9,7 @@ const webpush = require('web-push');
 const {
   cleanLabel,
   resolveProjectIdentity,
+  describeFromPaneTitle,
   assignInstanceLabels,
   resolveNotificationTarget,
 } = require('./lib/session-identity');
@@ -518,16 +519,13 @@ function listLiveSessions() {
       // project) AND pane title looks like a Claude conversation topic, surface the
       // title as description so the user sees what the session is working on.
       if (!description && !projectConfirmed && paneTitle) {
-        // Strip leading spinner chars (unicode when LANG is set; `_` when tmux
-        // downgrades to ASCII without a UTF-8 locale).
-        const cleanedTitle = paneTitle
-          .replace(/^[⠀-⣿✲✳✴•_\s]+/, '')
-          .replace(/^Claude Code\s*$/i, '')
-          .trim();
-        const hostname = os.hostname();
-        if (cleanedTitle && !cleanedTitle.includes(hostname) && cleanedTitle.length > 2) {
-          description = cleanedTitle.length > 80 ? cleanedTitle.slice(0, 77) + '...' : cleanedTitle;
-        }
+        description = describeFromPaneTitle({
+          paneTitle,
+          cwd: projectPath,
+          homeDir,
+          username,
+          hostname: os.hostname(),
+        });
       }
 
       // needsAttention is driven by notification hooks, not tmux parsing.
@@ -966,9 +964,6 @@ app.delete('/api/sessions/:name', (req, res) => {
 
 // ── WebSocket: tmux pane streaming via capture-pane polling ──
 
-// Track last-sent line count per tmux target so reconnects send only new content
-const targetLineTracker = {};
-
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const session = url.searchParams.get('session');
@@ -1016,12 +1011,15 @@ wss.on('connection', (ws, req) => {
     }
   }
 
-  // Capture full scrollback + visible screen as plain text (no ANSI)
+  // Capture full scrollback + visible screen as plain text (no ANSI).
+  // maxBuffer must be large — a long Claude session's scrollback can easily
+  // exceed Node's 1 MB execSync default and cause silent ENOBUFS failure
+  // (the empty-terminal symptom: pane-size sent, output never sent).
   function captureAll() {
     try {
       return execSync(
         `tmux capture-pane -t '${target}' -p -S - 2>/dev/null`,
-        { encoding: 'utf8' }
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
       );
     } catch {
       return '';
@@ -1035,26 +1033,19 @@ wss.on('connection', (ws, req) => {
     const size = getPaneSize();
     ws.send(JSON.stringify({ type: 'pane-size', cols: size.cols, rows: size.rows }));
 
-    // Send scrollback on connect — on reconnect, only send lines since last disconnect
+    // Always send full scrollback on each new client connect — the client replaces
+    // its viewer with this first output (openTerminal() and automatic reconnects alike).
+    // The previous "diff on reconnect" path could send a whitespace-only delta and
+    // leave the viewer blank when the conversation was idle.
     const all = captureAll();
     const allLines = all.split('\n');
-    const prevCount = targetLineTracker[target] || 0;
-
-    if (prevCount > 0 && prevCount < allLines.length) {
-      // Reconnect — only send new lines since last disconnect
-      const newLines = allLines.slice(prevCount);
-      if (newLines.join('').trim()) {
-        ws.send(JSON.stringify({ type: 'output', data: newLines.join('\r\n') + '\r\n' }));
-      }
-    } else if (all.trim()) {
-      // First connect or line count reset — send full scrollback
+    if (all.trim()) {
       ws.send(JSON.stringify({ type: 'output', data: all.replace(/\n/g, '\r\n') }));
     }
 
     const lines = allLines;
     lastLineCount = lines.length;
     lastFullText = all;
-    targetLineTracker[target] = lastLineCount;
 
     // Poll for new content at ~100ms for near-realtime updates.
     // Sends new scrollback lines AND visible-screen changes.
@@ -1092,7 +1083,6 @@ wss.on('connection', (ws, req) => {
 
         lastLineCount = currentLines.length;
         lastFullText = current;
-        targetLineTracker[target] = lastLineCount;
       } catch {
         captureErrors++;
         if (captureErrors > 20) {

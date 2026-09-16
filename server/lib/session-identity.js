@@ -73,6 +73,26 @@ function resolveProjectIdentity({ sessionName, explicitProject, cwd, homeDir, us
   return { projectName: name, source: 'fallback', confirmed: false };
 }
 
+// Description for a session with no project identity. Claude titles its pane with the
+// conversation topic, which says what the session is doing. Other agents and shells leave the
+// terminal default — Codex titles every home-directory session with the folder name, i.e. the
+// username — and a title that only echoes the user, host, or folder describes nothing.
+function describeFromPaneTitle({ paneTitle, cwd, homeDir, username, hostname }) {
+  // Strip leading spinner chars (unicode when LANG is set; `_` when tmux
+  // downgrades to ASCII without a UTF-8 locale).
+  const title = cleanLabel(paneTitle)
+    .replace(/^[⠀-⣿✲✳✴•_\s]+/, '')
+    .replace(/^Claude Code\s*$/i, '')
+    .trim();
+  if (title.length <= 2) return '';
+  const lower = title.toLowerCase();
+  if (hostname && lower.includes(hostname.toLowerCase())) return '';
+  const dir = typeof cwd === 'string' ? stripTrailingSlash(cwd) : '';
+  const terminalDefaults = [username, homeDir && path.basename(homeDir), dir && path.basename(dir)];
+  if (terminalDefaults.some(d => d && d.toLowerCase() === lower)) return '';
+  return title.length > 80 ? title.slice(0, 77) + '...' : title;
+}
+
 function formatSessionLabel(projectName, instanceSuffix) {
   return instanceSuffix ? `${projectName} · ${instanceSuffix}` : projectName;
 }
@@ -136,6 +156,7 @@ module.exports = {
   cleanLabel,
   matchProject,
   resolveProjectIdentity,
+  describeFromPaneTitle,
   formatSessionLabel,
   assignInstanceLabels,
   resolveNotificationTarget,

@@ -537,6 +537,10 @@ function connectWebSocket(session, windowName) {
 
   let screenLineCount = 0;
   let pendingText = '';
+  // The server sends the pane's full scrollback as the first output of every connection.
+  // openTerminal() clears the viewer before a fresh open but an automatic reconnect does
+  // not, so that dump replaces what is shown instead of appending a second copy.
+  let awaitingScrollbackDump = true;
 
   function appendMessage(text, role) {
     const div = document.createElement('div');
@@ -565,6 +569,10 @@ function connectWebSocket(session, windowName) {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'output') {
+        if (awaitingScrollbackDump) {
+          awaitingScrollbackDump = false;
+          viewer.replaceChildren();
+        }
         const clean = filterStatusLines(stripAnsi(msg.data).replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
         pendingText += clean;
         flushPending();
