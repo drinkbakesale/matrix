@@ -12,12 +12,26 @@ if [ -n "$TMUX_PANE" ]; then
   SESSION=$(tmux show-option -t "$TMUX_SESSION" -v @matrix_project 2>/dev/null || true)
 fi
 
-# Priority 2: match $PWD against projects.conf (longest path wins)
+# Priority 2: match $PWD against projects.conf (longest path wins).
+# Only the configured path itself or a slash-delimited descendant of it counts: a bare
+# prefix test makes a sibling directory (…/app-old) answer to another project (…/app),
+# which then routes the alert to that project's terminal. Paths are expanded by
+# substitution, never by eval, so a config value cannot execute anything.
 if [ -z "$SESSION" ]; then
   BEST_LEN=0
+  CWD="${PWD%/}"
   while IFS='|' read -r name spath _; do
-    expanded=$(eval echo "$spath")
-    if [[ "$PWD" == "$expanded"* ]]; then
+    [ -n "$name" ] && [ -n "$spath" ] || continue
+    expanded="$spath"
+    case "$expanded" in
+      '~') expanded="$HOME" ;;
+      '~/'*) expanded="$HOME/${expanded#\~/}" ;;
+    esac
+    expanded="${expanded//\$\{HOME\}/$HOME}"
+    expanded="${expanded//\$HOME/$HOME}"
+    expanded="${expanded%/}"
+    [ -n "$expanded" ] || continue
+    if [ "$CWD" = "$expanded" ] || [ "${CWD#"$expanded"/}" != "$CWD" ]; then
       len=${#expanded}
       if (( len > BEST_LEN )); then
         BEST_LEN=$len
