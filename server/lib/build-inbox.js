@@ -36,14 +36,21 @@ function malformed(detail) {
   return new BuildInboxError('malformed_output', `buildctl inbox output was not a valid summary (${detail})`);
 }
 
+// Every entry is validated, including those past the display cap: a group carrying an
+// unusable entry is malformed controller output, not something to render partially.
 function parseGroup(data, key, pick) {
   const list = data[key];
   if (!Array.isArray(list)) throw malformed(`${key} is not a list`);
-  const items = list.slice(0, MAX_ITEMS_PER_GROUP).map((raw, i) => {
+  const items = [];
+  list.forEach((raw, i) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw malformed(`${key}[${i}] is not an object`);
     const taskId = field(raw.task_id);
     if (!taskId) throw malformed(`${key}[${i}] has no task_id`);
-    return { taskId, project: field(raw.repo ?? raw.project), updated: field(raw.updated ?? raw.age), ...pick(raw) };
+    const project = field(raw.repo) || field(raw.project);
+    if (!project) throw malformed(`${key}[${i}] has no project`);
+    if (items.length < MAX_ITEMS_PER_GROUP) {
+      items.push({ taskId, project, updated: field(raw.updated ?? raw.age), ...pick(raw) });
+    }
   });
   return { items, total: list.length };
 }
@@ -115,10 +122,24 @@ function buildInboxErrorStatus(err) {
   return (err && ERROR_STATUS[err.code]) || 502;
 }
 
+// Single place that turns any inbox failure into the safe client-facing response.
+function buildInboxErrorResponse(err) {
+  const known = err instanceof BuildInboxError;
+  return {
+    status: buildInboxErrorStatus(err),
+    body: {
+      ok: false,
+      error: known ? err.code : 'failed',
+      message: known ? err.message : 'Build inbox unavailable',
+    },
+  };
+}
+
 module.exports = {
   BuildInboxError,
   parseBuildInbox,
   runBuildInbox,
   buildInboxErrorStatus,
+  buildInboxErrorResponse,
   MAX_ITEMS_PER_GROUP,
 };

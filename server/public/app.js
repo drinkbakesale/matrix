@@ -726,7 +726,7 @@ function renderBuildInbox(data) {
     for (const item of items) {
       const row = textEl('div', 'inbox-item');
       const top = textEl('div', 'inbox-item-top');
-      top.appendChild(textEl('span', 'inbox-project', item.project || 'unknown project'));
+      top.appendChild(textEl('span', 'inbox-project', item.project));
       top.appendChild(textEl('span', 'inbox-detail', group.detail(item) || ''));
       const meta = textEl('div', 'inbox-item-meta');
       meta.appendChild(textEl('span', 'inbox-task', item.taskId));

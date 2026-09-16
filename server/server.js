@@ -12,7 +12,7 @@ const {
   assignInstanceLabels,
   resolveNotificationTarget,
 } = require('./lib/session-identity');
-const { BuildInboxError, runBuildInbox, buildInboxErrorStatus } = require('./lib/build-inbox');
+const { BuildInboxError, runBuildInbox, buildInboxErrorResponse } = require('./lib/build-inbox');
 
 // ── Configurable Paths ──
 const MATRIX_HOME = process.env.MATRIX_HOME || path.join(os.homedir(), '.matrix');
@@ -1315,13 +1315,9 @@ app.get('/api/build-inbox', async (req, res) => {
     const summary = await buildInboxInFlight;
     res.json({ ok: true, generatedAt: Date.now(), ...summary });
   } catch (err) {
-    const known = err instanceof BuildInboxError;
-    console.error(`[build-inbox] ${known ? err.code : 'error'}: ${err.message}`);
-    res.status(buildInboxErrorStatus(err)).json({
-      ok: false,
-      error: known ? err.code : 'failed',
-      message: known ? err.message : 'Build inbox unavailable',
-    });
+    console.error(`[build-inbox] ${err instanceof BuildInboxError ? err.code : 'error'}: ${err.message}`);
+    const { status, body } = buildInboxErrorResponse(err);
+    res.status(status).json(body);
   }
 });
 

@@ -9,6 +9,7 @@ const {
   parseBuildInbox,
   runBuildInbox,
   buildInboxErrorStatus,
+  buildInboxErrorResponse,
   MAX_ITEMS_PER_GROUP,
 } = require('../server/lib/build-inbox');
 
@@ -64,6 +65,78 @@ test('runs the binary with the fixed argument array', async (t) => {
   const bin = fakeBinary(t, `[ "$1" = inbox ] && [ "$2" = --json ] && [ $# -eq 2 ] || exit 9\ncat <<'EOF'\n${JSON.stringify(sample)}\nEOF`);
   const r = await runBuildInbox({ binary: bin, args: ARGS, execFile });
   assert.equal(r.running[0].taskId, 't-2');
+});
+
+test('rejects entries with no usable project identity', () => {
+  const nul = String.fromCharCode(0);
+  const cases = [
+    { task_id: 't-1', state: 'BUILDING' },             // no repo/project at all
+    { task_id: 't-1', repo: '', state: 'BUILDING' },    // empty string
+    { task_id: 't-1', repo: '   ', state: 'BUILDING' }, // whitespace only
+    { task_id: 't-1', repo: nul, state: 'BUILDING' },   // control characters only
+    { task_id: 't-1', repo: {}, state: 'BUILDING' },    // unusable type
+  ];
+  for (const entry of cases) {
+    assert.throws(
+      () => parseBuildInbox(JSON.stringify({ needs_you: [entry], running: [], finished: [] })),
+      e => e.code === 'malformed_output',
+      JSON.stringify(entry));
+  }
+  // repo wins when usable; the alternative project key covers an empty repo.
+  const ok = parseBuildInbox(JSON.stringify({
+    needs_you: [],
+    running: [
+      { task_id: 't-8', repo: 'matrix', project: 'ignored', state: 'BUILDING' },
+      { task_id: 't-9', repo: '', project: 'voc-miner', state: 'BUILDING' },
+    ],
+    finished: [],
+  }));
+  assert.deepEqual(ok.running.map(r => r.project), ['matrix', 'voc-miner']);
+});
+
+test('invalid entries past the display cap are still rejected', () => {
+  const valid = i => ({ task_id: `t-${i}`, repo: 'matrix', state: 'BUILDING' });
+  for (const broken of [{ task_id: 't-bad', state: 'BUILDING' }, { repo: 'matrix', state: 'BUILDING' }, 'not-an-object']) {
+    const many = Array.from({ length: MAX_ITEMS_PER_GROUP + 10 }, (_, i) => valid(i));
+    many[MAX_ITEMS_PER_GROUP + 5] = broken; // beyond the 50-item display cap
+    assert.throws(
+      () => parseBuildInbox(JSON.stringify({ needs_you: [], running: many, finished: [] })),
+      e => e.code === 'malformed_output',
+      JSON.stringify(broken));
+  }
+  // A well-formed oversized group still parses and reports the untruncated total.
+  const all = Array.from({ length: MAX_ITEMS_PER_GROUP + 10 }, (_, i) => valid(i));
+  const r = parseBuildInbox(JSON.stringify({ needs_you: [], running: all, finished: [] }));
+  assert.equal(r.running.length, MAX_ITEMS_PER_GROUP);
+  assert.equal(r.counts.running, MAX_ITEMS_PER_GROUP + 10);
+  assert.ok(r.running.every(item => item.project === 'matrix' && item.taskId));
+});
+
+test('malformed output reaches the client as a safe structured error', () => {
+  let thrown;
+  try {
+    parseBuildInbox(JSON.stringify({ needs_you: [{ task_id: 't-1', state: 'BLOCKED' }], running: [], finished: [] }));
+  } catch (err) {
+    thrown = err;
+  }
+  assert.equal(thrown.code, 'malformed_output');
+  const { status, body } = buildInboxErrorResponse(thrown);
+  assert.equal(status, 502);
+  assert.equal(body.ok, false);
+  assert.equal(body.error, 'malformed_output');
+  assert.match(body.message, /not a valid summary/);
+
+  // An unexpected non-inbox error must not leak its message to the client.
+  const opaque = buildInboxErrorResponse(new Error('ENOENT /Users/secret/path'));
+  assert.deepEqual(opaque, { status: 502, body: { ok: false, error: 'failed', message: 'Build inbox unavailable' } });
+});
+
+test('the endpoint builds its failure response from the shared helper', () => {
+  const server = fs.readFileSync(path.join(__dirname, '../server/server.js'), 'utf8');
+  const handler = server.slice(server.indexOf("app.get('/api/build-inbox'"));
+  const body = handler.slice(0, handler.indexOf('\n});'));
+  assert.match(body, /buildInboxErrorResponse\(err\)/);
+  assert.doesNotMatch(body, /ok:\s*false/, 'the endpoint must not hand-roll its own error body');
 });
 
 test('maps failures to structured errors', async (t) => {
