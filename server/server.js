@@ -566,44 +566,27 @@ app.get('/api/sessions', (req, res) => {
       };
     });
 
-    // Deduplicate: only merge sessions that have a CONFIRMED project identity.
-    // Guessed names (from pane titles, scrollback) are too noisy to dedup on —
-    // two unrelated sessions can mention the same project path in scrollback.
-    const groups = new Map(); // displayName (lowercase) → best session
-
+    // Keep every session — when multiple share a confirmed project name,
+    // suffix them ("project 1", "project 2") so each is distinguishable in the list.
+    // Numeric/unconfirmed displayNames are left alone (already unique by tmux name).
+    const byKey = new Map(); // displayName (lowercase) → array of sessions
     for (const s of sessions) {
       const key = s.displayName.toLowerCase();
-
-      // Only merge when BOTH sessions have confirmed project identity
-      // and share the same displayName. Otherwise treat as unique.
-      if (s.projectConfirmed && !/^\d+$/.test(key)) {
-        const existing = groups.get(key);
-        if (existing && existing.projectConfirmed) {
-          // Both confirmed same project — pick winner
-          const newWins =
-            (s.claudeRunning && !existing.claudeRunning) ||
-            (s.claudeRunning === existing.claudeRunning && s.lastActivity > existing.lastActivity);
-          const winner = newWins ? s : existing;
-          const loser = newWins ? existing : s;
-
-          // Merge attention: if ANY session for this project needs attention, show it
-          if (loser.needsAttention) winner.needsAttention = true;
-
-          groups.set(key, winner);
-        } else if (!existing) {
-          // First confirmed session with this name — store under display name for merging
-          groups.set(key, s);
-        } else {
-          // Existing is unconfirmed, new is confirmed — confirmed wins
-          groups.set(key, s);
-        }
-      } else {
-        // Unconfirmed or numeric — unique, never merge
-        groups.set(`__unique_${s.name}`, s);
-      }
+      if (!s.projectConfirmed || /^\d+$/.test(key)) continue;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(s);
+    }
+    for (const [, group] of byKey) {
+      if (group.length < 2) continue;
+      // Most-active session gets "1", oldest gets the highest number.
+      group.sort((a, b) => {
+        if (a.claudeRunning !== b.claudeRunning) return a.claudeRunning ? -1 : 1;
+        return b.lastActivity - a.lastActivity;
+      });
+      group.forEach((s, i) => { s.displayName = `${s.displayName} ${i + 1}`; });
     }
 
-    const deduped = [...groups.values()];
+    const deduped = sessions.slice();
 
     // Strip leading "_ " from display names
     for (const s of deduped) {
@@ -1065,12 +1048,15 @@ wss.on('connection', (ws, req) => {
     }
   }
 
-  // Capture full scrollback + visible screen as plain text (no ANSI)
+  // Capture full scrollback + visible screen as plain text (no ANSI).
+  // maxBuffer must be large — a long Claude session's scrollback can easily
+  // exceed Node's 1 MB execSync default and cause silent ENOBUFS failure
+  // (the empty-terminal symptom: pane-size sent, output never sent).
   function captureAll() {
     try {
       return execSync(
         `tmux capture-pane -t '${target}' -p -S - 2>/dev/null`,
-        { encoding: 'utf8' }
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
       );
     } catch {
       return '';
@@ -1084,19 +1070,13 @@ wss.on('connection', (ws, req) => {
     const size = getPaneSize();
     ws.send(JSON.stringify({ type: 'pane-size', cols: size.cols, rows: size.rows }));
 
-    // Send scrollback on connect — on reconnect, only send lines since last disconnect
+    // Always send full scrollback on each new client connect — the client clears
+    // the viewer in openTerminal() before connecting, so it expects a fresh dump.
+    // The previous "diff on reconnect" path could send a whitespace-only delta and
+    // leave the viewer blank when the conversation was idle.
     const all = captureAll();
     const allLines = all.split('\n');
-    const prevCount = targetLineTracker[target] || 0;
-
-    if (prevCount > 0 && prevCount < allLines.length) {
-      // Reconnect — only send new lines since last disconnect
-      const newLines = allLines.slice(prevCount);
-      if (newLines.join('').trim()) {
-        ws.send(JSON.stringify({ type: 'output', data: newLines.join('\r\n') + '\r\n' }));
-      }
-    } else if (all.trim()) {
-      // First connect or line count reset — send full scrollback
+    if (all.trim()) {
       ws.send(JSON.stringify({ type: 'output', data: all.replace(/\n/g, '\r\n') }));
     }
 
