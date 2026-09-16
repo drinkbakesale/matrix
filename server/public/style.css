@@ -191,6 +191,164 @@ body {
   text-overflow: ellipsis;
 }
 
+/* ── Pinned Build Inbox Row ── */
+.build-inbox-pin {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 8px 0;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px dashed var(--green);
+  border-radius: var(--radius);
+  color: var(--green);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+  flex-shrink: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.build-inbox-pin:active {
+  background: var(--border);
+  box-shadow: 0 0 8px var(--green-glow);
+}
+
+.build-inbox-pin-label {
+  flex: 1;
+  text-shadow: 0 0 6px var(--green-glow);
+}
+
+/* ── Build Inbox View ── */
+#build-inbox-view {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+#build-inbox-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: max(env(safe-area-inset-top), 6px) 8px 6px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#build-inbox-back {
+  background: none;
+  border: none;
+  color: var(--green);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+#build-inbox-title {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  text-shadow: 0 0 6px var(--green-glow);
+}
+
+#build-inbox-refresh {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--green);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: var(--radius);
+}
+
+.build-inbox-status {
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--dim);
+  flex-shrink: 0;
+}
+
+.build-inbox-status.error { color: var(--red); }
+
+#build-inbox-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px max(env(safe-area-inset-bottom), 8px);
+  -webkit-overflow-scrolling: touch;
+}
+
+.inbox-group { margin-bottom: 14px; }
+
+.inbox-group-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 6px 4px;
+}
+
+.inbox-group.needs-you .inbox-group-title { color: var(--amber); }
+
+.inbox-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 6px;
+}
+
+.inbox-group.needs-you .inbox-item { border-color: var(--amber); }
+
+.inbox-item-top {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.inbox-project {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inbox-detail {
+  max-width: 55%;
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inbox-item-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.inbox-empty {
+  font-size: 12px;
+  color: var(--dim);
+  padding: 4px 6px;
+}
+
 /* ── Project Picker Modal ── */
 #picker-modal {
   position: fixed;
@@ -410,12 +568,19 @@ body {
   word-break: normal;
   -webkit-overflow-scrolling: touch;
   text-shadow: none;
+  /* The transcript is a real text surface: native long-press selection and Copy */
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 /* Chat message blocks */
 #terminal .msg {
   padding: 4px 0;
   margin: 0;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 #terminal .msg-human {

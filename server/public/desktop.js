@@ -7,6 +7,19 @@ let dismissed = {}; // dismissed sessions
 let switchToastTimer = null;
 let switchToastSession = null;
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// Row label: canonical project name, plus an instance suffix when sessions share a project.
+function sessionLabel(s) {
+  if (!s) return '';
+  if (s.projectName) return s.instanceSuffix ? `${s.projectName} · ${s.instanceSuffix}` : s.projectName;
+  return s.displayName || s.name;
+}
+
 // ── ANSI / Filter ──
 
 function stripAnsi(str) {
@@ -71,7 +84,9 @@ async function loadSessions() {
     // Filter recent projects: not already visible, active within 14 days
     const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
     const activeNames = new Set(sessions.map(s => s.name.toLowerCase()));
-    const activeDisplayNames = new Set(sessions.map(s => (s.displayName || s.name).toLowerCase()));
+    const activeDisplayNames = new Set(sessions.flatMap(s =>
+      [s.projectName, s.displayName, s.name].filter(Boolean).map(n => n.toLowerCase())
+    ));
     recentProjects = (recentData.projects || []).filter(p =>
       p.lastActivity > fourteenDaysAgo &&
       !activeNames.has(p.name.toLowerCase()) &&
@@ -110,15 +125,15 @@ function renderSidebar() {
     const selected = s.name === currentSession ? ' selected' : '';
     const attention = needsAtt ? ' attention' : '';
     const dimmed = isDismissed ? ' dismissed' : '';
-    const descHtml = s.description ? `<div class="project-desc">${s.description}</div>` : '';
-    const dismissHtml = needsAtt ? `<button class="dismiss-btn" data-dismiss="${s.name}">dismiss</button>` : '';
+    const descHtml = s.description ? `<div class="project-desc">${escapeHtml(s.description)}</div>` : '';
+    const dismissHtml = needsAtt ? `<button class="dismiss-btn" data-dismiss="${escapeHtml(s.name)}">dismiss</button>` : '';
 
     return `
-      <div class="project-item${selected}${attention}${dimmed}" data-session="${s.name}">
+      <div class="project-item${selected}${attention}${dimmed}" data-session="${escapeHtml(s.name)}">
         <div class="project-content">
           <div class="project-top">
             <span class="project-dot ${dotClass}"></span>
-            <span class="project-name">${s.displayName || s.name}</span>
+            <span class="project-name">${escapeHtml(sessionLabel(s))}</span>
             <span class="project-badge">${badge}</span>
           </div>
           ${descHtml}
@@ -193,15 +208,16 @@ function recentTimeAgo(ms) {
 
 // ── Switch Toast (top-right popup) ──
 
-function showSwitchToast(session) {
+function showSwitchToast(session, projectLabel) {
   removeSwitchToast();
   switchToastSession = session;
+  const label = sessionLabel(sessions.find(s => s.name === session)) || projectLabel || session;
 
   const toast = document.createElement('div');
   toast.id = 'switch-toast';
   toast.innerHTML = `
     <span class="switch-toast-dot"></span>
-    <span class="switch-toast-text"><strong>${session}</strong> needs your input</span>
+    <span class="switch-toast-text"><strong>${escapeHtml(label)}</strong> needs your input</span>
     <span class="switch-toast-hint">Enter to switch</span>
   `;
   toast.addEventListener('click', () => {
@@ -246,7 +262,7 @@ function selectProject(name) {
 
   document.getElementById('empty-state').style.display = 'none';
   document.getElementById('chat-view').style.display = 'flex';
-  document.getElementById('chat-title').textContent = session?.displayName || name;
+  document.getElementById('chat-title').textContent = sessionLabel(session) || name;
 
   updateChatStatus();
 
@@ -448,8 +464,10 @@ function setupSSE() {
       const data = JSON.parse(e.data);
       if (data.type !== 'notification') return;
 
-      const session = data.session || data.project;
-      if (session && session !== 'matrix') {
+      // Only a server-resolved tmux session identifies a row; an unresolved alert never
+      // highlights or switches to a different project.
+      const session = typeof data.targetSession === 'string' ? data.targetSession : '';
+      if (session) {
         const wasAlreadyWaiting = sessionAttention[session];
         sessionAttention[session] = true;
         // Only undismiss for genuinely NEW alerts — don't override user's dismiss
@@ -461,7 +479,7 @@ function setupSSE() {
 
         // Show switch toast only for NEWLY waiting projects
         if (!wasAlreadyWaiting && session !== currentSession) {
-          showSwitchToast(session);
+          showSwitchToast(session, data.project);
         }
       }
     } catch {}

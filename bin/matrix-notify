@@ -8,16 +8,30 @@ TMUX_SESSION=""
 
 # Priority 1: tmux @matrix_project variable (set by matrix-project-tag.js hook)
 if [ -n "$TMUX_PANE" ]; then
-  TMUX_SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  TMUX_SESSION=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null)
   SESSION=$(tmux show-option -t "$TMUX_SESSION" -v @matrix_project 2>/dev/null || true)
 fi
 
-# Priority 2: match $PWD against projects.conf (longest path wins)
+# Priority 2: match $PWD against projects.conf (longest path wins).
+# Only the configured path itself or a slash-delimited descendant of it counts: a bare
+# prefix test makes a sibling directory (…/app-old) answer to another project (…/app),
+# which then routes the alert to that project's terminal. Paths are expanded by
+# substitution, never by eval, so a config value cannot execute anything.
 if [ -z "$SESSION" ]; then
   BEST_LEN=0
+  CWD="${PWD%/}"
   while IFS='|' read -r name spath _; do
-    expanded=$(eval echo "$spath")
-    if [[ "$PWD" == "$expanded"* ]]; then
+    [ -n "$name" ] && [ -n "$spath" ] || continue
+    expanded="$spath"
+    case "$expanded" in
+      '~') expanded="$HOME" ;;
+      '~/'*) expanded="$HOME/${expanded#\~/}" ;;
+    esac
+    expanded="${expanded//\$\{HOME\}/$HOME}"
+    expanded="${expanded//\$HOME/$HOME}"
+    expanded="${expanded%/}"
+    [ -n "$expanded" ] || continue
+    if [ "$CWD" = "$expanded" ] || [ "${CWD#"$expanded"/}" != "$CWD" ]; then
       len=${#expanded}
       if (( len > BEST_LEN )); then
         BEST_LEN=$len
@@ -42,8 +56,19 @@ if [[ "$SESSION" == "matrix" && "$TMUX_SESSION" == "matrix" ]]; then
   exit 0
 fi
 
-# Post to server — handles SSE toast + web push
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/}
+  printf '%s' "$s"
+}
+
+# Post to server — handles SSE toast + web push. tmuxSession lets the server route the
+# notification to this exact terminal instead of guessing from the project label.
 curl -s -X POST "http://localhost:${MATRIX_PORT:-7778}/api/notify" \
   -H 'Content-Type: application/json' \
-  -d "{\"message\":\"$MSG\",\"project\":\"$SESSION\",\"session\":\"$SESSION\"}" \
+  -d "{\"message\":\"$(json_escape "$MSG")\",\"project\":\"$(json_escape "$SESSION")\",\"session\":\"$(json_escape "$SESSION")\",\"tmuxSession\":\"$(json_escape "$TMUX_SESSION")\"}" \
   >/dev/null 2>&1
