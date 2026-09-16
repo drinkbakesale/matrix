@@ -103,9 +103,16 @@ test('project label resolves to its live session, exact name first', () => {
   assert.equal(resolveNotificationTarget({ session: '43' }, sessions).targetSession, '43');
 });
 
-test('a project with several live sessions resolves to its most recently active one', () => {
+test('a project label matching several live sessions is unresolved, not a guess', () => {
+  // Recent activity cannot identify which terminal raised the alert.
   const r = resolveNotificationTarget({ session: 'angles-to-ads' }, sessions);
-  assert.deepEqual(r, { targetSession: '49', projectName: 'angles-to-ads', via: 'project-most-recent' });
+  assert.deepEqual(r, { targetSession: null, projectName: null, via: 'ambiguous-label' });
+  assert.equal(resolveNotificationTarget({ project: 'ANGLES-TO-ADS' }, sessions).targetSession, null);
+});
+
+test('an explicit tmux target wins over an ambiguous project label', () => {
+  const r = resolveNotificationTarget({ tmuxSession: '43', session: 'angles-to-ads', project: 'angles-to-ads' }, sessions);
+  assert.deepEqual(r, { targetSession: '43', projectName: 'angles-to-ads', via: 'tmux-session' });
 });
 
 test('labels drop control characters', () => {

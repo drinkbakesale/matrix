@@ -9,10 +9,6 @@ let deferredScreenUpdate = null;
 
 const MAX_DOM_MESSAGES = 1000;
 
-// Labels that name the Matrix control surface rather than a project (mirrors
-// server/lib/session-identity.js); they never identify a terminal on their own.
-const GENERIC_CONTROL_LABELS = new Set(['matrix']);
-
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, c => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -156,18 +152,13 @@ async function fetchSessions() {
   return lastSessionList;
 }
 
-// Exact tmux identity first. A case-insensitive match is accepted only when it is unique and
-// not the generic Matrix label, so a stale label can never open a different project.
+// A resolved targetSession is an opaque tmux routing name: match it exactly and
+// case-sensitively. No project-label or case-folded fallback, because a stale target that
+// happens to equal another session's project name (or its name in different case) would
+// otherwise open a different terminal. Server ingestion owns any label resolution.
 function findSessionForTarget(sessions, target) {
   if (!Array.isArray(sessions) || !target) return null;
-  const exact = sessions.find(s => s.name === target);
-  if (exact) return exact;
-  const lower = target.toLowerCase();
-  const byName = sessions.filter(s => String(s.name).toLowerCase() === lower);
-  if (byName.length === 1) return byName[0];
-  if (GENERIC_CONTROL_LABELS.has(lower)) return null;
-  const byProject = sessions.filter(s => s.projectName && s.projectName.toLowerCase() === lower);
-  return byProject.length === 1 ? byProject[0] : null;
+  return sessions.find(s => s.name === target) || null;
 }
 
 function noteNotificationIntent() {

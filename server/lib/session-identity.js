@@ -92,10 +92,6 @@ function assignInstanceLabels(sessions) {
   });
 }
 
-function mostRecent(sessions) {
-  return sessions.reduce((best, s) => ((s.lastActivity || 0) > (best.lastActivity || 0) ? s : best));
-}
-
 // Resolve a hook notification to one concrete live tmux session.
 // input: { tmuxSession, session, project } as posted by the notify hook.
 // Returns { targetSession, projectName, via }; targetSession is null when nothing live
@@ -121,12 +117,15 @@ function resolveNotificationTarget(input, sessions) {
     if (byName.has(label)) return hit(byName.get(label), 'session-name');
   }
 
+  // Legacy label-only notifications may name a project. Accept that only when exactly one
+  // live session belongs to it: several sessions of one project are ambiguous, and recent
+  // activity cannot identify which terminal raised the alert.
   for (const label of labels) {
     const confirmed = live.filter(s => s.projectConfirmed && s.projectName);
     let matches = confirmed.filter(s => s.projectName === label);
     if (!matches.length) matches = confirmed.filter(s => s.projectName.toLowerCase() === label.toLowerCase());
     if (matches.length === 1) return hit(matches[0], 'project');
-    if (matches.length > 1) return hit(mostRecent(matches), 'project-most-recent');
+    if (matches.length > 1) return miss('ambiguous-label');
   }
 
   return miss('unresolved');
