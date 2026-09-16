@@ -4,7 +4,6 @@ let notifSource = null;
 let userScrolledUp = false;
 
 let lastSessionList = [];
-let lastNotificationIntentAt = 0;
 let deferredScreenUpdate = null;
 
 const MAX_DOM_MESSAGES = 1000;
@@ -161,17 +160,40 @@ function findSessionForTarget(sessions, target) {
   return sessions.find(s => s.name === target) || null;
 }
 
-function noteNotificationIntent() {
-  lastNotificationIntentAt = Date.now();
+// ── Navigation intents ──
+// A notification tap (URL parameter or service-worker message) and the pending-alert
+// auto-open can be in flight at once, each awaiting its own /api/sessions response. Ordering
+// those responses decides nothing: every navigation claims a generation, a claim invalidates
+// older ones, and each navigation re-checks its generation immediately before its final
+// terminal action, so a slow loser can never overwrite the winner's terminal.
+const INTENT_PRIORITY = { 'pending-alert': 1, explicit: 2 };
+let activeNavigation = { generation: 0, priority: 0, settled: true };
+
+// Claim the right to navigate, or return null when a newer or stronger intent owns it.
+// `sinceGeneration` makes a claim conditional: the pending-alert path passes the generation it
+// observed when its request started, so any tap that claimed while that request was
+// outstanding refuses the claim — however late the pending response arrives.
+function claimNavigation(source, sinceGeneration) {
+  const priority = INTENT_PRIORITY[source] || INTENT_PRIORITY['pending-alert'];
+  if (typeof sinceGeneration === 'number' && sinceGeneration !== activeNavigation.generation) return null;
+  if (!activeNavigation.settled && priority < activeNavigation.priority) return null;
+  activeNavigation = { generation: activeNavigation.generation + 1, priority, settled: false };
+  return activeNavigation.generation;
 }
 
-function hasRecentNotificationIntent() {
-  return Date.now() - lastNotificationIntentAt < 5000;
+function navigationIsCurrent(generation) {
+  return generation === activeNavigation.generation;
+}
+
+function settleNavigation(generation) {
+  if (navigationIsCurrent(generation)) activeNavigation.settled = true;
 }
 
 // Open the terminal a notification targets once session data is loaded; when the target is
 // missing or no longer live, show the project list instead of any other terminal.
-async function openNotificationTarget(target) {
+async function openNotificationTarget(target, generation) {
+  const claim = typeof generation === 'number' ? generation : claimNavigation('explicit');
+  if (claim === null) return;
   const wanted = typeof target === 'string' ? target.trim() : '';
   let match = null;
   if (wanted) {
@@ -184,8 +206,11 @@ async function openNotificationTarget(target) {
       }
     }
   }
+  // A newer intent claimed navigation while this one was waiting; leave its terminal alone.
+  if (!navigationIsCurrent(claim)) return;
   if (match) openTerminal(match.name);
   else closeTerminal();
+  settleNavigation(claim);
 }
 
 function showToast(data) {
@@ -877,20 +902,22 @@ document.querySelectorAll('.qa-btn').forEach(btn => {
 // Auto-refresh session list when app comes to foreground + check pending alerts
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) return;
+  // Snapshot the navigation generation before asking for a pending alert: if a notification
+  // tap claims navigation while this request is outstanding, this alert must not navigate,
+  // no matter how late its response arrives.
+  const startGeneration = activeNavigation.generation;
   // Check if there's a pending notification to auto-open
   try {
     const res = await fetch('/api/pending-alert');
     const { alert } = await res.json();
-    // Tapping a notification delivers its own target (URL or service-worker message), which
-    // must win over the newest pending alert — give that message a moment to arrive.
-    await new Promise(r => setTimeout(r, 400));
-    if (hasRecentNotificationIntent()) return;
     if (alert && alert.targetSession) {
-      openNotificationTarget(alert.targetSession);
+      const generation = claimNavigation('pending-alert', startGeneration);
+      if (generation === null) return;
+      await openNotificationTarget(alert.targetSession, generation);
       return;
     }
   } catch {}
-  if (hasRecentNotificationIntent()) return;
+  if (activeNavigation.generation !== startGeneration) return; // a tap owns navigation now
   if (currentSession) {
     if (!ws || ws.readyState > 1) connectWebSocket(currentSession);
   } else if (isBuildInboxOpen()) {
@@ -911,7 +938,6 @@ if ('serviceWorker' in navigator) {
   // Only the server-resolved targetSession is trusted; without one, show the project list.
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data?.type !== 'open-session') return;
-    noteNotificationIntent();
     openNotificationTarget(typeof e.data.targetSession === 'string' ? e.data.targetSession : '');
   });
   // Show setup button if permission not yet granted, auto-subscribe if already granted
@@ -958,7 +984,6 @@ if ('serviceWorker' in navigator) {
 const openParam = new URLSearchParams(location.search).get('open');
 if (openParam !== null) {
   history.replaceState(null, '', location.pathname || '/');
-  noteNotificationIntent();
   openNotificationTarget(openParam);
 } else {
   loadSessions();
