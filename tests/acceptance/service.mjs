@@ -76,6 +76,36 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   await service.settle();
   t.eq((await service.read('S')).current, byId.f2.expectedCurrent, 'the Claude window brief is untouched by the shell window');
 
+  // Claude moves between windows inside ONE incarnation. Discovery is warm, the session is
+  // not recreated and nothing calls invalidate(): the brief has to follow the stream on its
+  // own, because window names and the commands running in them are mutable.
+  const streamTargetFor = session => {
+    const claude = (session.windows || []).find(w => briefTmux.isClaudeCmd(w.command));
+    return claude ? `S:${claude.name}` : 'S';
+  };
+  const movedSession = {
+    sessionId: '$S', createdAt: 1_600_000_000,
+    windows: [
+      { name: 'shell', command: 'claude', active: true, pane: paneFor(byId.f3) },   // Claude restarted here
+      { name: 'claude', command: 'bash', active: false, pane: paneFor(byId.f2) },   // and quit here
+    ],
+  };
+  fake.set('S', movedSession);
+  const callsBeforeMove = fake.callsFor('list-panes').length;
+  const afterMove = await service.read('S');
+  t.ok(fake.callsFor('list-panes').length > callsBeforeMove, 'the reopened read re-enumerates windows rather than trusting warm discovery');
+  t.eq(afterMove.session.target, streamTargetFor(movedSession), 'the brief targets the window the stream would pick after the move');
+  t.eq(afterMove.goal, null, 'the moved-to window exposes no brief from the window Claude left');
+  t.ok(!String(afterMove.current || '').includes('score normalization'), 'no text from the previous window survives the move');
+  // This window was last looked at moments ago, so the evidence interval is still holding
+  // it off; let it elapse and the moved-to window generates from its own pane.
+  clock.advance(31000);
+  await service.tick();
+  await service.settle();
+  const settledAfterMove = await service.read('S');
+  t.eq(settledAfterMove.goal, byId.f3.expectedGoal, 'the moved-to window generates from its own pane');
+  t.eq(settledAfterMove.session.target, 'S:shell', 'generation stays bound to the moved-to window');
+
   // Same project, different session: no cross-contamination.
   await service.read('B');
   await service.settle();

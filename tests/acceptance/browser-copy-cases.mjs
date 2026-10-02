@@ -57,7 +57,19 @@ export async function copyDiagnosis(ctx, t) {
   t.eq(cand.screen_only.preserved, true, 'CANDIDATE: a screen refresh keeps the selection');
   t.eq(cand.output_only.preserved, true, 'CANDIDATE: appended output keeps the selection');
   t.eq(cand.reconnect_dump.preserved, true, 'CANDIDATE: a reconnect dump keeps the selection');
+  // Pruning only means something if the workload actually prunes. Both variants must show
+  // the unprotected control capping the node count and dropping an identified old node.
+  for (const [variant, conds] of [['BASE', base], ['CANDIDATE', cand]]) {
+    const ctl = conds.pruning_control;
+    t.ok(ctl.messagesEmitted > ctl.pruneLimit, `${variant}: the pruning workload emits more than the ${ctl.pruneLimit}-node limit as separate messages`);
+    t.eq(ctl.cappedAtPruneLimit, true, `${variant}: unprotected control is capped exactly at the prune limit (${ctl.nodesBeforeFlood}+${ctl.messagesEmitted} emitted, ${ctl.nodesAfterFlood} left, limit ${ctl.pruneLimit})`);
+    t.eq(ctl.oldestNodeRemoved, true, `${variant}: unprotected control removed the identified oldest node`);
+    t.eq(ctl.newestMessageKept, true, `${variant}: pruning dropped the oldest nodes, not the newest`);
+    t.eq(conds.pruning.entryState.selection, '', `${variant}: the pruning condition starts with no inherited selection`);
+  }
+  t.eq(cand.pruning_control.stateBefore.mode, 'live', 'CANDIDATE: the unprotected control really is unprotected');
   t.eq(cand.pruning.preserved, true, 'CANDIDATE: pruning past 1000 messages keeps the selection');
+  t.eq(cand.pruning.nodeConnected, true, 'CANDIDATE: the selected node survives the pruning workload');
   t.eq(cand.list_header_refresh.preserved, true, 'CANDIDATE: a list/header/brief refresh keeps the selection');
   t.eq(cand.ancestor_gestures.touchendDefaultPrevented, false, 'CANDIDATE: no ancestor preventDefaults a transcript touchend');
   t.ok(cand.ancestor_gestures.chain.every(n => n.userSelect !== 'none'), 'CANDIDATE: no ancestor disables selection');

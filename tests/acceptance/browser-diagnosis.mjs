@@ -8,6 +8,8 @@
 import { emit, startStream, stopStream } from './browser-support.mjs';
 
 const TARGET = 'selection target café 日本語';
+// MAX_DOM_MESSAGES in both the base renderer and the delivered transcript controller.
+const PRUNE_LIMIT = 1000;
 
 async function prime(page) {
   await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
@@ -40,20 +42,102 @@ async function preSelectionGesture(page) {
     await new Promise(r => setTimeout(r, 900));
     clearInterval(timer);
     const after = original.getBoundingClientRect();
-    return {
+    const result = {
       connected: original.isConnected,
       yStable: after.y === rect.y,
       stable: original.isConnected && after.y === rect.y,
       updates: n,
       text: original.textContent,
     };
+    // Release the gesture here, inside the measurement, so the held pointer cannot leak
+    // into any later condition and protect it by accident.
+    const empty = typeof document.createTouchList === 'function' ? document.createTouchList() : null;
+    if (list) original.dispatchEvent(new TouchEvent('touchend', { bubbles: true, touches: empty, targetTouches: empty, changedTouches: list }));
+    original.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'touch', clientX: x, clientY: y }));
+    return result;
   });
+}
+
+// Conditions must not inherit each other's state. This clears any selection, completes any
+// gesture still in progress and waits past the release grace, on base and candidate alike
+// (the base has no transcript controller, so nothing here may depend on one).
+async function resetConditionState(page) {
+  await page.evaluate(() => {
+    const term = document.getElementById('terminal');
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges();
+    if (term) {
+      const empty = typeof document.createTouchList === 'function' ? document.createTouchList() : null;
+      if (empty) term.dispatchEvent(new TouchEvent('touchcancel', { bubbles: true, touches: empty, targetTouches: empty, changedTouches: empty }));
+      term.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, pointerType: 'touch' }));
+      term.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'touch' }));
+    }
+  });
+  await page.waitForTimeout(250);
+  return page.evaluate(() => ({
+    mode: typeof transcript === 'undefined' ? 'n/a (base has no transcript controller)' : transcript.mode(),
+    selection: String(window.getSelection()),
+  }));
+}
+
+// Emits `count` SEPARATE output messages. The delivered renderer makes one .msg node per
+// message, so this is the only way to actually cross the 1000-node pruning threshold; one
+// big blob is a single node and never prunes anything.
+function floodMessages(page, count, label) {
+  return page.evaluate(([n, tag]) => {
+    const s = window.__sockets.at(-1);
+    for (let i = 0; i < n; i += 1) {
+      s.onmessage({ data: JSON.stringify({ type: 'output', data: `${tag} ${i}\n` }) });
+    }
+    return document.getElementById('terminal').querySelectorAll('.msg').length;
+  }, [count, label]);
+}
+
+// The unprotected control: with nothing selected and no gesture held, pruning must actually
+// fire — node count capped and an identified old node gone from the DOM. Without this a
+// "selection survived pruning" result could just mean pruning never ran.
+async function pruningControl(page) {
+  const state = await resetConditionState(page);
+  await floodMessages(page, 200, 'control warmup');
+  const marked = await page.evaluate(() => {
+    const term = document.getElementById('terminal');
+    window.__oldestNode = term.querySelector('.msg');
+    return { nodes: term.querySelectorAll('.msg').length, oldestText: window.__oldestNode ? window.__oldestNode.textContent : '' };
+  });
+  const emitted = 1400;
+  await floodMessages(page, emitted, 'control prune filler');
+  const after = await page.evaluate((last) => {
+    const term = document.getElementById('terminal');
+    const nodes = term.querySelectorAll('.msg');
+    return {
+      nodes: nodes.length,
+      oldestStillConnected: window.__oldestNode ? window.__oldestNode.isConnected : null,
+      newestText: nodes.length ? nodes[nodes.length - 1].textContent : '',
+      lastFillerPresent: nodes.length ? nodes[nodes.length - 1].textContent.includes(last) : false,
+    };
+  }, `control prune filler ${emitted - 1}`);
+  return {
+    stateBefore: state,
+    nodesBeforeFlood: marked.nodes,
+    messagesEmitted: emitted,
+    nodesAfterFlood: after.nodes,
+    pruneLimit: PRUNE_LIMIT,
+    // Capped exactly at the renderer's limit: more nodes were created than the limit and
+    // the surplus was dropped. A workload that only made one node cannot satisfy this.
+    cappedAtPruneLimit: after.nodes === PRUNE_LIMIT,
+    oldestNodeRemoved: after.oldestStillConnected === false,
+    newestMessageKept: after.lastFillerPresent,
+    oldestText: marked.oldestText,
+    newestText: after.newestText,
+  };
 }
 
 // Conditions 2-6 — selection lifetime. The selection here is created with a scripted Range:
 // that is explicitly a selection-lifetime subtest, and is never evidence that a long press
 // produced a selection.
 async function selectionLifetime(page, kind) {
+  // Every condition starts from the same clean state: no selection, no gesture in flight.
+  const entryState = await resetConditionState(page);
   await page.evaluate(() => {
     const term = document.getElementById('terminal');
     const node = term.querySelector('.msg-screen') || term.lastElementChild;
@@ -78,12 +162,8 @@ async function selectionLifetime(page, kind) {
     await page.waitForTimeout(1700);
     await emit(page, 'output', `initial history\nreconnected dump\n`);
   } else if (kind === 'pruning') {
-    await page.evaluate(() => {
-      const s = window.__sockets.at(-1);
-      let blob = '';
-      for (let i = 0; i < 1100; i += 1) blob += `prune filler ${i}\n`;
-      s.onmessage({ data: JSON.stringify({ type: 'output', data: blob }) });
-    });
+    // The same workload the unprotected control used: >1000 real message nodes.
+    await floodMessages(page, 1400, 'protected prune filler');
   } else if (kind === 'list_header_refresh') {
     await page.evaluate(async () => {
       if (typeof loadSessions === 'function') await loadSessions();
@@ -95,12 +175,14 @@ async function selectionLifetime(page, kind) {
     await page.waitForTimeout(250);
   }
 
-  return page.evaluate(() => ({
+  const result = await page.evaluate(() => ({
     before: window.__selectedBefore,
     after: String(window.getSelection()),
     preserved: String(window.getSelection()) === window.__selectedBefore && window.__selectedBefore.length > 0,
     nodeConnected: window.__selectedNode ? window.__selectedNode.isConnected : false,
+    nodes: document.getElementById('terminal').querySelectorAll('.msg').length,
   }));
+  return { entryState, ...result };
 }
 
 // Condition 7 — do ancestors or their gesture handlers suppress selection/callout?
@@ -132,6 +214,9 @@ export async function diagnose(page, label) {
   await prime(page);
   const result = { variant: label, conditions: {} };
   result.conditions.pre_selection_gesture = await preSelectionGesture(page);
+  // Unprotected control first: prove the pruning workload really prunes, so the protected
+  // result below means something.
+  result.conditions.pruning_control = await pruningControl(page);
   for (const kind of ['screen_only', 'output_only', 'reconnect_dump', 'pruning', 'list_header_refresh']) {
     result.conditions[kind] = {
       selectionSource: 'scripted Range (labelled selection-lifetime subtest, not long-press proof)',
