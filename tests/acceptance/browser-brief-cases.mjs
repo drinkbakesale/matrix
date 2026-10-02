@@ -18,6 +18,20 @@ async function settleAndRefresh(page) {
   await page.waitForTimeout(80);
 }
 
+// Waits for the DELIVERED client poll to bring a change in on its own. Nothing here calls
+// briefView.refresh(), so the deadline really is the shipped polling interval plus slack.
+async function waitForBrief(page, predicate, deadlineMs, label) {
+  const started = Date.now();
+  for (;;) {
+    const brief = await readBrief(page);
+    if (predicate(brief)) return { brief, elapsedMs: Date.now() - started };
+    if (Date.now() - started > deadlineMs) {
+      throw new Error(`${label}: client poll did not update within ${deadlineMs}ms (last ${JSON.stringify(brief)})`);
+    }
+    await page.waitForTimeout(100);
+  }
+}
+
 async function readBrief(page) {
   return page.evaluate(() => ({
     status: document.getElementById('brief').getAttribute('data-status'),
@@ -127,11 +141,16 @@ export async function updatesAndOverrides(ctx, t) {
   const first = await readBrief(page);
   t.eq(first.current, F1.current, 'the brief starts on fixture f1');
 
-  // f1 → f2 with no change of session name.
+  // f1 → f2 with no change of session name, and NOTHING here asks the view to refresh: the
+  // change has to arrive through the client's own polling, inside its configured interval.
+  const pollMs = await page.evaluate(() => briefView.pollIntervalMs);
+  t.ok(pollMs > 0 && pollMs <= 30000, `the client polls on a bounded configured interval (${pollMs}ms)`);
   await control(page, 'pane', { session: 'A', pane: ctx.panes.f2 });
   await control(page, 'advance', { ms: 31000 });
-  await settleAndRefresh(page);
-  const second = await readBrief(page);
+  const polled = await waitForBrief(page, b => b.current === F2.current, pollMs + 3000, 'f1->f2 by polling');
+  const second = polled.brief;
+  t.ok(polled.elapsedMs <= pollMs + 3000,
+    `current work reached the UI by client polling in ${polled.elapsedMs}ms, within the ${pollMs}ms interval plus generation`);
   t.eq(second.current, F2.current, 'current work refreshes within one evidence interval');
   t.eq(second.goal, F2.goal, 'the broad goal stays supported across the refresh');
   t.ok(second.generatedAt > first.generatedAt, 'generatedAt advances on a successful generation');
@@ -214,19 +233,67 @@ export async function updatesAndOverrides(ctx, t) {
 
 export async function isolationAndFailures(ctx, t) {
   const { context, page } = await openClient(ctx, 'mobile');
-
-  // A slow A, then switch to B before A's answer lands.
-  await control(page, 'mode', { mode: 'slow' });
-  await page.evaluate(() => briefView.refresh());
-  await page.evaluate(() => openTerminal('B'));
-  await page.waitForTimeout(100);
-  await control(page, 'mode', { mode: 'ok' });
+  // Start from a clean incarnation of A so earlier cases' edits do not colour this one.
+  await control(page, 'reincarnate', { session: 'A' });
+  await control(page, 'pane', { session: 'A', pane: ctx.panes.f1 });
+  await page.evaluate(() => openTerminal('A'));
   await settleAndRefresh(page);
-  const b = await readBrief(page);
-  t.eq(b.goal, F3.goal, 'session B shows its own goal');
-  t.ok(!b.goal.includes('copy generation') && !b.current.includes('judging'),
+  t.eq((await readBrief(page)).goal, F1.goal, 'session A starts with its own brief');
+
+  // ---- A held HTTP response for a session the user has left ----
+  // A's answer is computed now and written only when the test releases it, so this is a
+  // genuinely in-flight response, not a simulated one.
+  await control(page, 'hold', { session: 'A' });
+  await page.evaluate(() => briefView.open('A', ''));          // request for A: captured, held
+  await page.waitForTimeout(150);
+  t.ok((await control(page, 'held', { session: 'A' })).count >= 1, 'A\'s response is genuinely in flight');
+  await page.evaluate(() => openTerminal('B'));                 // B answers normally
+  await settleAndRefresh(page);
+  t.eq((await readBrief(page)).goal, F3.goal, 'session B shows its own goal');
+  await control(page, 'release', { session: 'A' });             // A's late answer arrives
+  await page.waitForTimeout(300);
+  const afterRelease = await readBrief(page);
+  t.eq(afterRelease.goal, F3.goal, 'a released in-flight answer for A never lands on B');
+  t.ok(!afterRelease.goal.includes('copy generation') && !afterRelease.current.includes('judging'),
     'session B never displays session A\'s brief');
-  t.ok(!b.goal.includes('shared-project'), 'the shared project label is not used as a goal');
+  t.ok(!afterRelease.goal.includes('shared-project'), 'the shared project label is not used as a goal');
+
+  // ---- A -> B -> A with TWO A answers in flight at once ----
+  // The first one belongs to a superseded open of the same session; releasing it before the
+  // current one must change nothing on screen.
+  await page.evaluate(() => briefView.open('A', ''));           // stale request, held
+  await page.waitForTimeout(150);
+  await page.evaluate(() => openTerminal('B'));
+  await page.waitForTimeout(150);
+  await page.evaluate(() => briefView.open('A', ''));           // current request, held
+  await page.waitForTimeout(150);
+  const pending = await control(page, 'held', { session: 'A' });
+  t.ok(pending.count >= 2, `both A answers are in flight (${pending.count})`);
+  await control(page, 'release', { session: 'A', count: 1 });   // FIFO: the superseded one
+  await page.waitForTimeout(300);
+  const staleSameName = await readBrief(page);
+  t.ok(['loading', 'generating'].includes(staleSameName.status),
+    `an answer from a previous open of the same session does not render (saw ${staleSameName.status})`);
+  t.ok(!staleSameName.goal.includes(F1.goal), 'no text from the superseded open reaches the screen');
+  await control(page, 'release', { session: 'A' });             // the current request may land
+  await page.waitForTimeout(300);
+  t.eq((await readBrief(page)).goal, F1.goal, 'the current open\'s own answer does render');
+
+  // ---- same name, different window: the other window's answer must not render ----
+  await page.evaluate(() => briefView.open('A', 'shell'));      // request for A:shell, held
+  await page.waitForTimeout(150);
+  await page.evaluate(() => briefView.open('A', 'claude'));     // user switches window
+  await page.waitForTimeout(150);
+  await control(page, 'release', { session: 'A', count: 1 });   // the shell answer comes back
+  await page.waitForTimeout(300);
+  const afterWindowSwitch = await readBrief(page);
+  t.ok(!afterWindowSwitch.goal.includes('inventory tracking'),
+    'an answer for the other window of the same session never renders');
+  await control(page, 'release', { session: 'A' });
+  await control(page, 'unhold', { session: 'A' });
+  await page.evaluate(() => openTerminal('A'));
+  await settleAndRefresh(page);
+  t.eq((await readBrief(page)).goal, F1.goal, 'the streamed window\'s own brief is what is shown');
 
   // A new incarnation under the same tmux name inherits nothing.
   await page.evaluate(() => openTerminal('A'));

@@ -88,6 +88,38 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
     tmux.set(name, { ...prev, windows });
   };
 
+  // Controlled response delay. A held session's brief response is COMPUTED immediately (so
+  // it carries the state at request time) but WRITTEN only when the test releases it. That
+  // is what lets a case prove an in-flight answer for a session the user has left can never
+  // reach the screen.
+  const held = new Map();                 // session -> [{ replay }]
+  const holding = new Set();
+
+  function heldSession(pathname) {
+    const match = /^\/api\/sessions\/([^/]+)\/brief\/?$/.exec(pathname);
+    if (!match) return null;
+    let name;
+    try { name = decodeURIComponent(match[1]); } catch { return null; }
+    return holding.has(name) ? name : null;
+  }
+
+  function captureResponse() {
+    const captured = { status: 200, headers: {}, chunks: [] };
+    const sink = {
+      setHeader(k, v) { captured.headers[k] = v; },
+      writeHead(status, headers) { captured.status = status; Object.assign(captured.headers, headers || {}); return sink; },
+      end(body) { if (body !== undefined) captured.chunks.push(body); },
+      write(body) { captured.chunks.push(body); },
+    };
+    return {
+      sink,
+      replay(real) {
+        real.writeHead(captured.status, captured.headers);
+        real.end(captured.chunks.join(''));
+      },
+    };
+  }
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const json = (status, body) => {
@@ -130,7 +162,27 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
         return json(200, { ok: true });
       }
       if (op === 'store') { return json(200, { file: home, contents: fs.existsSync(home) ? fs.readFileSync(home, 'utf8') : null }); }
+      if (op === 'hold') { holding.add(url.searchParams.get('session')); return json(200, { ok: true }); }
+      if (op === 'unhold') { holding.delete(url.searchParams.get('session')); return json(200, { ok: true }); }
+      if (op === 'held') { return json(200, { count: (held.get(url.searchParams.get('session')) || []).length }); }
+      if (op === 'release') {
+        const name = url.searchParams.get('session');
+        const want = url.searchParams.get('count');
+        const queue = held.get(name) || [];
+        const n = want === null ? queue.length : Math.min(Number(want), queue.length);
+        for (let i = 0; i < n; i += 1) queue.shift().replay();   // FIFO: oldest answer first
+        return json(200, { released: n, remaining: queue.length });
+      }
       return json(404, { ok: false });
+    }
+
+    const holdName = heldSession(url.pathname);
+    if (holdName) {
+      const captured = captureResponse();
+      if (!(await handler(req, captured.sink))) { res.writeHead(404).end(); return; }
+      if (!held.has(holdName)) held.set(holdName, []);
+      held.get(holdName).push({ replay: () => captured.replay(res) });
+      return;
     }
 
     if (await handler(req, res)) return;

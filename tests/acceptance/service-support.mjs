@@ -238,7 +238,11 @@ process.stdin.on('end', () => {
     hasApiKey: Boolean(process.env.ANTHROPIC_API_KEY),
     envKeys: Object.keys(process.env).sort(),
   }));
-  setTimeout(() => { process.stdout.write(${JSON.stringify(stdout)}); process.exit(${exitCode}); }, ${delayMs});
+  // Exit only once stdout has actually flushed, so an oversized payload really reaches the
+  // parent's maxBuffer instead of being cut short by an early exit.
+  setTimeout(() => {
+    process.stdout.write(${JSON.stringify(stdout)}, () => process.exit(${exitCode}));
+  }, ${delayMs});
 });
 `;
   fs.writeFileSync(bin, script, { mode: 0o755 });

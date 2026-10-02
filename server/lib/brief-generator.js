@@ -15,6 +15,10 @@
 
 const MAX_FIELD_CHARS = 500;
 const MAX_EVIDENCE_CHARS = 24 * 1024;
+// Hard bounds on the child process. Both are part of the contract, not tuning knobs: a
+// generator that can run forever or print forever is a denial of service on the brief slot.
+const DEFAULT_CLI_TIMEOUT_MS = 30000;
+const MAX_CLI_OUTPUT_BYTES = 64 * 1024;
 
 class BriefGenerationError extends Error {
   constructor(code, message) {
@@ -138,27 +142,39 @@ function renderEvidence(items) {
 
 // Shell-free, tool-free, memory-free. No API key is read or required: the installed CLI uses
 // the user's own Claude subscription auth.
-function createClaudeCliGenerator({ execFile, bin = 'claude', model = 'claude-haiku-4-5-20251001', timeoutMs = 30000, cwd } = {}) {
+function classifyCliError(err) {
+  // A child killed for exceeding maxBuffer is a bounded-output rejection, not a timeout:
+  // naming it correctly is what lets the operator tell a wedged CLI from a chatty one.
+  if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer/i.test(err.message || '')) {
+    return { code: 'generator_output_too_large', message: `claude CLI produced more than ${MAX_CLI_OUTPUT_BYTES} bytes and was stopped` };
+  }
+  if (err.killed || err.signal) return { code: 'generator_timeout', message: 'claude CLI timed out' };
+  return { code: 'generator_failed', message: 'claude CLI exited with an error' };
+}
+
+function createClaudeCliGenerator({ execFile, bin = 'claude', model = 'claude-haiku-4-5-20251001', timeoutMs = DEFAULT_CLI_TIMEOUT_MS, cwd } = {}) {
   if (typeof execFile !== 'function') throw new BriefGenerationError('invalid_config', 'claude generator requires execFile');
   const args = ['-p', '--model', model, '--output-format', 'text', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
   return {
     name: 'claude-cli',
     version: '1',
     args,
+    timeoutMs,
+    maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
     async generate({ items }) {
       const stdin = `${CLI_PROMPT_HEADER}\n${renderEvidence(items)}\n`;
       const raw = await new Promise((resolve, reject) => {
         const child = execFile(bin, args, {
           timeout: timeoutMs,
-          maxBuffer: 64 * 1024,
+          maxBuffer: MAX_CLI_OUTPUT_BYTES,
           cwd: cwd || require('os').tmpdir(),
           env: { PATH: process.env.PATH, HOME: process.env.HOME, TERM: 'dumb' },
           windowsHide: true,
         }, (err, stdout) => {
           if (err) {
-            const code = err.killed || err.signal ? 'generator_timeout' : 'generator_failed';
             // The child's own output may echo private transcript text, so it is not relayed.
-            reject(new BriefGenerationError(code, `claude CLI ${code === 'generator_timeout' ? 'timed out' : 'exited with an error'}`));
+            const { code, message } = classifyCliError(err);
+            reject(new BriefGenerationError(code, message));
             return;
           }
           resolve(String(stdout || ''));
@@ -213,4 +229,6 @@ module.exports = {
   splitSentences,
   MAX_FIELD_CHARS,
   MAX_EVIDENCE_CHARS,
+  DEFAULT_CLI_TIMEOUT_MS,
+  MAX_CLI_OUTPUT_BYTES,
 };

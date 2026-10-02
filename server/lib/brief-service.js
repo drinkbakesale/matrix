@@ -300,4 +300,7 @@ class BriefService {
   }
 }
 
-module.exports = { BriefService, BriefRequestError, DEFAULT_EVIDENCE_INTERVAL_MS };
+module.exports = {
+  BriefService, BriefRequestError,
+  DEFAULT_EVIDENCE_INTERVAL_MS, DEFAULT_GENERATION_TIMEOUT_MS, MAX_BACKOFF_MS,
+};

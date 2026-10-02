@@ -43,10 +43,17 @@
     // exact pane, so the summary describes what is on screen and not another window.
     var windowName = '';
     var latest = null;
+    // Every open/close is a new epoch. A response is only allowed to touch the UI if it was
+    // issued in the epoch that is still on screen: the session name alone is not enough,
+    // because A -> B -> A, a window change and a tmux reincarnation all keep the same name
+    // while being a different thing to look at.
+    var epoch = 0;
     var requestId = 0;
     var appliedId = 0;
     var timer = null;
     var editing = null;
+
+    function currentEpoch() { return epoch; }
 
     function briefUrl(name) {
       var url = '/api/sessions/' + encodeURIComponent(name) + '/brief';
@@ -101,28 +108,32 @@
       setStatus(messages.join(' · '), brief.error || brief.storageError ? 'error' : '');
     }
 
-    function apply(id, name, payload) {
-      // A slow response for the session the user left must never land on the new one.
-      if (name !== session || id <= appliedId) return;
+    // A response may only land if its epoch is still the one on screen and it is newer than
+    // whatever is already shown. Stale successes and stale errors are both dropped silently:
+    // the new session's own request owns the view.
+    function apply(id, token, payload) {
+      if (token !== epoch || id <= appliedId) return false;
       appliedId = id;
       latest = payload;
       render();
+      return true;
     }
 
     async function load() {
       if (!session || !fetchImpl) return;
       var id = ++requestId;
+      var token = epoch;
       var name = session;
       try {
         var res = await fetchImpl(briefUrl(name), { cache: 'no-store' });
         var data = await res.json();
         if (!data || data.ok !== true || !data.brief) {
-          apply(id, name, errorBrief(name, data && data.message ? data.message : 'HTTP ' + res.status));
+          apply(id, token, errorBrief(name, data && data.message ? data.message : 'HTTP ' + res.status));
           return;
         }
-        apply(id, name, data.brief);
+        apply(id, token, data.brief);
       } catch (err) {
-        apply(id, name, errorBrief(name, 'could not reach Matrix'));
+        apply(id, token, errorBrief(name, 'could not reach Matrix'));
       }
     }
 
@@ -177,6 +188,7 @@
     async function patch(body) {
       if (!session || !fetchImpl) return null;
       var name = session;
+      var token = epoch;
       var res = await fetchImpl(briefUrl(name), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -184,20 +196,23 @@
       });
       var data = null;
       try { data = await res.json(); } catch (e) { data = null; }
+      // The user has moved on: neither the saved brief nor the failure belongs to what is
+      // on screen now, and writing either would disturb the new session's editor.
+      if (token !== epoch) return null;
       if (!res.ok || !data || data.ok !== true) {
         setStatus('Edit not saved: ' + ((data && data.message) || ('HTTP ' + res.status)), 'error');
         if (res.status === 409) load();
         return null;
       }
-      apply(++requestId, name, data.brief);
-      return data.brief;
+      return apply(++requestId, token, data.brief) ? data.brief : null;
     }
 
     async function submit(field, value) {
+      var token = epoch;
       var body = { revision: latest ? latest.revision : 0 };
       body[field] = value;
       var saved = await patch(body);
-      if (saved) { editing = null; fieldEl(field).replaceChildren(); render(); }
+      if (saved && token === epoch) { editing = null; fieldEl(field).replaceChildren(); render(); }
     }
 
     function clearOverride(field) {
@@ -225,6 +240,7 @@
 
     return {
       open: function (name, streamedWindow) {
+        epoch += 1;
         session = name;
         windowName = typeof streamedWindow === 'string' ? streamedWindow : '';
         latest = null;
@@ -235,6 +251,7 @@
         if (timer === null && typeof setInterval === 'function') timer = setInterval(load, POLL_MS);
       },
       close: function () {
+        epoch += 1;
         session = null;
         latest = null;
         editing = null;
@@ -244,6 +261,8 @@
       refresh: load,
       current: function () { return latest; },
       session: function () { return session; },
+      epoch: currentEpoch,
+      pollIntervalMs: POLL_MS,
     };
   }
 

@@ -9,9 +9,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRun, parseArgs } from './assertions.mjs';
 import {
-  briefGenerator, briefRoutes, briefTmux, tempDir, cleanupAll, fakeClock, fakeTmuxProcess,
-  claudeSession, shellActiveSession, paneFor, tmuxStack, makeService, countingGenerator,
-  fakeCli, loadCorpus, sleep,
+  briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
+  fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
+  countingGenerator, fakeCli, loadCorpus, sleep,
 } from './service-support.mjs';
 import { evaluateCorpus } from './corpus.mjs';
 
@@ -149,6 +149,37 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   hold();
   await service3.settle();
 
+  // A generator that never returns must not hold the single global slot forever. The
+  // service-level ceiling is the only thing that can break this, so a healthy session
+  // queued behind the wedged one must still complete within a bounded wall-clock deadline.
+  const wedged = (() => {
+    let first = true;
+    return {
+      name: 'wedged', version: '1',
+      generate(input) {
+        if (first) { first = false; return new Promise(() => {}); }   // never resolves
+        return extractive().generate(input);
+      },
+    };
+  })();
+  const stuckService = makeService({
+    stack: tmuxStack(fake), clock, generator: wedged, storeFile: store(), generationTimeoutMs: 200,
+  });
+  const deadline = Date.now() + 5000;
+  await stuckService.read('A');          // takes the global slot and never returns
+  await stuckService.read('B');          // queued behind it
+  let healthy = null;
+  while (Date.now() < deadline) {
+    healthy = await stuckService.read('B');
+    if (healthy.status === 'ok') break;
+    await sleep(50);
+  }
+  const wedgedBrief = await stuckService.read('A');
+  t.eq(healthy && healthy.status, 'ok', 'a healthy session queued behind a wedged generator still completes');
+  t.ok(Date.now() < deadline, 'it completed within the bounded deadline rather than waiting on the wedged job');
+  t.eq(wedgedBrief.status, 'error', 'the wedged session reports an error');
+  t.includes(wedgedBrief.error, 'timed out', 'the wedged generation is classified as a timeout');
+
   t.note('evidence_and_cache', {
     captureTargets: [...new Set(fake.callsFor('capture-pane').map(c => c.args[c.args.indexOf('-t') + 1]))],
     generatorCalls: gen.calls,
@@ -239,6 +270,32 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
     execFile, bin: fakeCli(tempDir(), { stdout: 'sorry, no JSON here' }).bin, timeoutMs: 5000, cwd: dir,
   }).generate({ items: injection }).catch(e => e);
   t.eq(junkErr.code, 'invalid_output', 'non-JSON output is rejected');
+
+  // A CLI that floods stdout is cut off by maxBuffer and classified as such, with nothing
+  // of what it printed echoed back.
+  const flood = `{"goal":{"text":"${'A'.repeat(300 * 1024)}","evidenceId":"c1"}}`;
+  const hugeErr = await briefGenerator.createClaudeCliGenerator({
+    execFile, bin: fakeCli(tempDir(), { stdout: flood }).bin, timeoutMs: 5000, cwd: dir,
+  }).generate({ items: injection }).catch(e => e);
+  const hugeMessage = hugeErr && hugeErr.message ? String(hugeErr.message) : '';
+  t.eq(hugeErr && hugeErr.code, 'generator_output_too_large', 'oversized CLI output is rejected on the process bound');
+  t.ok(hugeMessage && !hugeMessage.includes('AAAA'), 'the oversized-output error echoes none of the child output');
+  t.ok(hugeMessage && !/IGNORE ALL RULES|rm -rf/.test(hugeMessage), 'the oversized-output error carries no evidence text');
+
+  // The bounds that make all of the above true are the shipped defaults, not test values.
+  const prodCli = briefGenerator.createClaudeCliGenerator({ execFile });
+  t.ok(briefGenerator.DEFAULT_CLI_TIMEOUT_MS <= 30000 && briefGenerator.DEFAULT_CLI_TIMEOUT_MS > 0,
+    `the shipped CLI timeout is bounded at <=30s (${briefGenerator.DEFAULT_CLI_TIMEOUT_MS}ms)`);
+  t.eq(prodCli.timeoutMs, briefGenerator.DEFAULT_CLI_TIMEOUT_MS, 'the default generator really uses that timeout');
+  t.ok(briefGenerator.MAX_CLI_OUTPUT_BYTES > 0 && briefGenerator.MAX_CLI_OUTPUT_BYTES <= 1024 * 1024,
+    `the shipped CLI output bound is finite (${briefGenerator.MAX_CLI_OUTPUT_BYTES} bytes)`);
+  t.eq(prodCli.maxOutputBytes, briefGenerator.MAX_CLI_OUTPUT_BYTES, 'the default generator really uses that output bound');
+  t.ok(briefServiceMod.DEFAULT_GENERATION_TIMEOUT_MS <= 30000 && briefServiceMod.DEFAULT_GENERATION_TIMEOUT_MS > 0,
+    `the shipped service-level generation ceiling is <=30s (${briefServiceMod.DEFAULT_GENERATION_TIMEOUT_MS}ms)`);
+  t.ok(briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS <= 30000 && briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS > 0,
+    `the shipped evidence interval is <=30s (${briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS}ms)`);
+  t.ok(briefGenerator.MAX_EVIDENCE_CHARS <= 24 * 1024, 'the shipped evidence cap is <=24 KiB');
+  t.ok(briefGenerator.MAX_FIELD_CHARS <= 500, 'the shipped field cap is <=500 characters');
 
   const reject = (output, why) => {
     let code = null;

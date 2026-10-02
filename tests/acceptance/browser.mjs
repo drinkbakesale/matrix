@@ -33,8 +33,16 @@ const byId = Object.fromEntries(corpus.map(r => [r.id, r]));
 const panes = { f1: paneFor(byId.f1), f2: paneFor(byId.f2), f3: paneFor(byId.f3) };
 
 // Two sessions of the *same* project, so cross-session isolation is actually at risk.
+// Session A also has a second window, so a same-name window change is exercisable.
 const sessions = () => ({
-  A: { ...claudeSession('A', panes.f1), projectName: 'shared-project' },
+  A: {
+    ...claudeSession('A', panes.f1),
+    projectName: 'shared-project',
+    windows: [
+      { name: 'claude', command: 'claude', active: true, pane: panes.f1 },
+      { name: 'shell', command: 'bash', active: false, pane: '> The broad goal is reliable inventory tracking. We are currently repairing barcode import validation.\n\n$ ls\n' },
+    ],
+  },
   B: { ...claudeSession('B', panes.f3), createdAt: 1_600_000_100, projectName: 'shared-project' },
 });
 
