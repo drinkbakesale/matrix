@@ -10,6 +10,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="apple-touch-icon" href="/icon-192.png">
   <link rel="stylesheet" href="style.css?v=40">
+  <link rel="stylesheet" href="matrix-ui.css?v=1">
 
 </head>
 <body>
@@ -64,7 +65,56 @@
       <button id="back-btn">←</button>
       <span id="term-title"></span>
     </header>
+
+    <!-- Pinned session brief: lives outside the scrolling transcript so it stays visible
+         and a refresh can never replace a node the user is selecting. -->
+    <section id="brief" class="brief" data-status="loading" data-collapsed="0">
+      <div class="brief-head">
+        <button id="brief-toggle" class="brief-toggle" type="button" aria-expanded="true" aria-controls="brief-body">Brief</button>
+        <span id="brief-age" class="brief-age"></span>
+      </div>
+      <div id="brief-body" class="brief-body">
+        <div class="brief-row">
+          <span class="brief-label">Project goal</span>
+          <span id="brief-goal" class="brief-value"></span>
+          <button id="brief-edit-goal" class="brief-edit" type="button">Edit</button>
+          <button id="brief-clear-goal" class="brief-clear" type="button" hidden>Clear edit</button>
+        </div>
+        <div class="brief-row">
+          <span class="brief-label">Right now</span>
+          <span id="brief-current" class="brief-value"></span>
+          <button id="brief-edit-current" class="brief-edit" type="button">Edit</button>
+          <button id="brief-clear-current" class="brief-clear" type="button" hidden>Clear edit</button>
+        </div>
+        <div id="brief-status" class="brief-status" role="status"></div>
+      </div>
+    </section>
+
+    <div id="copy-bar" class="copy-bar">
+      <button id="copy-open" class="copy-open" type="button">Select / copy</button>
+      <span id="transcript-status" class="transcript-status" role="status"></span>
+      <button id="transcript-resume" class="transcript-resume" type="button" hidden>Resume</button>
+    </div>
+
     <pre id="terminal"></pre>
+
+    <!-- Stable copy surface: plain text only, every control outside the text box so a copy
+         never picks up a label or the brief. -->
+    <div id="copy-sheet" class="copy-sheet" hidden>
+      <div class="copy-sheet-head">
+        <span class="copy-sheet-title">Copy transcript</span>
+        <span id="copy-status" class="copy-status" role="status"></span>
+      </div>
+      <textarea id="copy-text" class="copy-text" readonly spellcheck="false"></textarea>
+      <div class="copy-sheet-actions">
+        <button id="copy-select-all" type="button">Select all</button>
+        <button id="copy-selection" type="button">Copy selection</button>
+        <button id="copy-all" type="button">Copy all</button>
+        <button id="copy-resume" type="button">Resume live</button>
+        <button id="copy-close" type="button">Close</button>
+      </div>
+    </div>
+
     <button id="talk-btn">TALK</button>
     <div id="quick-actions">
       <button class="qa-btn" data-input="y&#10;">y</button>
@@ -81,6 +131,11 @@
     </div>
   </div>
 
-  <script src="app.js?v=43"></script>
+  <script src="matrix-transcript.js?v=1"></script>
+  <script src="matrix-copy.js?v=1"></script>
+  <script src="matrix-brief.js?v=1"></script>
+  <script src="app-notifications.js?v=1"></script>
+  <script src="app-panels.js?v=1"></script>
+  <script src="app.js?v=44"></script>
 </body>
 </html>

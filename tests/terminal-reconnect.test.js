@@ -1,25 +1,20 @@
 'use strict';
-// Drives the delivered terminal stream code (server/public/app.js connectWebSocket) in a VM.
+// Drives the delivered terminal stream code (server/public/app.js connectWebSocket) on top
+// of the delivered transcript controller (server/public/matrix-transcript.js) in a VM.
 // The server sends the pane's full scrollback as the first output on every connection, so an
 // automatic reconnect must show that scrollback once, not append a second copy.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
 const vm = require('vm');
 const { createDocument } = require('./app-harness');
+const { readFile, slice } = require('./client-sources');
 
-const SOURCE = fs.readFileSync(path.join(__dirname, '../server/public/app.js'), 'utf8');
-const START = 'function connectWebSocket(';
-const END = 'function openTerminal(';
+const TRANSCRIPT = readFile('matrix-transcript.js');
+const STREAM = slice('app.js', 'function connectWebSocket(', 'function openTerminal(');
 
 function loadStream() {
-  const start = SOURCE.indexOf(START);
-  const end = SOURCE.indexOf(END, start);
-  assert.ok(start >= 0 && end > start, 'connectWebSocket boundaries missing from app.js');
   const document = createDocument(['terminal']);
   const viewer = document.getElementById('terminal');
-  viewer.addEventListener = () => {};
   const sockets = [];
   const timers = [];
   class FakeWebSocket {
@@ -34,18 +29,19 @@ function loadStream() {
     console: { log() {} },
     JSON,
     setTimeout: fn => timers.push(fn),
+    clearTimeout: () => {},
     ws: null,
     currentSession: null,
-    userScrolledUp: false,
-    deferredScreenUpdate: null,
-    isNearBottom: () => true,
-    terminalSelectionActive: () => false,
-    pruneMessages: () => {},
-    autoScroll: () => {},
+    currentWindowName: '',
     stripAnsi: s => s,
     filterStatusLines: s => s,
   });
-  vm.runInContext(SOURCE.slice(start, end), context);
+  context.window = context;
+  // The delivered controller owns every #terminal mutation, so the stream code is exercised
+  // against it rather than against stubs.
+  vm.runInContext(TRANSCRIPT, context);
+  context.transcript = context.MatrixTranscript.createTranscript({ viewer, document });
+  vm.runInContext(STREAM, context);
   const output = (socket, text) => socket.onmessage({ data: JSON.stringify({ type: 'output', data: text }) });
   const runTimers = () => { while (timers.length) timers.shift()(); };
   return { context, viewer, sockets, output, runTimers };
@@ -81,4 +77,17 @@ test('output after the reconnect dump appends to it', () => {
 
   assert.equal(count(viewer.textContent, 'first line'), 1);
   assert.equal(count(viewer.textContent, 'new line'), 1);
+});
+
+test('a screen refresh replaces the live screen block instead of stacking copies', () => {
+  const { context, viewer, sockets, output } = loadStream();
+  context.currentSession = '41';
+  context.connectWebSocket('41');
+  output(sockets[0], 'history\r\n');
+  const screen = (text) => sockets[0].onmessage({ data: JSON.stringify({ type: 'screen', data: text }) });
+  screen('live one');
+  screen('live two');
+  assert.equal(count(viewer.textContent, 'live one'), 0);
+  assert.equal(count(viewer.textContent, 'live two'), 1);
+  assert.equal(viewer.querySelectorAll('.msg-screen').length, 1);
 });

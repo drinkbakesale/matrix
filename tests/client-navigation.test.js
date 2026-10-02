@@ -4,18 +4,12 @@
 // anything but an exact, case-sensitive live match must return to the project list.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
 const vm = require('vm');
+const { slice } = require('./client-sources');
 
-const SOURCE = fs.readFileSync(path.join(__dirname, '../server/public/app.js'), 'utf8');
-const START = 'async function fetchSessions()';
-const END = 'function showToast(';
+const NAVIGATION = slice('app.js', 'async function fetchSessions()', '// ── Dismissed Sessions ──');
 
 function loadNavigation({ failFetchTimes = 0 } = {}) {
-  const start = SOURCE.indexOf(START);
-  const end = SOURCE.indexOf(END, start);
-  assert.ok(start >= 0 && end > start, 'navigation function boundaries missing from app.js');
   const state = { sessions: [], opened: null, closed: false, fetches: 0 };
   const context = vm.createContext({
     GENERIC_CONTROL_LABELS: new Set(['matrix']),
@@ -31,7 +25,7 @@ function loadNavigation({ failFetchTimes = 0 } = {}) {
     openTerminal: name => { state.opened = name; },
     closeTerminal: () => { state.closed = true; },
   });
-  vm.runInContext(SOURCE.slice(start, end), context);
+  vm.runInContext(NAVIGATION, context);
   return { context, state };
 }
 

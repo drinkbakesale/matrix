@@ -1,15 +1,15 @@
 'use strict';
-// Loads the whole delivered mobile app (server/public/app.js) in a VM with a stub DOM and
-// drives its real visibilitychange and service-worker message handlers. Notification taps and
-// the pending-alert auto-open can be in flight simultaneously; the winner is decided by intent
-// precedence, never by which /api/sessions response happens to arrive last.
+// Loads the whole delivered mobile app — every script index.html loads, in that order — in a
+// VM with a stub DOM and drives its real visibilitychange and service-worker message
+// handlers. Notification taps and the pending-alert auto-open can be in flight
+// simultaneously; the winner is decided by intent precedence, never by which /api/sessions
+// response happens to arrive last.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
 const vm = require('vm');
+const { readClient } = require('./client-sources');
 
-const SOURCE = fs.readFileSync(path.join(__dirname, '../server/public/app.js'), 'utf8');
+const SOURCE = readClient('index.html');
 
 function deferred() {
   let resolve;
@@ -36,6 +36,9 @@ function makeElement(id = '') {
     closest: () => null,
     contains: () => false,
     getBoundingClientRect: () => ({ x: 0, y: 0, top: 0, left: 0, width: 0, height: 0 }),
+    setAttribute(name, value) { el.attributes[name] = String(value); },
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(el.attributes, name) ? el.attributes[name] : null; },
+    attributes: {},
   };
   return el;
 }

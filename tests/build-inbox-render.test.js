@@ -1,24 +1,18 @@
 'use strict';
-// Drives the delivered build-inbox render code (server/public/app.js) against the real
-// parser output, so a row can never show a placeholder identity and controller strings
+// Drives the delivered build-inbox render code (server/public/app-panels.js) against the
+// real parser output, so a row can never show a placeholder identity and controller strings
 // can never become markup.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
 const vm = require('vm');
 const { createDocument, nodesByClass, textByClass } = require('./app-harness');
+const { slice } = require('./client-sources');
 const { parseBuildInbox, buildInboxErrorResponse, BuildInboxError } = require('../server/lib/build-inbox');
 
-const SOURCE = fs.readFileSync(path.join(__dirname, '../server/public/app.js'), 'utf8');
-const START = 'const BUILD_INBOX_GROUPS';
-const END = '// ── Text Input ──';
+const RENDER = slice('app-panels.js', 'const BUILD_INBOX_GROUPS', '// ── TALK Button');
 const IDS = ['build-inbox-status', 'build-inbox-content', 'build-inbox-view', 'list-view', 'term-view'];
 
 function loadInboxUi({ response } = {}) {
-  const start = SOURCE.indexOf(START);
-  const end = SOURCE.indexOf(END, start);
-  assert.ok(start >= 0 && end > start, 'build inbox render boundaries missing from app.js');
   const document = createDocument(IDS);
   const context = vm.createContext({
     document,
@@ -30,7 +24,7 @@ function loadInboxUi({ response } = {}) {
       return { ok: response.ok, status: response.status, json: async () => response.body };
     },
   });
-  vm.runInContext(SOURCE.slice(start, end), context);
+  vm.runInContext(RENDER, context);
   return {
     context,
     content: document.getElementById('build-inbox-content'),

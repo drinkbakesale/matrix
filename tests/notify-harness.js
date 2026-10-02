@@ -2,15 +2,15 @@
 // Shared harness for the notification path: runs the real bin/matrix-notify with fake
 // tmux/curl on PATH, and loads the delivered mobile navigation code from
 // server/public/app.js so a test can follow one alert from the hook to openTerminal.
-const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const vm = require('vm');
 const { execFileSync } = require('child_process');
+const { slice } = require('./client-sources');
 
 const SCRIPT = path.join(__dirname, '../bin/matrix-notify');
-const APP_SOURCE = fs.readFileSync(path.join(__dirname, '../server/public/app.js'), 'utf8');
+const NAVIGATION = slice('app.js', 'async function fetchSessions()', '// ── Dismissed Sessions ──');
 
 // realpath: macOS tmpdir is behind a /var symlink and bash reports the physical $PWD.
 function makeWorkspace(t) {
@@ -50,9 +50,6 @@ function runNotify(t, options = {}) {
 
 // Runs the delivered navigation code through its final openTerminal/closeTerminal action.
 function loadNavigation(liveSessions) {
-  const start = APP_SOURCE.indexOf('async function fetchSessions()');
-  const end = APP_SOURCE.indexOf('function showToast(', start);
-  assert.ok(start >= 0 && end > start, 'navigation function boundaries missing from app.js');
   const state = { opened: null, closed: false };
   const context = vm.createContext({
     GENERIC_CONTROL_LABELS: new Set(['matrix']),
@@ -64,7 +61,7 @@ function loadNavigation(liveSessions) {
     openTerminal: name => { state.opened = name; },
     closeTerminal: () => { state.closed = true; },
   });
-  vm.runInContext(APP_SOURCE.slice(start, end), context);
+  vm.runInContext(NAVIGATION, context);
   return { context, state };
 }
 

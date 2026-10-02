@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Matrix — Desktop</title>
   <link rel="stylesheet" href="desktop.css?v=23">
+  <link rel="stylesheet" href="matrix-ui.css?v=1">
 </head>
 <body>
   <div id="app">
@@ -25,7 +26,53 @@
           <span id="chat-title"></span>
           <span id="chat-status"></span>
         </header>
+
+        <!-- Pinned session brief: outside the scrolling transcript so it stays visible. -->
+        <section id="brief" class="brief" data-status="loading" data-collapsed="0">
+          <div class="brief-head">
+            <button id="brief-toggle" class="brief-toggle" type="button" aria-expanded="true" aria-controls="brief-body">Brief</button>
+            <span id="brief-age" class="brief-age"></span>
+          </div>
+          <div id="brief-body" class="brief-body">
+            <div class="brief-row">
+              <span class="brief-label">Project goal</span>
+              <span id="brief-goal" class="brief-value"></span>
+              <button id="brief-edit-goal" class="brief-edit" type="button">Edit</button>
+              <button id="brief-clear-goal" class="brief-clear" type="button" hidden>Clear edit</button>
+            </div>
+            <div class="brief-row">
+              <span class="brief-label">Right now</span>
+              <span id="brief-current" class="brief-value"></span>
+              <button id="brief-edit-current" class="brief-edit" type="button">Edit</button>
+              <button id="brief-clear-current" class="brief-clear" type="button" hidden>Clear edit</button>
+            </div>
+            <div id="brief-status" class="brief-status" role="status"></div>
+          </div>
+        </section>
+
+        <div id="copy-bar" class="copy-bar">
+          <button id="copy-open" class="copy-open" type="button">Select / copy</button>
+          <span id="transcript-status" class="transcript-status" role="status"></span>
+          <button id="transcript-resume" class="transcript-resume" type="button" hidden>Resume</button>
+        </div>
+
         <pre id="terminal"></pre>
+
+        <div id="copy-sheet" class="copy-sheet" hidden>
+          <div class="copy-sheet-head">
+            <span class="copy-sheet-title">Copy transcript</span>
+            <span id="copy-status" class="copy-status" role="status"></span>
+          </div>
+          <textarea id="copy-text" class="copy-text" readonly spellcheck="false"></textarea>
+          <div class="copy-sheet-actions">
+            <button id="copy-select-all" type="button">Select all</button>
+            <button id="copy-selection" type="button">Copy selection</button>
+            <button id="copy-all" type="button">Copy all</button>
+            <button id="copy-resume" type="button">Resume live</button>
+            <button id="copy-close" type="button">Close</button>
+          </div>
+        </div>
+
         <div id="chat-input-bar">
           <div id="slash-autocomplete" style="display:none"></div>
           <textarea id="chat-input" placeholder="Type a message..." autocomplete="off" autocorrect="off" rows="1"></textarea>
@@ -58,6 +105,12 @@
     </aside>
     -->
   </div>
-  <script src="desktop.js?v=27"></script>
+  <script src="matrix-transcript.js?v=1"></script>
+  <script src="matrix-copy.js?v=1"></script>
+  <script src="matrix-brief.js?v=1"></script>
+  <script src="desktop-sidebar.js?v=1"></script>
+  <script src="desktop-output.js?v=1"></script>
+  <script src="desktop-compose.js?v=1"></script>
+  <script src="desktop.js?v=28"></script>
 </body>
 </html>

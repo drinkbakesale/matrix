@@ -10,14 +10,14 @@ const ROOT = path.join(__dirname, '..');
 const FILES = [
   'bin/matrix-notify',
   'server/server.js',
-  'server/lib/build-inbox.js',
-  'server/lib/session-identity.js',
-  'server/public/app.js',
-  'server/public/desktop.js',
-  'server/public/index.html',
-  'server/public/style.css',
-  'server/public/sw.js',
+  ...fs.readdirSync(path.join(ROOT, 'server/lib')).filter(f => f.endsWith('.js')).map(f => `server/lib/${f}`),
+  ...fs.readdirSync(path.join(ROOT, 'server/public'))
+    .filter(f => /\.(js|css|html)$/.test(f))
+    .map(f => `server/public/${f}`),
   ...fs.readdirSync(__dirname).filter(f => f.endsWith('.js')).map(f => `tests/${f}`),
+  ...fs.readdirSync(path.join(__dirname, 'acceptance'))
+    .filter(f => /\.(mjs|js)$/.test(f))
+    .map(f => `tests/acceptance/${f}`),
 ];
 
 const ALLOWED = new Set([9, 10, 13]);

@@ -1,0 +1,255 @@
+/* Shared styles for the pinned session brief and the copy surface.
+   Loaded after style.css / desktop.css so the few #terminal rules here win. */
+
+/* ── Pinned brief ── */
+
+.brief {
+  flex: 0 0 auto;
+  background: var(--surface, #0d120d);
+  border-bottom: 1px solid var(--border, #1d2a1d);
+  padding: 6px 10px 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  max-height: 34vh;
+  overflow-y: auto;
+}
+
+.brief[hidden] { display: none; }
+
+.brief-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.brief-toggle {
+  background: none;
+  border: 1px solid var(--border, #1d2a1d);
+  color: var(--green, #52e06a);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.brief-age {
+  color: var(--dim, #6a8a6a);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+.brief-body { margin-top: 6px; }
+.brief[data-collapsed="1"] .brief-body { display: none; }
+
+.brief-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 2px 0;
+}
+
+.brief-label {
+  color: var(--dim, #6a8a6a);
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  flex: 0 0 auto;
+  min-width: 78px;
+}
+
+.brief-value {
+  flex: 1 1 180px;
+  color: var(--text, #b5e8c0);
+  -webkit-user-select: text;
+  user-select: text;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.brief-value[data-empty="1"] { color: var(--dim, #6a8a6a); font-style: italic; }
+.brief-value[data-overridden="1"] { border-left: 2px solid var(--green, #52e06a); padding-left: 6px; }
+
+.brief-edit,
+.brief-clear,
+.brief-save,
+.brief-cancel {
+  background: none;
+  border: 1px solid var(--border, #1d2a1d);
+  color: var(--dim, #6a8a6a);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.brief-save { color: var(--green, #52e06a); }
+
+.brief-input {
+  flex: 1 1 160px;
+  background: #060a06;
+  border: 1px solid var(--green, #52e06a);
+  color: var(--text, #b5e8c0);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  min-width: 120px;
+}
+
+.brief-status {
+  color: var(--dim, #6a8a6a);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.brief-status.error { color: var(--amber, #e0b152); }
+
+/* ── Copy bar above the transcript ── */
+
+.copy-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--surface, #0d120d);
+  border-bottom: 1px solid var(--border, #1d2a1d);
+}
+
+.copy-open,
+.transcript-resume {
+  background: none;
+  border: 1px solid var(--green, #52e06a);
+  color: var(--green, #52e06a);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.transcript-status {
+  flex: 1 1 auto;
+  color: var(--amber, #e0b152);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Copy sheet ── */
+
+.copy-sheet {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: #050805;
+  padding: 8px;
+  gap: 6px;
+}
+
+.copy-sheet[hidden] { display: none; }
+
+.copy-sheet-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.copy-sheet-title {
+  color: var(--green, #52e06a);
+  font-size: 12px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.copy-status {
+  flex: 1 1 160px;
+  font-size: 11px;
+  color: var(--dim, #6a8a6a);
+}
+
+.copy-status.ok { color: var(--green, #52e06a); }
+.copy-status.error { color: var(--amber, #e0b152); }
+
+.copy-text {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 140px;
+  background: #080c08;
+  color: #b5e8c0;
+  border: 1px solid var(--border, #1d2a1d);
+  border-radius: 4px;
+  padding: 8px;
+  font-family: 'SF Mono', 'Menlo', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+  resize: none;
+}
+
+.copy-sheet-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.copy-sheet-actions button {
+  background: none;
+  border: 1px solid var(--border, #1d2a1d);
+  color: var(--text, #b5e8c0);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+  cursor: pointer;
+  flex: 1 1 auto;
+  min-height: 36px;
+}
+
+#copy-selection,
+#copy-all { border-color: var(--green, #52e06a); color: var(--green, #52e06a); }
+
+/* #term-view / #chat-view host the absolutely positioned copy sheet. */
+#term-view,
+#chat-view { position: relative; }
+
+/* Mobile only: the TALK button is fixed at the top right of the terminal view, so the brief
+   and the copy controls have to stay clear of it, and it must not float over the copy sheet. */
+#term-view .brief,
+#term-view .copy-bar { padding-right: 84px; }
+#copy-sheet:not([hidden]) ~ #talk-btn { display: none; }
+
+/* The transcript is a real text surface: native long-press selection and Copy. These stay
+   here (rather than only in style.css) so desktop.html gets them too. */
+#terminal {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+#terminal .msg {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+@media (max-width: 480px) {
+  .brief { max-height: 28vh; font-size: 11px; }
+  .brief-label { min-width: 0; }
+}
