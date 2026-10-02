@@ -42,6 +42,11 @@
     // The tmux window this client is streaming. The server resolves the brief against this
     // exact pane, so the summary describes what is on screen and not another window.
     var windowName = '';
+    // Whether `windowName` came from the stream's own announcement. Empty-and-announced is
+    // NOT the same as empty-and-unknown: the first means the connection found no Claude and
+    // is streaming the session itself, the second means we have not been told yet. Without
+    // the flag the server cannot tell them apart and would go looking for Claude.
+    var bound = false;
     var latest = null;
     // Every open/close is a new epoch. A response is only allowed to touch the UI if it was
     // issued in the epoch that is still on screen: the session name alone is not enough,
@@ -57,7 +62,10 @@
 
     function briefUrl(name) {
       var url = '/api/sessions/' + encodeURIComponent(name) + '/brief';
-      return windowName ? url + '?window=' + encodeURIComponent(windowName) : url;
+      var query = [];
+      if (windowName) query.push('window=' + encodeURIComponent(windowName));
+      if (bound) query.push('bound=1');
+      return query.length ? url + '?' + query.join('&') : url;
     }
 
     function setStatus(text, kind) {
@@ -243,6 +251,9 @@
         epoch += 1;
         session = name;
         windowName = typeof streamedWindow === 'string' ? streamedWindow : '';
+        // A fresh open only knows what the user asked for. Until the new connection
+        // announces its target, an empty window still means "find Claude for me".
+        bound = false;
         latest = null;
         appliedId = 0;
         editing = null;
@@ -259,11 +270,14 @@
       bindWindow: function (name, streamedWindow) {
         var next = typeof streamedWindow === 'string' ? streamedWindow : '';
         if (session === null || session !== name) return false;   // not the session on screen
-        if (windowName === next) return false;                    // already the right pane
+        // Becoming bound counts as a change even when the window string is unchanged: an
+        // announced "" and an unknown "" ask the server for different panes.
+        if (windowName === next && bound) return false;
         // A different pane is a different brief. The epoch bump makes every answer still in
         // flight for the previous binding unrenderable, including a PATCH acknowledgement.
         epoch += 1;
         windowName = next;
+        bound = true;
         latest = null;
         appliedId = 0;
         editing = null;
@@ -272,9 +286,12 @@
         return true;
       },
       window: function () { return windowName; },
+      bound: function () { return bound; },
       close: function () {
         epoch += 1;
         session = null;
+        windowName = '';
+        bound = false;
         latest = null;
         editing = null;
         root.hidden = true;

@@ -81,8 +81,11 @@ are D2 (mobile copy) and D3 (session brief).
   "this session" afterwards. *[candidate change: `server/lib/pane-stream.js` now sends a
   `stream-target` message naming the resolved `session`/`window`/`target` as the first
   message of every connection, so the pinned brief (D3) binds to the pane on screen and
-  re-synchronises on reconnect. The stream's own polling, input routing and `output`/
-  `screen` behaviour are unchanged.]*
+  re-synchronises on reconnect. The announced window is empty when no Claude was found —
+  the connection then streams the session itself, i.e. whichever window tmux has active —
+  and the brief API distinguishes that announced empty window (`?bound=1`) from a client
+  that has not been told yet, which still gets discovery. The stream's own polling, input
+  routing and `output`/`screen` behaviour are unchanged.]*
 * `server/server.js:1054-1096 @27534cd` **[code]** The 100 ms poll sends `output` when the
   capture grew, and `screen` (the last `rows` lines) when the length is unchanged but the
   content differs. The comment at `:1029-1031` ("We NEVER clear the screen. We only APPEND")

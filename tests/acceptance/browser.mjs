@@ -44,6 +44,15 @@ const sessions = () => ({
     ],
   },
   B: { ...claudeSession('B', panes.f3), createdAt: 1_600_000_100, projectName: 'shared-project' },
+  // No Claude running anywhere at open, and distinct evidence per window: the case where
+  // the stream keeps the bare session as its target and announces an empty window.
+  C: {
+    sessionId: '$C', createdAt: 1_600_000_200, projectName: 'late-start',
+    windows: [
+      { name: 'one', command: 'bash', active: true, pane: panes.f1 },
+      { name: 'two', command: 'bash', active: false, pane: panes.f3 },
+    ],
+  },
 });
 
 const { webkit, chromium, devices } = playwright();

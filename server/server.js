@@ -71,7 +71,7 @@ const briefResolver = createSessionResolver({ tmux: briefTmux });
 const briefCapture = createPaneCapture({ tmux: briefTmux });
 const briefService = new BriefService({
   storeFile: config.BRIEF_PATH,
-  resolveSession: (name, window) => briefResolver.resolve(name, window),
+  resolveSession: (name, window, options) => briefResolver.resolve(name, window, options),
   collector: createEvidenceCollector({ capturePane: identity => briefCapture.capture(identity) }),
   generator,
   literalRequired,

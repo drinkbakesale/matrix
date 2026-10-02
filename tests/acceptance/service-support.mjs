@@ -185,7 +185,7 @@ export function makeService(opts) {
   } = opts;
   return new briefServiceMod.BriefService({
     storeFile,
-    resolveSession: (name, windowName) => stack.resolver.resolve(name, windowName),
+    resolveSession: (name, windowName, options) => stack.resolver.resolve(name, windowName, options),
     collector: briefEvidence.createEvidenceCollector({
       capturePane: identity => stack.capture.capture(identity),
       now: clock.now,
@@ -290,6 +290,99 @@ esac
     process.env.PATH = previousPath;
   }
   return { sent, first: sent[0] || null, types: sent.map(m => m.type) };
+}
+
+// What the stream announces, and whether the brief follows it — returned as labelled
+// [actual, expected, detail] triples the runner asserts, plus a raw report to archive.
+//
+// Two halves. First, the real pane-stream module is run against a fake tmux for three
+// window layouts, so the announcement itself is observed rather than assumed. Then the
+// "no Claude at open" case is driven end to end: a connection that finds no Claude keeps
+// the bare session as its target and announces an EMPTY window, and that announcement is
+// authoritative — the brief must stay on the session pane even once Claude starts in
+// another window, and only a reconnect may move it.
+export async function streamBindingChecks({ clock, generator, storeFile, activePane, otherPane, expect }) {
+  const checks = [];
+  for (const [label, windows, window, target] of [
+    ['Claude in window one', [['one', 'claude'], ['two', 'bash']], 'one', 'A:one'],
+    ['Claude moved to window two', [['one', 'bash'], ['two', 'claude']], 'two', 'A:two'],
+    ['no Claude anywhere', [['one', 'bash'], ['two', 'bash']], '', 'A'],
+  ]) {
+    const probe = paneStreamProbe({ session: 'A', windows });
+    checks.push([probe.first && probe.first.type, 'stream-target', `${label}: the connection announces its target first`]);
+    checks.push([probe.first && probe.first.window, window, `${label}: the announcement names the window pane-stream picked`]);
+    checks.push([probe.first && probe.first.target, target, `${label}: the announced target is the one the stream polls`]);
+    checks.push([probe.types.indexOf('stream-target') < probe.types.indexOf('output'), true,
+      `${label}: the binding is announced before the scrollback the client renders`]);
+  }
+  const report = await emptyBindingScenario({ clock, generator, storeFile, activePane, otherPane });
+  checks.push(
+    [report.briefAtOpen, report.streamAtOpen, 'the brief opens on the pane the stream is polling'],
+    [report.goalAtOpen, expect.activeGoal, 'with no Claude running it describes the window being streamed'],
+    [report.briefAfterStart, report.streamAtOpen, 'Claude starting in another window does not re-point an open brief'],
+    [report.goalAfterStart, expect.activeGoal, 'the other window\'s work never takes over the open session'],
+    [report.editTarget, report.streamAtOpen, 'an edit is addressed to the pane the user can see'],
+    [report.briefAtReconnect, report.streamAtReconnect, 'a reconnect re-binds to the window it discovered'],
+    [report.goalAfterReconnect, expect.otherGoal, 'and the brief then describes that window'],
+    [report.overrideAfterReconnect, null, 'the edit stayed with the pane it was made against'],
+    [report.unboundTarget, 'C:two', 'a client that has not been told yet still gets discovery'],
+  );
+  return { checks, report };
+}
+
+async function emptyBindingScenario({ clock, generator, storeFile, activePane, otherPane }) {
+  const streamBinding = session => {
+    const claude = (session.windows || []).find(w => briefTmux.isClaudeCmd(w.command));
+    return claude ? { window: claude.name, target: `C:${claude.name}` } : { window: '', target: 'C' };
+  };
+  const noClaude = {
+    sessionId: '$C', createdAt: 1_600_000_000,
+    windows: [
+      { name: 'one', command: 'bash', active: true, pane: activePane },
+      { name: 'two', command: 'bash', active: false, pane: otherPane },
+    ],
+  };
+  const fake = fakeTmuxProcess({ C: noClaude });
+  const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
+
+  const atOpen = streamBinding(noClaude);
+  let binding = { window: atOpen.window, authoritative: true };
+  await service.read('C', binding);
+  await service.settle();
+  const opened = await service.read('C', binding);
+
+  // Claude starts in the inactive window. The open connection still polls `-t C`.
+  const claudeElsewhere = { ...noClaude, windows: [
+    { name: 'one', command: 'bash', active: true, pane: activePane },
+    { name: 'two', command: 'claude', active: false, pane: otherPane },
+  ] };
+  fake.set('C', claudeElsewhere);
+  const polled = await service.read('C', binding);
+  clock.advance(31000);
+  await service.tick();
+  await service.settle();
+  const held = await service.read('C', binding);
+  const edited = await service.patch('C', { goal: 'edit against the streamed pane', revision: held.revision }, binding);
+
+  // Reconnect: a new connection discovers Claude and announces the window it found.
+  const atReconnect = streamBinding(claudeElsewhere);
+  binding = { window: atReconnect.window, authoritative: true };
+  const reconnected = await service.read('C', binding);
+  clock.advance(31000);
+  await service.tick();
+  await service.settle();
+  const rebound = await service.read('C', binding);
+  // A client that has not been told yet still gets discovery, so a fresh open is not stuck.
+  const unbound = await service.read('C', '');
+
+  return {
+    streamAtOpen: atOpen.target, briefAtOpen: opened.session.target, goalAtOpen: opened.goal,
+    briefAfterStart: polled.session.target, goalAfterStart: held.goal,
+    editTarget: edited.session.target,
+    streamAtReconnect: atReconnect.target, briefAtReconnect: reconnected.session.target,
+    goalAfterReconnect: rebound.goal, overrideAfterReconnect: rebound.overrides.goal,
+    unboundTarget: unbound.session.target,
+  };
 }
 
 export function loadCorpus(oracleDir) {

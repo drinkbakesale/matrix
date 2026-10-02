@@ -109,16 +109,25 @@ function createSessionResolver({ tmux } = {}) {
   }
 
   return {
-    async resolve(name, windowName) {
+    // `options.authoritative` means the caller is reporting a binding an open stream
+    // already resolved, not asking for one. The distinction only matters for an EMPTY
+    // window, and there it is the whole game: a connection that found no Claude keeps the
+    // bare session as its target, and "" from that connection means "the session itself",
+    // not "please go and find Claude". Rediscovering for it would point the brief at a
+    // window the transcript is not showing the moment Claude starts somewhere else.
+    async resolve(name, windowName, options) {
+      const authoritative = !!(options && options.authoritative);
       const hit = (await liveSessions()).find(s => s.name === name);
       if (!hit) return null;
       const windows = await liveWindows(name);
 
-      // Identical to pane-stream: requested window, else the Claude window, else no window.
+      // Identical to pane-stream: requested window, else the Claude window, else no window
+      // — except that an authoritative empty window skips the discovery step, exactly as
+      // the already-connected stream does.
       let window = '';
       if (windowName) {
         window = windowName;
-      } else {
+      } else if (!authoritative) {
         const claude = windows.find(w => isClaudeCmd(w.command));
         if (claude) window = claude.name;
       }
@@ -133,6 +142,9 @@ function createSessionResolver({ tmux } = {}) {
         // a pane that no longer exists. Saying so is better than capturing `name:gone` and
         // reporting whatever tmux does with it.
         windowKnown: window === '' ? true : !!chosen,
+        // Carried so a later re-resolve for the same open stream repeats this decision
+        // rather than falling back to discovery.
+        bound: authoritative,
         target: window ? `${hit.name}:${window}` : hit.name,
       };
     },

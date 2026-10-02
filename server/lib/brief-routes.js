@@ -23,13 +23,13 @@ function parseBriefPath(pathname) {
   }
 }
 
-// (method, session name, parsed body, streamed window) -> { status, body }.
+// (method, session name, parsed body, stream binding) -> { status, body }.
 // Asynchronous because session/pane resolution is an awaited, cached, bounded process call;
 // it still never waits for generation.
-async function respond(service, method, name, body, windowName) {
+async function respond(service, method, name, body, binding) {
   try {
-    if (method === 'GET') return { status: 200, body: { ok: true, brief: await service.read(name, windowName) } };
-    if (method === 'PATCH') return { status: 200, body: { ok: true, brief: await service.patch(name, body, windowName) } };
+    if (method === 'GET') return { status: 200, body: { ok: true, brief: await service.read(name, binding) } };
+    if (method === 'PATCH') return { status: 200, body: { ok: true, brief: await service.patch(name, body, binding) } };
     return { status: 405, body: { ok: false, code: 'method_not_allowed', message: 'use GET or PATCH' } };
   } catch (err) {
     if (err instanceof BriefRequestError) {
@@ -41,18 +41,26 @@ async function respond(service, method, name, body, windowName) {
 }
 
 // `window` names the tmux window the client is actually streaming, so the brief describes
-// the pane on screen rather than whichever window happens to be tmux-active.
-function windowParam(value) {
-  return typeof value === 'string' ? value : '';
+// the pane on screen rather than whichever window happens to be tmux-active. `bound=1` says
+// that window came from the stream's own announcement and is final — including when it is
+// empty, which means the connection found no Claude and is streaming the session itself.
+// Without `bound`, the client has not been told yet and the server discovers.
+function bindingParam(windowValue, boundValue) {
+  return {
+    window: typeof windowValue === 'string' ? windowValue : '',
+    authoritative: boundValue === '1' || boundValue === 1 || boundValue === true,
+  };
 }
 
 function mountExpress(app, service) {
   app.get('/api/sessions/:name/brief', async (req, res) => {
-    const { status, body } = await respond(service, 'GET', req.params.name, null, windowParam(req.query.window));
+    const binding = bindingParam(req.query.window, req.query.bound);
+    const { status, body } = await respond(service, 'GET', req.params.name, null, binding);
     res.status(status).json(body);
   });
   app.patch('/api/sessions/:name/brief', async (req, res) => {
-    const { status, body } = await respond(service, 'PATCH', req.params.name, req.body, windowParam(req.query.window));
+    const binding = bindingParam(req.query.window, req.query.bound);
+    const { status, body } = await respond(service, 'PATCH', req.params.name, req.body, binding);
     res.status(status).json(body);
   });
 }
@@ -93,7 +101,8 @@ function createNodeHandler(service) {
       return true;
     }
     const query = new URL(req.url, 'http://localhost').searchParams;
-    const { status, body } = await respond(service, req.method, name, payload, windowParam(query.get('window')));
+    const binding = bindingParam(query.get('window'), query.get('bound'));
+    const { status, body } = await respond(service, req.method, name, payload, binding);
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(body));
     return true;

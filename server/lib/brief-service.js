@@ -23,6 +23,20 @@ class BriefRequestError extends Error {
   }
 }
 
+// A client either knows which pane its stream resolved, or it does not. A bare window name
+// is the old call shape and is authoritative by virtue of naming something; `''` on its own
+// is "not told yet"; `{ window: '', authoritative: true }` is the stream saying "the session
+// itself, no window" — the three states the empty string alone cannot express.
+// Returns null for a shape that is not a binding at all.
+function normalizeBinding(binding) {
+  if (binding === undefined || binding === null) return { window: '', authoritative: false };
+  if (typeof binding === 'string') return { window: binding, authoritative: binding !== '' };
+  if (typeof binding !== 'object' || Array.isArray(binding)) return null;
+  const window = binding.window === undefined || binding.window === null ? '' : binding.window;
+  if (typeof window !== 'string') return null;
+  return { window, authoritative: !!binding.authoritative || window !== '' };
+}
+
 function validOverride(value) {
   if (value === null) return true;
   if (typeof value !== 'string') return false;
@@ -73,16 +87,18 @@ class BriefService {
   // against the live session list. A name that is not live (including a forged path)
   // resolves to nothing and is rejected. Resolution is asynchronous and cached at the
   // process boundary, so a request never blocks the event loop on tmux.
-  async identityFor(name, windowName) {
+  async identityFor(name, binding) {
     if (typeof name !== 'string' || !name || name.length > 200 || /[\u0000-\u001f/\\]/.test(name)) {
       throw new BriefRequestError(400, 'invalid_session', 'session name is not a valid tmux session name');
     }
-    if (windowName !== undefined && windowName !== null && windowName !== '') {
-      if (typeof windowName !== 'string' || windowName.length > 200 || /[\u0000-\u001f/\\]/.test(windowName)) {
-        throw new BriefRequestError(400, 'invalid_window', 'window is not a valid tmux window name');
-      }
+    const bound = normalizeBinding(binding);
+    if (!bound) throw new BriefRequestError(400, 'invalid_window', 'window binding is not valid');
+    if (bound.window !== '' && (bound.window.length > 200 || /[\u0000-\u001f/\\]/.test(bound.window))) {
+      throw new BriefRequestError(400, 'invalid_window', 'window is not a valid tmux window name');
     }
-    const identity = await this.resolveSession(name, windowName || '');
+    // Only a session name, a window name and a boolean cross this line. The client never
+    // supplies a tmux target, so it cannot address a pane of its own choosing.
+    const identity = await this.resolveSession(name, bound.window, { authoritative: bound.authoritative });
     if (!identity || identity.name !== name) {
       throw new BriefRequestError(404, 'unknown_session', 'no live session with that name');
     }
@@ -92,12 +108,13 @@ class BriefService {
     return identity;
   }
 
-  async read(name, windowName) {
-    const identity = await this.identityFor(name, windowName);
+  async read(name, binding) {
+    const identity = await this.identityFor(name, binding);
     const key = sessionKey(identity);
     const state = this.runtimeFor(key);
     state.lastAccess = this.now();
     state.window = identity.window || '';
+    state.bound = !!identity.bound;
     // Scheduling only enqueues; generation never happens on the request path.
     this.schedule(identity);
     return this.snapshot(identity, key);
@@ -148,8 +165,8 @@ class BriefService {
 
   // Edits are per field. `null` clears that field's override and restores the newest
   // generated value for it, leaving the other field's edit untouched.
-  async patch(name, body, windowName) {
-    const identity = await this.identityFor(name, windowName);
+  async patch(name, body, binding) {
+    const identity = await this.identityFor(name, binding);
     const key = sessionKey(identity);
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       throw new BriefRequestError(400, 'invalid_body', 'body must be an object');
@@ -206,7 +223,10 @@ class BriefService {
       if (now - state.lastAccess > OPEN_SESSION_TTL_MS) { this.runtime.delete(key); continue; }
       const [name] = key.split('\u0000');
       let identity = null;
-      try { identity = await this.identityFor(name, state.window || ''); } catch { identity = null; }
+      // Re-resolve on the binding this session was last read with, not on a bare window
+      // string: an authoritative empty window must not turn into discovery here either.
+      const binding = { window: state.window || '', authoritative: !!state.bound };
+      try { identity = await this.identityFor(name, binding); } catch { identity = null; }
       if (!identity || sessionKey(identity) !== key) continue;
       this.schedule(identity);
     }
@@ -239,7 +259,8 @@ class BriefService {
     try {
       const evidence = await this.collector.collect(identity);
       // A session whose identity changed while the job ran is a different session now.
-      const live = await this.resolveSession(identity.name, identity.window || '');
+      // Re-checked on the same binding the job was scheduled under.
+      const live = await this.resolveSession(identity.name, identity.window || '', { authoritative: !!identity.bound });
       if (!live || sessionKey(live) !== key) return;
       if (evidence.fingerprint !== state.fingerprint) {
         state.fingerprint = evidence.fingerprint;

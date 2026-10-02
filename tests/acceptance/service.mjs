@@ -11,7 +11,7 @@ import { createRun, parseArgs } from './assertions.mjs';
 import {
   briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
-  countingGenerator, fakeCli, loadCorpus, sleep, paneStreamProbe,
+  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks,
 } from './service-support.mjs';
 import { evaluateCorpus } from './corpus.mjs';
 
@@ -119,15 +119,15 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   let goneWindow = null;
   try { await service.read('S', 'closed-window'); } catch (e) { goneWindow = e; }
   t.eq(goneWindow && goneWindow.code, 'unknown_window', 'a stream binding to a window that no longer exists is rejected');
-  // The stream itself announces the window it resolved, which is what the client binds to.
-  const announced = paneStreamProbe({ session: 'A', windows: [['one', 'claude'], ['two', 'bash']] });
-  t.eq(announced.first && announced.first.type, 'stream-target', 'a connection announces its target before any pane data');
-  t.eq(announced.first && announced.first.window, 'one', 'the announcement names the window pane-stream actually picked');
-  t.eq(announced.first && announced.first.target, 'A:one', 'the announced target is the one the stream polls');
-  const announcedAfterMove = paneStreamProbe({ session: 'A', windows: [['one', 'bash'], ['two', 'claude']] });
-  t.eq(announcedAfterMove.first && announcedAfterMove.first.window, 'two', 'a later connection announces the window Claude moved to');
-  t.ok(announced.types.indexOf('stream-target') < announced.types.indexOf('output'),
-    'the binding is announced before the scrollback the client renders');
+  // What the stream announces, and whether the brief follows it — including the case with
+  // no Claude running at all, where the announced window is empty and must still bind.
+  const binding = await streamBindingChecks({
+    clock, generator: extractive(), storeFile: store(),
+    activePane: paneFor(byId.f1), otherPane: paneFor(byId.f3),
+    expect: { activeGoal: byId.f1.expectedGoal, otherGoal: byId.f3.expectedGoal },
+  });
+  for (const [actual, expected, detail] of binding.checks) t.eq(actual, expected, detail);
+  t.note('streamBinding', binding.report);
 
   // Same project, different session: no cross-contamination.
   await service.read('B');
