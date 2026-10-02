@@ -58,14 +58,18 @@ export async function pinnedBothClients(ctx, t) {
   const boxes = {};
   for (const kind of ['mobile', 'desktop']) {
     // A genuinely unseen session: earlier cases shared this store, so start a fresh
-    // incarnation to observe the real first-open state rather than a warm cache.
+    // incarnation to observe the real first-open state rather than a warm cache. The
+    // generator is held slow so the pending state is observed deterministically instead of
+    // racing a fast extractor.
     await fetch(`${ctx.origin}/__control/reincarnate?session=A`);
+    await fetch(`${ctx.origin}/__control/mode?mode=slow`);
     const { context, page } = await openClient(ctx, kind);
     const initial = await readBrief(page);
     t.eq(['loading', 'generating'].includes(initial.status) ? 'pending' : initial.status, 'pending',
       `${kind}: an unseen brief first says it is generating`);
     t.ok(!initial.goal.includes('shared-project') && !initial.goal.includes('fixture'),
       `${kind}: the placeholder is never invented from the project name`);
+    await fetch(`${ctx.origin}/__control/mode?mode=ok`);
 
     await settleAndRefresh(page);
     const brief = await readBrief(page);

@@ -69,9 +69,10 @@ are D2 (mobile copy) and D3 (session brief).
 * `server/server.js:1018-1027 @27534cd` **[code]** `captureAll()` runs
   `tmux capture-pane -p -S -` with a 64 MiB buffer — and **swallows every failure into an
   empty string**. The 100 ms poller then sees a shorter capture and simply stops advancing;
-  the user sees a terminal that quietly stops updating. (This build made the initial capture
-  log its error — `server/lib/pane-stream.js:76-80` — but the symptom class is an audit
-  concern, not something D2/D3 set out to fix.)
+  the user sees a terminal that quietly stops updating. This build deliberately leaves that
+  behaviour exactly as it was when extracting the code to `server/lib/pane-stream.js`:
+  fixing it is improvement 3 below, a separate change with its own evidence, not something
+  an extraction should smuggle in.
 * `server/server.js:1040-1048 @27534cd` **[code]** Every connection, including an automatic
   reconnect, re-sends the whole scrollback as the first `output`.
 * `server/server.js:1054-1096 @27534cd` **[code]** The 100 ms poll sends `output` when the
@@ -316,9 +317,23 @@ not be captured. **Do not claim the t-20260915 deep-link fix works live.** What 
 4. Background the PWA, tap the notification, and confirm the terminal that opens is that exact
    tmux session (check `#term-title` against the session's project and suffix).
 5. Repeat for the second session of the same project. Both must land on their own terminal.
-6. Record the server's reply field `via` from `/api/notify` (it is in
-   `~/.matrix/logs/matrix.log`): `tmux-session` is the good path; `project`, `ambiguous-label`
-   or `unresolved` each mean the hook is not passing `tmuxSession`.
+6. To see *why* it routed as it did, capture the `/api/notify` reply directly — it is the only
+   place `via` appears. `bin/matrix-notify:71-74 @27534cd` pipes curl's output away, and
+   `/api/notify` (`server.js:208-214 @27534cd`, now `server/lib/notify-routes.js`) logs
+   nothing, so **`via` is not in `~/.matrix/logs/matrix.log` and never was**. Post the same
+   body the hook posts and read the response:
+   ```sh
+   S=<session>
+   curl -s -X POST http://localhost:7778/api/notify \
+     -H 'Content-Type: application/json' \
+     -d "{\"message\":\"audit deep-link test\",\"project\":\"$S\",\"session\":\"$S\",\"tmuxSession\":\"$S\"}"
+   ```
+   The JSON reply carries `targetSession` and `via`: `tmux-session` is the good path;
+   `project`, `ambiguous-label` or `unresolved` each mean the hook is not passing
+   `tmuxSession`. Note this sends a real notification, so do it only in the same sitting as
+   steps 3-5. To learn `via` without any notification at all, add a one-line
+   `console.log` of `target.via` to the route first — that is a code change, not part of
+   this procedure.
 
 *Effort to fix if it fails:* unknown until step 6 identifies `via`. *Dependencies:* none.
 

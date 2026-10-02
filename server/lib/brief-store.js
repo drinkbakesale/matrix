@@ -24,15 +24,18 @@ class BriefStoreError extends Error {
   }
 }
 
-// Identity of one live session incarnation. `name` alone is not a key.
+// Identity of one live session incarnation, on one pane. `name` alone is not a key, and
+// neither is the session: the shell window and the Claude window of the same session are
+// different work and must not share a brief.
 function sessionKey(identity) {
   if (!identity || typeof identity.name !== 'string' || !identity.name) {
     throw new BriefStoreError('invalid_identity', 'session identity requires a name');
   }
   const id = typeof identity.sessionId === 'string' ? identity.sessionId : '';
   const created = identity.createdAt === undefined || identity.createdAt === null ? '' : String(identity.createdAt);
+  const target = typeof identity.target === 'string' && identity.target ? identity.target : identity.name;
   // Control characters and the separator cannot appear in a tmux id/name we accept.
-  return [identity.name, id, created].map(part => String(part).replace(/[\u0000-\u001f]/g, '')).join('\u0000');
+  return [identity.name, id, created, target].map(part => String(part).replace(/[\u0000-\u001f]/g, '')).join('\u0000');
 }
 
 function emptyRecord(identity) {
@@ -40,6 +43,8 @@ function emptyRecord(identity) {
     name: identity.name,
     sessionId: identity.sessionId || '',
     createdAt: identity.createdAt === undefined ? null : identity.createdAt,
+    target: identity.target || identity.name,
+    window: identity.window || '',
     overrides: { goal: null, current: null },
     generated: { goal: null, current: null, generatedAt: null, evidenceAt: null, fingerprint: null, source: null },
     revision: 0,
@@ -108,6 +113,8 @@ class BriefStore {
         name: raw.name,
         sessionId: raw.sessionId,
         createdAt: raw.createdAt,
+        target: raw.target,
+        window: raw.window,
       }));
     }
   }
@@ -128,6 +135,8 @@ class BriefStore {
     next.name = identity.name;
     next.sessionId = identity.sessionId || '';
     next.createdAt = identity.createdAt === undefined ? null : identity.createdAt;
+    next.target = identity.target || identity.name;
+    next.window = identity.window || '';
     next.revision = current.revision + 1;
     next.updatedAt = this.now();
     const previous = this.sessions.get(key);

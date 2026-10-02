@@ -69,24 +69,33 @@ class BriefService {
     return this.runtime.get(key);
   }
 
-  // Resolve a client-supplied tmux name against the live session list. A name that is not
-  // live (including a forged path) resolves to nothing and is rejected.
-  identityFor(name) {
+  // Resolve a client-supplied tmux name and the window the client is actually streaming
+  // against the live session list. A name that is not live (including a forged path)
+  // resolves to nothing and is rejected. Resolution is asynchronous and cached at the
+  // process boundary, so a request never blocks the event loop on tmux.
+  async identityFor(name, windowName) {
     if (typeof name !== 'string' || !name || name.length > 200 || /[\u0000-\u001f/\\]/.test(name)) {
       throw new BriefRequestError(400, 'invalid_session', 'session name is not a valid tmux session name');
     }
-    const identity = this.resolveSession(name);
+    if (windowName !== undefined && windowName !== null && windowName !== '') {
+      if (typeof windowName !== 'string' || windowName.length > 200 || /[\u0000-\u001f/\\]/.test(windowName)) {
+        throw new BriefRequestError(400, 'invalid_window', 'window is not a valid tmux window name');
+      }
+    }
+    const identity = await this.resolveSession(name, windowName || '');
     if (!identity || identity.name !== name) {
       throw new BriefRequestError(404, 'unknown_session', 'no live session with that name');
     }
     return identity;
   }
 
-  read(name) {
-    const identity = this.identityFor(name);
+  async read(name, windowName) {
+    const identity = await this.identityFor(name, windowName);
     const key = sessionKey(identity);
     const state = this.runtimeFor(key);
     state.lastAccess = this.now();
+    state.window = identity.window || '';
+    // Scheduling only enqueues; generation never happens on the request path.
     this.schedule(identity);
     return this.snapshot(identity, key);
   }
@@ -106,7 +115,13 @@ class BriefService {
     else if (state.unavailable) status = 'unavailable';
     else status = 'generating';
     return {
-      session: { name: identity.name, sessionId: identity.sessionId || '', createdAt: identity.createdAt ?? null },
+      session: {
+        name: identity.name,
+        sessionId: identity.sessionId || '',
+        createdAt: identity.createdAt ?? null,
+        window: identity.window || '',
+        target: identity.target || identity.name,
+      },
       goal: effective.goal ?? null,
       current: effective.current ?? null,
       generated: { goal: record.generated.goal, current: record.generated.current },
@@ -130,8 +145,8 @@ class BriefService {
 
   // Edits are per field. `null` clears that field's override and restores the newest
   // generated value for it, leaving the other field's edit untouched.
-  patch(name, body) {
-    const identity = this.identityFor(name);
+  async patch(name, body, windowName) {
+    const identity = await this.identityFor(name, windowName);
     const key = sessionKey(identity);
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       throw new BriefRequestError(400, 'invalid_body', 'body must be an object');
@@ -180,14 +195,15 @@ class BriefService {
     return true;
   }
 
-  // Called by the host on a timer. Re-checks every session a client still has open.
-  tick() {
+  // Called by the host on a timer. Re-checks every session a client still has open, on the
+  // exact window that client is streaming.
+  async tick() {
     const now = this.now();
-    for (const [key, state] of this.runtime) {
+    for (const [key, state] of [...this.runtime]) {
       if (now - state.lastAccess > OPEN_SESSION_TTL_MS) { this.runtime.delete(key); continue; }
       const [name] = key.split('\u0000');
       let identity = null;
-      try { identity = this.identityFor(name); } catch { identity = null; }
+      try { identity = await this.identityFor(name, state.window || ''); } catch { identity = null; }
       if (!identity || sessionKey(identity) !== key) continue;
       this.schedule(identity);
     }
@@ -220,7 +236,7 @@ class BriefService {
     try {
       const evidence = await this.collector.collect(identity);
       // A session whose identity changed while the job ran is a different session now.
-      const live = this.resolveSession(identity.name);
+      const live = await this.resolveSession(identity.name, identity.window || '');
       if (!live || sessionKey(live) !== key) return;
       if (evidence.fingerprint !== state.fingerprint) {
         state.fingerprint = evidence.fingerprint;
@@ -247,8 +263,11 @@ class BriefService {
         return;
       }
       this.store.update(identity, next => {
-        next.generated.goal = result.goal ? result.goal.text : null;
-        next.generated.current = result.current ? result.current.text : null;
+        // A field the new evidence does not restate keeps its last supported value. The
+        // pane is a rolling window: once the opening turns scroll past the capture, a
+        // current-work-only result must not erase the goal the session actually stated.
+        if (result.goal) next.generated.goal = result.goal.text;
+        if (result.current) next.generated.current = result.current.text;
         next.generated.generatedAt = this.now();
         next.generated.evidenceAt = evidence.evidenceAt;
         next.generated.fingerprint = evidence.fingerprint;

@@ -11,7 +11,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
-  briefGenerator, briefRoutes, fakeClock, fakeTmux, makeService, tempDir,
+  briefGenerator, briefRoutes, fakeClock, fakeTmuxProcess, tmuxStack, makeService, tempDir,
 } from './service-support.mjs';
 
 const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json' };
@@ -37,10 +37,12 @@ export function baseHash(repoRoot) {
 }
 
 function sessionRow(name, meta) {
+  const windows = meta.windows || [];
   return {
     name, targetSession: name, projectName: meta.projectName || 'fixture',
-    projectSource: 'explicit', description: '', windows: 1, attached: false,
-    path: '/tmp/fixture', windowList: [{ index: 0, name: 'claude', active: true }],
+    projectSource: 'explicit', description: '', windows: windows.length || 1, attached: false,
+    path: '/tmp/fixture',
+    windowList: windows.map((w, i) => ({ index: i, name: w.name, active: !!w.active })),
     claudeRunning: true, needsAttention: false, lastActivity: 0, projectConfirmed: true,
     sessionId: meta.sessionId, createdAt: meta.createdAt, instanceSuffix: '', displayName: name,
   };
@@ -68,13 +70,23 @@ function switchableGenerator(state) {
 
 export async function startFixtureServer({ root, sessions, storeFile, literalRequired = true }) {
   const clock = fakeClock();
-  const tmux = fakeTmux(sessions);
+  // A fake tmux *process* behind the delivered resolver/capture stack, so the browser cases
+  // exercise the same session/window resolution the live server uses.
+  const tmux = fakeTmuxProcess(sessions);
+  const stack = tmuxStack(tmux);
   const state = { mode: 'ok', slowMs: 1500 };
   const generator = switchableGenerator(state);
   const home = storeFile || path.join(tempDir('matrix-home-'), 'briefs.json');
-  let service = makeService({ tmux, clock, generator, storeFile: home, literalRequired });
+  let service = makeService({ stack, clock, generator, storeFile: home, literalRequired });
   const briefHandler = briefRoutes.createNodeHandler(service);
   let handler = briefHandler;
+
+  const setPane = (name, pane) => {
+    const prev = tmux.sessions.get(name);
+    if (!prev) return;
+    const windows = (prev.windows || []).map(w => (w.active || w.command === 'claude' ? { ...w, pane } : w));
+    tmux.set(name, { ...prev, windows });
+  };
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -85,29 +97,33 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
 
     if (url.pathname.startsWith('/__control/')) {
       const op = url.pathname.slice('/__control/'.length);
-      if (op === 'advance') { clock.advance(Number(url.searchParams.get('ms') || 0)); service.tick(); return json(200, { now: clock.now() }); }
+      if (op === 'advance') {
+        clock.advance(Number(url.searchParams.get('ms') || 0));
+        stack.resolver.invalidate();
+        await service.tick();
+        return json(200, { now: clock.now() });
+      }
       if (op === 'pane') {
-        const name = url.searchParams.get('session');
-        const prev = tmux.sessions.get(name) || {};
-        tmux.set(name, { ...prev, pane: decodeURIComponent(url.searchParams.get('pane') || '') });
+        setPane(url.searchParams.get('session'), decodeURIComponent(url.searchParams.get('pane') || ''));
         return json(200, { ok: true });
       }
       if (op === 'reincarnate') {
         const name = url.searchParams.get('session');
         const prev = tmux.sessions.get(name) || {};
         tmux.set(name, { ...prev, sessionId: `${prev.sessionId}-new`, createdAt: (prev.createdAt || 0) + 1000 });
+        stack.resolver.invalidate();
         return json(200, { ok: true });
       }
       if (op === 'mode') { state.mode = url.searchParams.get('mode') || 'ok'; return json(200, { mode: state.mode }); }
       if (op === 'settle') { await service.settle(); return json(200, { ok: true }); }
       if (op === 'restart') {
-        service = makeService({ tmux, clock, generator, storeFile: home, literalRequired });
+        service = makeService({ stack, clock, generator, storeFile: home, literalRequired });
         handler = briefRoutes.createNodeHandler(service);
         return json(200, { ok: true });
       }
       if (op === 'readonly') {
         service = makeService({
-          tmux, clock, generator, storeFile: home, literalRequired,
+          stack, clock, generator, storeFile: home, literalRequired,
           fsImpl: { ...fs, writeFileSync: () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; } },
         });
         handler = briefRoutes.createNodeHandler(service);

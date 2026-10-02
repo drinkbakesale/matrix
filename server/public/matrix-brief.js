@@ -39,11 +39,19 @@
     if (!root || !goalEl || !currentEl || !statusEl) return null;
 
     var session = null;
+    // The tmux window this client is streaming. The server resolves the brief against this
+    // exact pane, so the summary describes what is on screen and not another window.
+    var windowName = '';
     var latest = null;
     var requestId = 0;
     var appliedId = 0;
     var timer = null;
     var editing = null;
+
+    function briefUrl(name) {
+      var url = '/api/sessions/' + encodeURIComponent(name) + '/brief';
+      return windowName ? url + '?window=' + encodeURIComponent(windowName) : url;
+    }
 
     function setStatus(text, kind) {
       statusEl.textContent = text || '';
@@ -106,7 +114,7 @@
       var id = ++requestId;
       var name = session;
       try {
-        var res = await fetchImpl('/api/sessions/' + encodeURIComponent(name) + '/brief', { cache: 'no-store' });
+        var res = await fetchImpl(briefUrl(name), { cache: 'no-store' });
         var data = await res.json();
         if (!data || data.ok !== true || !data.brief) {
           apply(id, name, errorBrief(name, data && data.message ? data.message : 'HTTP ' + res.status));
@@ -169,7 +177,7 @@
     async function patch(body) {
       if (!session || !fetchImpl) return null;
       var name = session;
-      var res = await fetchImpl('/api/sessions/' + encodeURIComponent(name) + '/brief', {
+      var res = await fetchImpl(briefUrl(name), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -216,8 +224,9 @@
     }
 
     return {
-      open: function (name) {
+      open: function (name, streamedWindow) {
         session = name;
+        windowName = typeof streamedWindow === 'string' ? streamedWindow : '';
         latest = null;
         appliedId = 0;
         editing = null;

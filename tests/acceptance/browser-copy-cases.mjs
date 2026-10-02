@@ -3,7 +3,7 @@
 
 import { diagnose, TARGET } from './browser-diagnosis.mjs';
 import {
-  newPage, emit, startStream, stopStream, dragSelect, touchLongPress,
+  newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, trustedLongPress,
   engineCapabilities, saveArtifact, STANDALONE_STUB,
 } from './browser-support.mjs';
 
@@ -72,21 +72,47 @@ export async function mobileStreamSelection(ctx, t) {
   await emit(page, 'screen', `${TARGET}\n`);
   await page.waitForSelector('#terminal .msg-screen');
 
-  // 1. Attempt a native long press and report honestly what the engine did.
-  const press = await touchLongPress(page, '#terminal .msg-screen', 900);
-  const nativeSelection = press.selection && press.selection.length > 0;
-  t.note('nativeLongPress', { ...press, producedSelection: nativeSelection });
-  t.ok(press.attempted, 'a touch long-press was attempted on the transcript');
-  await startStream(page, 100);
-  await page.waitForTimeout(3100);
-  const held = await page.evaluate(() => ({
-    mode: transcript.mode(),
-    screenText: (document.querySelector('#terminal .msg-screen') || {}).textContent || '',
-    selection: String(window.getSelection()),
-  }));
-  t.eq(held.mode === 'live', false, 'the gesture put the transcript into a protected mode');
-  t.includes(held.screenText, TARGET, 'the touched text is byte-identical after 3s of both stream types');
-  if (nativeSelection) t.eq(held.selection, press.selection, 'a native selection stayed byte-identical for 3 seconds');
+  // Both stream types run throughout the gesture attempts, as the oracle requires. The
+  // screen frames carry the Unicode target so the protected text is real conversation text.
+  await startStream(page, 100, ` ${TARGET}`);
+  await page.waitForTimeout(250);
+
+  // 1a. TRUSTED-INPUT capability attempt: the engine generates the events itself
+  // (isTrusted=true), exactly as it would for a user. This is the only evidence that can
+  // speak to whether a real press-and-hold selects text; a scripted dispatchEvent cannot.
+  const targetBox = await page.evaluate(() => {
+    const el = document.querySelector('#terminal .msg-screen');
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  });
+  const trusted = await trustedLongPress(page, targetBox, 900);
+  const nativeSelection = !!(trusted.selection && trusted.selection.length > 0);
+  t.note('trustedLongPress', { ...trusted, producedSelection: nativeSelection });
+  t.eq(trusted.error, null, 'a trusted press-and-hold was delivered through the engine input API');
+  t.includes(trusted.textAtPress, TARGET, 'the pressed node holds real transcript text');
+  t.eq(trusted.textDuringHold, trusted.textAtPress,
+    'under a trusted hold the touched text is byte-identical while both stream types keep arriving');
+  if (nativeSelection) {
+    await page.waitForTimeout(3100);
+    const stillSelected = await page.evaluate(() => String(window.getSelection()));
+    t.eq(stillSelected, trusted.selection, 'a trusted-input selection stayed byte-identical for 3 seconds');
+  } else {
+    t.note('trustedLongPressLimitation',
+      'WebKit under Playwright produced no selection from a trusted press-and-hold: no SpringBoard, no selection handles. The visible fallback below is the tested path.');
+  }
+
+  // 1b. SYNTHETIC gesture, recorded separately and never conflated with the above: it is
+  // what proves the DOM race causally, and it completes with a release.
+  await page.evaluate(() => transcript.resume());
+  await page.waitForTimeout(250);
+  const synthetic = await syntheticLongPress(page, '#terminal .msg-screen', 900);
+  t.note('syntheticLongPress', synthetic);
+  t.ok(synthetic.attempted, 'a synthetic touch sequence was dispatched on the transcript');
+  t.eq(synthetic.released, true, 'the synthetic gesture is released, not left pressed');
+  t.eq(synthetic.stillConnected, true, 'the synthetically touched node stayed in the DOM for the whole hold');
+  t.eq(synthetic.textDuringHold, synthetic.textAtPress, 'the synthetically touched text did not change during the hold');
+  const afterSynthetic = await page.evaluate(() => transcript.mode());
+  t.eq(afterSynthetic, 'live', 'releasing without a selection returns the transcript to live');
 
   // 2. The delivered visible fallback, exercised regardless of native capability.
   await page.evaluate(() => transcript.resume());
@@ -182,6 +208,9 @@ async function readRealClipboard(page, context) {
 
 export async function clipboardAndFailure(ctx, t) {
   const report = { engines: {} };
+  // At least one engine must produce a real, exact clipboard round-trip through the visible
+  // control. "Both engines said Copy failed" is a failing case, not a documented limitation.
+  const roundTrips = [];
 
   for (const [engineName, launcher, device] of [
     ['webkit-mobile', ctx.webkit, ctx.devices['iPhone 13']],
@@ -222,10 +251,12 @@ export async function clipboardAndFailure(ctx, t) {
       if (state === 'copied') {
         t.ok(clip.ok, `${engineName}: a copy reported as succeeded is readable back from the real clipboard`);
         if (clip.ok) {
+          const exact = clip.text === expected;
           t.eq(clip.text, expected, `${engineName}: the pasted text is exactly the transcript snapshot`);
           t.includes(clip.text, UNICODE_LINE, `${engineName}: Unicode and tabs survive the copy`);
           t.ok(!clip.text.includes('Copy selection') && !clip.text.includes('Project goal'),
             `${engineName}: no control label or brief text is included`);
+          if (exact) roundTrips.push({ engine: engineName, via: clip.via, chars: clip.text.length });
         }
       } else {
         t.includes(status, 'Copy failed', `${engineName}: a copy that did not succeed says so instead of claiming success`);
@@ -274,8 +305,13 @@ export async function clipboardAndFailure(ctx, t) {
     }
   }
   report.limitation = 'A programmatic standalone display-mode is not an installed iOS PWA; no SpringBoard callout or OS share sheet is exercised here.';
+  report.successfulRoundTrips = roundTrips;
   saveArtifact(ctx.artifactDir, 'clipboard-evidence.json', report);
-  t.note('clipboard', report.engines);
+  // The whole point of the case: somewhere, the visible control really did put the exact
+  // transcript text on the real system clipboard.
+  t.ok(roundTrips.length >= 1,
+    `at least one engine completed an exact clipboard round-trip through the visible control (got ${JSON.stringify(roundTrips)})`);
+  t.note('clipboard', { engines: report.engines, roundTrips });
 }
 
 export async function desktopScrollLifecycle(ctx, t) {
@@ -324,6 +360,47 @@ export async function desktopScrollLifecycle(ctx, t) {
   }, streamed);
   t.eq(caught.last, 1, 'the newest held line appears exactly once after Resume');
   t.eq(caught.first, 1, 'the oldest held line appears exactly once after Resume');
+
+  // Pausing while reading history must bring you back to where you were reading, not to
+  // the bottom — including across a reconnect snapshot that arrives while paused.
+  const readingTop = await page.evaluate(() => {
+    const v = document.getElementById('terminal');
+    v.scrollTop = Math.floor(v.scrollHeight * 0.25);
+    v.dispatchEvent(new Event('scroll'));
+    return { top: v.scrollTop, following: transcript.following(), height: v.scrollHeight };
+  });
+  t.ok(readingTop.top > 0, 'the reader scrolled up into history');
+  t.eq(readingTop.following, false, 'the transcript knows the reader is not following the bottom');
+  await page.click('#copy-open');
+  await page.waitForSelector('#copy-sheet:not([hidden])');
+  await startStream(page, 100);
+  await page.waitForTimeout(600);
+  await page.evaluate(() => {
+    const s = window.__sockets.at(-1);
+    if (s.onclose) s.onclose({});
+  });
+  await page.waitForTimeout(1700);
+  // The server re-sends the whole scrollback as the first output of every connection, so
+  // the reconnect dump restores comparable content to be positioned in.
+  await page.evaluate((line) => {
+    const s = window.__sockets.at(-1);
+    const dump = Array.from({ length: 80 }, (_, i) => `history line ${i} ${line}`).join('\n');
+    s.onmessage({ data: JSON.stringify({ type: 'output', data: `${dump}\nreconnect while paused\n` }) });
+  }, UNICODE_LINE);
+  await stopStream(page);
+  await page.click('#copy-resume');
+  await page.waitForTimeout(200);
+  const afterResume = await page.evaluate(() => {
+    const v = document.getElementById('terminal');
+    return {
+      top: v.scrollTop, bottom: v.scrollHeight - v.scrollTop - v.clientHeight,
+      following: transcript.following(), mode: transcript.mode(),
+    };
+  });
+  t.eq(afterResume.mode, 'live', 'Resume returns to live');
+  t.eq(afterResume.following, false, 'Resume does not silently re-enable bottom-following for a history reader');
+  t.ok(afterResume.bottom > 100, 'Resume did not yank the reader to the bottom');
+  t.ok(Math.abs(afterResume.top - readingTop.top) <= 2, 'the reading position is preserved across pause, updates, reconnect and Resume');
 
   // At the bottom, live streaming follows the bottom.
   await page.evaluate(() => { const v = document.getElementById('terminal'); v.scrollTop = v.scrollHeight; v.dispatchEvent(new Event('scroll')); });

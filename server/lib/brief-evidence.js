@@ -38,17 +38,24 @@ function userTurns(capture) {
   return turns.filter(t => t.length > 2);
 }
 
-// Early turns carry the broad purpose; recent turns carry the work in flight. Capturing them
-// as two separate items is what keeps a long session from losing its original goal.
-function buildEvidence({ capture, evidenceAt }) {
+// Early turns carry the broad purpose; recent turns carry the work in flight. They come from
+// two separate bounded captures, because in a long session the opening turns scroll out of
+// the tail window entirely — capturing only the tail loses the goal permanently.
+//
+// `capture` is the recent tail. `earlyCapture`, when supplied, is a slice of the very start
+// of the pane's history; `pane-early` prefers it and falls back to the head of the tail.
+function buildEvidence({ capture, earlyCapture, evidenceAt }) {
   const text = typeof capture === 'string' ? capture : '';
+  const earlyText = typeof earlyCapture === 'string' ? earlyCapture : '';
   const turns = userTurns(text);
+  const earlyTurns = earlyText ? userTurns(earlyText) : [];
   const items = [];
-  if (turns.length) {
-    items.push({ id: 'pane-early', role: 'user', text: collapse(turns.slice(0, 4), MAX_FIELD_CHARS) });
-    if (turns.length > 4) {
-      items.push({ id: 'pane-recent', role: 'user', text: collapse(turns.slice(-6), MAX_FIELD_CHARS) });
-    }
+  const earlySource = earlyTurns.length ? earlyTurns.slice(0, 4) : turns.slice(0, 4);
+  if (earlySource.length) {
+    items.push({ id: 'pane-early', role: 'user', text: collapse(earlySource, MAX_FIELD_CHARS) });
+  }
+  if (turns.length && (earlyTurns.length || turns.length > 4)) {
+    items.push({ id: 'pane-recent', role: 'user', text: collapse(turns.slice(-6), MAX_FIELD_CHARS) });
   }
   const tail = text.split('\n').slice(-40);
   const tailText = collapse(tail, 2048);
@@ -76,15 +83,21 @@ function fingerprintItems(items) {
   return hash.digest('hex').slice(0, 32);
 }
 
-// `capturePane` is injected so tests never touch a real tmux server.
+// `capturePane` is the injected process boundary (server/lib/brief-tmux.js in production, a
+// fake-process adapter in tests). It may return a plain string (tail only) or
+// `{ recent, early }` from the two-capture reader. A capture failure propagates: the service
+// records it as an error rather than silently reporting "no evidence".
 function createEvidenceCollector({ capturePane, now = Date.now, maxChars = MAX_EVIDENCE_CHARS }) {
   if (typeof capturePane !== 'function') throw new Error('evidence collector requires capturePane');
   return {
     async collect(identity) {
       if (!identity || !identity.name) throw new Error('evidence collection requires a session identity');
+      if (!identity.target) throw new Error('evidence collection requires the resolved pane target');
       const raw = await capturePane(identity);
-      const capture = typeof raw === 'string' ? raw.slice(-maxChars * 4) : '';
-      return buildEvidence({ capture, evidenceAt: now() });
+      const bound = s => (typeof s === 'string' ? s.slice(-maxChars * 4) : '');
+      const capture = typeof raw === 'string' ? bound(raw) : bound(raw && raw.recent);
+      const earlyCapture = typeof raw === 'string' ? '' : bound(raw && raw.early);
+      return { ...buildEvidence({ capture, earlyCapture, evidenceAt: now() }), target: identity.target };
     },
   };
 }

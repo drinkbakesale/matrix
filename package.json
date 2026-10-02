@@ -13,11 +13,5 @@
     "web-push": "^3.6.7",
     "ws": "^8.20.0"
   },
-  "license": "MIT",
-  "scriptsComments": {
-    "test:acceptance": "Browser acceptance needs the pinned Playwright WebKit and Chromium builds: npx playwright install webkit chromium"
-  },
-  "devDependencies": {
-    "playwright": "1.59.1"
-  }
+  "license": "MIT"
 }

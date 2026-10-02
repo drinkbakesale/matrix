@@ -9,7 +9,7 @@ import path from 'node:path';
 import { createRun, parseArgs } from './assertions.mjs';
 import { playwright, saveArtifact } from './browser-support.mjs';
 import { startFixtureServer, exportBase, baseHash } from './browser-server.mjs';
-import { loadCorpus, tempDir, cleanupAll, paneFor } from './service-support.mjs';
+import { loadCorpus, tempDir, cleanupAll, paneFor, claudeSession } from './service-support.mjs';
 import { copyDiagnosis, mobileStreamSelection, clipboardAndFailure, desktopScrollLifecycle } from './browser-copy-cases.mjs';
 import { pinnedBothClients, updatesAndOverrides, isolationAndFailures } from './browser-brief-cases.mjs';
 
@@ -34,8 +34,8 @@ const panes = { f1: paneFor(byId.f1), f2: paneFor(byId.f2), f3: paneFor(byId.f3)
 
 // Two sessions of the *same* project, so cross-session isolation is actually at risk.
 const sessions = () => ({
-  A: { sessionId: '$A', createdAt: 1_600_000_000, projectName: 'shared-project', target: 'A:0', pane: panes.f1 },
-  B: { sessionId: '$B', createdAt: 1_600_000_100, projectName: 'shared-project', target: 'B:0', pane: panes.f3 },
+  A: { ...claudeSession('A', panes.f1), projectName: 'shared-project' },
+  B: { ...claudeSession('B', panes.f3), createdAt: 1_600_000_100, projectName: 'shared-project' },
 });
 
 const { webkit, chromium, devices } = playwright();

@@ -307,7 +307,8 @@ function openTerminal(session, windowName) {
   // A fresh open is a new epoch: staged data and callbacks from the previous session die.
   transcript.clear();
   if (copyUi) copyUi.hide();
-  if (briefView) briefView.open(session);
+  // The brief must describe the window this terminal is streaming, not another one.
+  if (briefView) briefView.open(session, currentWindowName);
 
   connectWebSocket(session, windowName);
 }

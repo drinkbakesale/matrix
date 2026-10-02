@@ -49,7 +49,8 @@ function selectProject(name) {
   // A fresh open is a new epoch: staged data and callbacks from the previous session die.
   transcript.clear();
   if (copyUi) copyUi.hide();
-  if (briefView) briefView.open(name);
+  // Desktop always streams the session's auto-detected window, so it sends no override.
+  if (briefView) briefView.open(name, '');
 
   connectWS(name);
   renderSidebar();

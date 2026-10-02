@@ -1,8 +1,10 @@
-// Fixtures and fakes for the brief service acceptance runner.
+// Fixtures and fakes for the brief acceptance runners.
 //
-// Every external boundary is faked — tmux capture, the clock, the `claude` CLI, MATRIX_HOME —
-// so the runner never reads the real HOME, never talks to a real tmux server and never
-// spawns the real CLI. The application code under test is the delivered code, unmodified.
+// The fake is a fake *process*: it stands in for `execFile('tmux', ...)` and nothing else.
+// Everything above it — session/window resolution, the two-capture pane reader, the
+// evidence collector, the generator, the validator, the store, the service and the HTTP
+// routes — is the delivered production code. Replacing tmux with an in-memory resolver
+// would skip exactly the boundary that has to be proved shell-free and bounded.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,6 +19,7 @@ export const briefEvidence = require(path.join(LIB, 'brief-evidence.js'));
 export const briefGenerator = require(path.join(LIB, 'brief-generator.js'));
 export const briefServiceMod = require(path.join(LIB, 'brief-service.js'));
 export const briefRoutes = require(path.join(LIB, 'brief-routes.js'));
+export const briefTmux = require(path.join(LIB, 'brief-tmux.js'));
 
 const cleanups = [];
 
@@ -41,57 +44,147 @@ export function fakeClock(start = 1_700_000_000_000) {
   };
 }
 
-// A fake tmux: sessions keyed by name, each with its own incarnation and pane text.
-export function fakeTmux(initial = {}) {
+function argAfter(args, flag) {
+  const at = args.indexOf(flag);
+  return at >= 0 ? args[at + 1] : undefined;
+}
+
+function lastLines(text, n) {
+  const lines = String(text).split('\n');
+  return lines.slice(Math.max(0, lines.length - n)).join('\n');
+}
+
+// A fake `tmux` executable. Sessions hold real multi-window panes with real scrollback, so
+// window selection and the early/recent capture split are genuinely exercised.
+//   session: { sessionId, createdAt, windows: [{ name, command, active, pane }] }
+export function fakeTmuxProcess(initial = {}) {
   const sessions = new Map(Object.entries(initial));
-  const captures = [];
+  const calls = [];
+  const behaviour = { delayMs: 0, fail: new Set() };
+
+  function windowsOf(name) {
+    const s = sessions.get(name);
+    return s ? (s.windows || []) : [];
+  }
+
+  function paneTextForTarget(target) {
+    const [name, windowName] = String(target).split(':');
+    const windows = windowsOf(name);
+    if (!windows.length) return null;
+    const hit = windowName ? windows.find(w => w.name === windowName) : windows.find(w => w.active) || windows[0];
+    return hit ? String(hit.pane || '') : null;
+  }
+
+  function respond(args) {
+    const cmd = args[0];
+    if (behaviour.fail.has(cmd)) throw Object.assign(new Error(`fake tmux: ${cmd} failed`), { code: 1 });
+    if (cmd === 'list-sessions') {
+      return [...sessions.entries()].map(([name, s]) => `${name}|${s.sessionId}|${s.createdAt}`).join('\n') + '\n';
+    }
+    if (cmd === 'list-panes') {
+      const name = argAfter(args, '-t');
+      const windows = windowsOf(name);
+      if (!windows.length) throw Object.assign(new Error('no such session'), { code: 1 });
+      return windows.map((w, i) => `${i}|${w.name}|${w.active ? 1 : 0}|${w.command || 'bash'}`).join('\n') + '\n';
+    }
+    if (cmd === 'display-message') {
+      const text = paneTextForTarget(argAfter(args, '-t'));
+      if (text === null) throw Object.assign(new Error('no such pane'), { code: 1 });
+      return `${text.split('\n').length}\n`;
+    }
+    if (cmd === 'capture-pane') {
+      const text = paneTextForTarget(argAfter(args, '-t'));
+      if (text === null) throw Object.assign(new Error('no such pane'), { code: 1 });
+      const start = argAfter(args, '-S');
+      const end = argAfter(args, '-E');
+      const lines = text.split('\n');
+      if (end !== undefined) {
+        // Early slice: -S -<history> -E -<history - earlyLines>
+        const from = Math.max(0, lines.length + Number(start));
+        const to = Math.max(from, lines.length + Number(end));
+        return lines.slice(from, to).join('\n') + '\n';
+      }
+      return lastLines(text, Math.abs(Number(start) || 400)) + '\n';
+    }
+    throw Object.assign(new Error(`fake tmux: unsupported ${cmd}`), { code: 127 });
+  }
+
+  const execFileImpl = (bin, args, opts, cb) => {
+    calls.push({ bin, args: [...args], opts });
+    const finish = () => {
+      if (behaviour.delayMs && opts && opts.timeout && behaviour.delayMs > opts.timeout) {
+        cb(Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }), '', '');
+        return;
+      }
+      try { cb(null, respond(args), ''); } catch (err) { cb(err, '', String(err.message)); }
+    };
+    if (behaviour.delayMs) setTimeout(finish, Math.min(behaviour.delayMs, 50));
+    else setImmediate(finish);
+    return { stdin: null };
+  };
+
   return {
-    sessions,
-    captures,
+    sessions, calls, behaviour, execFileImpl,
     set(name, data) { sessions.set(name, data); },
     kill(name) { sessions.delete(name); },
-    resolveSession(name) {
-      const s = sessions.get(name);
-      if (!s) return null;
-      return {
-        name,
-        sessionId: s.sessionId,
-        createdAt: s.createdAt,
-        projectName: s.projectName || 'fixture',
-        target: s.target || `${name}:0`,
-      };
-    },
-    capturePane(identity) {
-      captures.push({ name: identity.name, target: identity.target, sessionId: identity.sessionId });
-      const s = sessions.get(identity.name);
-      return s ? s.pane : '';
-    },
+    callsFor(cmd) { return calls.filter(c => c.args[0] === cmd); },
+    reset() { calls.length = 0; },
+  };
+}
+
+// A session whose single Claude window holds `pane`.
+export function claudeSession(id, pane, extra = {}) {
+  return {
+    sessionId: `$${id}`, createdAt: 1_600_000_000,
+    windows: [{ name: 'claude', command: 'claude', active: true, pane }],
+    ...extra,
+  };
+}
+
+// A session whose tmux-active window is a shell and whose Claude window is elsewhere —
+// the case where "the active window" and "the streamed window" disagree.
+export function shellActiveSession(id, shellPane, claudePane) {
+  return {
+    sessionId: `$${id}`, createdAt: 1_600_000_000,
+    windows: [
+      { name: 'shell', command: 'bash', active: true, pane: shellPane },
+      { name: 'claude', command: 'claude', active: false, pane: claudePane },
+    ],
   };
 }
 
 // Renders a fixture record as pane text the way the live pane shows a Claude turn, so the
 // evidence collector's own parser is exercised rather than bypassed.
-export function paneFor(record) {
+export function paneFor(record, { padLines = 0 } = {}) {
   const lines = [];
   for (const item of record.evidence || []) {
     if (item.role === 'user') lines.push(`> ${item.text}`);
     else lines.push(item.text);
     lines.push('');
   }
+  for (let i = 0; i < padLines; i += 1) lines.push(`filler output line ${i}`);
   lines.push('⏺ working…');
   return lines.join('\n');
 }
 
+// Builds the delivered resolver/capture stack on top of the fake process.
+export function tmuxStack(fake, { timeoutMs = 5000, recentLines = 400, earlyLines = 120, ttlMs = 0 } = {}) {
+  const tmux = briefTmux.createTmux({ execFileImpl: fake.execFileImpl, timeoutMs });
+  const resolver = briefTmux.createSessionResolver({ tmux, ttlMs });
+  const capture = briefTmux.createPaneCapture({ tmux, recentLines, earlyLines });
+  return { tmux, resolver, capture };
+}
+
 export function makeService(opts) {
   const {
-    tmux, clock, generator, storeFile, evidenceIntervalMs = 30000,
+    stack, clock, generator, storeFile, evidenceIntervalMs = 30000,
     literalRequired = true, generationTimeoutMs = 30000, fsImpl,
   } = opts;
   return new briefServiceMod.BriefService({
     storeFile,
-    resolveSession: name => tmux.resolveSession(name),
+    resolveSession: (name, windowName) => stack.resolver.resolve(name, windowName),
     collector: briefEvidence.createEvidenceCollector({
-      capturePane: identity => tmux.capturePane(identity),
+      capturePane: identity => stack.capture.capture(identity),
       now: clock.now,
     }),
     generator,

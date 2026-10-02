@@ -1,17 +1,17 @@
 // Brief service acceptance runner.
 //   node tests/acceptance/service.mjs --oracle <dir> --artifacts <dir> --result <file>
 //
-// Fakes live only at the external boundaries: tmux capture, the clock, the `claude` binary
-// and MATRIX_HOME. The evidence collector, generator, validator, store, service and HTTP
-// routes are the delivered modules.
+// The only fake is the tmux *process* and the `claude` binary; the clock and MATRIX_HOME are
+// injected. Session/window resolution, the two-capture pane reader, the evidence collector,
+// generator, validator, store, service and HTTP routes are all the delivered modules.
 
 import fs from 'node:fs';
 import path from 'node:path';
-import http from 'node:http';
 import { createRun, parseArgs } from './assertions.mjs';
 import {
-  briefGenerator, briefRoutes, tempDir, cleanupAll, fakeClock, fakeTmux, paneFor,
-  makeService, countingGenerator, fakeCli, loadCorpus, sleep,
+  briefGenerator, briefRoutes, briefTmux, tempDir, cleanupAll, fakeClock, fakeTmuxProcess,
+  claudeSession, shellActiveSession, paneFor, tmuxStack, makeService, countingGenerator,
+  fakeCli, loadCorpus, sleep,
 } from './service-support.mjs';
 import { evaluateCorpus } from './corpus.mjs';
 
@@ -28,72 +28,95 @@ const run = createRun([
 const corpus = loadCorpus(oracleDir);
 const byId = Object.fromEntries(corpus.map(r => [r.id, r]));
 const extractive = () => briefGenerator.createExtractiveGenerator();
-
-function sessionFor(id, overrides = {}) {
-  return {
-    sessionId: `$${id}`, createdAt: 1_600_000_000, projectName: 'shared-project',
-    target: `${id}:0`, pane: '', ...overrides,
-  };
-}
+const store = () => path.join(tempDir(), 'briefs.json');
 
 // ── BriefService::evidence_and_cache ───────────────────────────────────────────────────
 await run.runCase('BriefService::evidence_and_cache', async (t) => {
   const clock = fakeClock();
-  const tmux = fakeTmux({
-    A: sessionFor('A', { pane: paneFor(byId.f1) }),
-    B: sessionFor('B', { pane: paneFor(byId.f3) }),
-    E: sessionFor('E', { pane: paneFor(byId.f6) }),
-    D: sessionFor('D', { pane: '' }),
+  const fake = fakeTmuxProcess({
+    A: claudeSession('A', paneFor(byId.f1)),
+    B: claudeSession('B', paneFor(byId.f3)),
+    E: claudeSession('E', paneFor(byId.f6)),
+    D: claudeSession('D', ''),
+    // Active window is a shell; the Claude window holds the real work.
+    S: shellActiveSession('S', 'bash-5.2$ ls\nREADME.md\n', paneFor(byId.f2)),
   });
   const gen = countingGenerator(extractive());
-  const service = makeService({ tmux, clock, generator: gen, storeFile: path.join(tempDir(), 'briefs.json') });
+  const service = makeService({ stack: tmuxStack(fake), clock, generator: gen, storeFile: store() });
 
   // Opening never waits for generation.
-  const started = Date.now();
   const release = gen.hold();
-  const first = service.read('A');
-  t.ok(Date.now() - started < 60, 'GET returns immediately while the generator is held');
+  const started = Date.now();
+  const first = await service.read('A');
+  t.ok(Date.now() - started < 120, 'GET returns without waiting for a held generator');
   t.eq(first.status, 'generating', 'an unseen session reports generating, not filler');
   release();
   await service.settle();
 
-  // Exact-pane evidence only — captures are keyed by the resolved session, never a project.
-  t.ok(tmux.captures.every(c => c.name === 'A' && c.target === 'A:0'), 'only session A\'s own pane was captured');
-  const a1 = service.read('A');
+  // Exact-pane evidence only: every capture names session A's own Claude window.
+  const captures = fake.callsFor('capture-pane');
+  t.ok(captures.length > 0, 'the pane was actually captured through the process boundary');
+  t.ok(captures.every(c => c.args[c.args.indexOf('-t') + 1] === 'A:claude'), 'only session A\'s streamed pane was captured');
+  const a1 = await service.read('A');
   t.eq(a1.goal, byId.f1.expectedGoal, 'goal comes from A\'s pane');
   t.eq(a1.current, byId.f1.expectedCurrent, 'current work comes from A\'s pane');
+  t.eq(a1.session.target, 'A:claude', 'the brief names the pane it describes');
   t.ok(!JSON.stringify(a1).includes('misleading-payments'), 'the project label never leaks into the brief');
 
+  // The streamed window wins over the tmux-active window.
+  await service.read('S');
+  await service.settle();
+  const s1 = await service.read('S');
+  t.eq(s1.session.target, 'S:claude', 'resolution picks the Claude window, matching the stream');
+  t.eq(s1.current, byId.f2.expectedCurrent, 'the brief describes the Claude window, not the active shell');
+  // ...and an explicit window override is honoured, with its own cache entry.
+  const sShell = await service.read('S', 'shell');
+  t.eq(sShell.session.target, 'S:shell', 'an explicitly streamed window is resolved as asked');
+  t.eq(sShell.goal, null, 'the shell window has its own (empty) brief, not the Claude window\'s');
+  await service.settle();
+  t.eq((await service.read('S')).current, byId.f2.expectedCurrent, 'the Claude window brief is untouched by the shell window');
+
   // Same project, different session: no cross-contamination.
+  await service.read('B');
   await service.settle();
-  service.read('B');
-  await service.settle();
-  const b1 = service.read('B');
+  const b1 = await service.read('B');
   t.eq(b1.goal, byId.f3.expectedGoal, 'session B gets its own goal');
   t.ok(!String(b1.current).includes('judging'), 'B never shows A\'s work');
 
   // Unchanged evidence does not re-run the generator; coalesced reads do not either.
   const callsAfterFirst = gen.calls;
   clock.advance(31000);
-  for (let i = 0; i < 5; i += 1) service.read('A');
+  await Promise.all([0, 1, 2, 3, 4].map(() => service.read('A')));
   await service.settle();
   t.eq(gen.calls, callsAfterFirst, 'unchanged evidence reuses the cache and coalesces reads');
 
   // Changed work refreshes inside one evidence interval.
-  tmux.set('A', sessionFor('A', { pane: paneFor(byId.f2) }));
+  fake.set('A', claudeSession('A', paneFor(byId.f2)));
   clock.advance(31000);
-  service.tick();
+  await service.tick();
   await service.settle();
-  const a2 = service.read('A');
+  const a2 = await service.read('A');
   t.eq(a2.current, byId.f2.expectedCurrent, 'changed work refreshes after one evidence interval');
   t.eq(a2.goal, byId.f2.expectedGoal, 'the broad goal survives the refresh');
   t.ok(a2.generatedAt > a1.generatedAt, 'generatedAt advances only on a new successful generation');
 
+  // The goal must survive scrolling out of the recent capture window.
+  const longPane = [paneFor(byId.f1), ...Array.from({ length: 500 }, (_, i) => `routine output ${i}`),
+    '> We are now fixing inconsistent score normalization.', ''].join('\n');
+  fake.set('A', claudeSession('A', longPane));
+  clock.advance(31000);
+  await service.tick();
+  await service.settle();
+  const a3 = await service.read('A');
+  t.eq(a3.current, byId.f2.expectedCurrent, 'current work tracks the newest turn after the goal scrolled away');
+  t.eq(a3.goal, byId.f1.expectedGoal, 'the broad goal is retained once the opening turn leaves the tail window');
+  t.ok(fake.callsFor('capture-pane').some(c => c.args.includes('-E')), 'an early-history slice was captured as well as the tail');
+
   // Empty and unusable evidence abstain instead of inventing.
   for (const name of ['D', 'E']) {
-    service.read(name);
+    await service.read(name);
     await service.settle();
-    const brief = service.read(name);
+    const brief = await service.read(name);
     t.eq(brief.goal, null, `${name} invents no goal`);
     t.eq(brief.status, 'unavailable', `${name} reports unavailable`);
   }
@@ -106,24 +129,30 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
       return extractive().generate({ items });
     },
   };
-  const service2 = makeService({ tmux, clock, generator: flaky, storeFile: path.join(tempDir(), 'briefs.json') });
-  service2.read('B'); await service2.settle();
-  service2.read('A'); await service2.settle();
-  t.eq(service2.read('B').status, 'error', 'the failing session reports an error');
-  t.eq(service2.read('A').current, byId.f2.expectedCurrent, 'the healthy session still generates');
+  const service2 = makeService({ stack: tmuxStack(fake), clock, generator: flaky, storeFile: store() });
+  await service2.read('B'); await service2.settle();
+  await service2.read('A'); await service2.settle();
+  t.eq((await service2.read('B')).status, 'error', 'the failing session reports an error');
+  t.eq((await service2.read('A')).current, byId.f2.expectedCurrent, 'the healthy session still generates');
 
   // At most one generator globally.
   const slow = countingGenerator(extractive());
   const hold = slow.hold();
-  const service3 = makeService({ tmux, clock, generator: slow, storeFile: path.join(tempDir(), 'briefs.json') });
-  service3.read('A');
-  service3.read('B');
-  await sleep(10);
+  const service3 = makeService({ stack: tmuxStack(fake), clock, generator: slow, storeFile: store() });
+  await service3.read('A');
+  await service3.read('B');
+  // Resolution and capture are asynchronous now, so wait for the generator to be entered
+  // rather than guessing a delay.
+  for (let i = 0; i < 200 && slow.calls === 0; i += 1) await sleep(10);
+  t.eq(slow.calls, 1, 'exactly one generation started while the generator was held');
   t.eq(slow.maxConcurrent, 1, 'at most one generation runs globally');
   hold();
   await service3.settle();
 
-  t.note('evidence_and_cache', { captures: tmux.captures.slice(0, 8), generatorCalls: gen.calls });
+  t.note('evidence_and_cache', {
+    captureTargets: [...new Set(fake.callsFor('capture-pane').map(c => c.args[c.args.indexOf('-t') + 1]))],
+    generatorCalls: gen.calls,
+  });
 });
 
 // ── BriefService::generation_boundary ──────────────────────────────────────────────────
@@ -135,7 +164,45 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
   });
   const injection = byId.f4.evidence;
 
-  // Shell-free invocation with fixed arguments, evidence only on stdin.
+  // ---- the tmux process boundary itself ----
+  const hostile = `a'; rm -rf $HOME; echo '`;
+  const fake = fakeTmuxProcess({ [hostile]: claudeSession('H', paneFor(byId.f1)) });
+  const stack = tmuxStack(fake, { timeoutMs: 120 });
+  const resolved = await stack.resolver.resolve(hostile, '');
+  t.ok(resolved !== null, 'a session whose name contains shell metacharacters still resolves');
+  const listCall = fake.callsFor('list-panes')[0];
+  t.eq(listCall.bin, 'tmux', 'tmux is invoked as a fixed executable');
+  t.eq(listCall.args[listCall.args.indexOf('-t') + 1], hostile, 'the session name is one argv element, never a command fragment');
+  t.ok(!listCall.args.some(a => a.includes('tmux ') || a.includes('2>/dev/null')), 'no argument carries an embedded shell command');
+  t.ok(listCall.opts && listCall.opts.shell === undefined, 'no shell is requested');
+  t.ok(listCall.opts.timeout > 0 && listCall.opts.maxBuffer > 0, 'every tmux call is time- and size-bounded');
+  await stack.capture.capture(resolved);
+  t.ok(fake.callsFor('capture-pane').every(c => c.opts.timeout > 0), 'captures are time-bounded too');
+
+  // A wedged tmux is a classified timeout, not a hang and not a silent empty capture.
+  fake.behaviour.delayMs = 5000;
+  stack.resolver.invalidate();
+  const timedOut = await stack.capture.capture(resolved).then(() => null, e => e);
+  t.eq(timedOut && timedOut.code, 'tmux_timeout', 'a slow tmux capture is classified as a timeout');
+  fake.behaviour.delayMs = 0;
+  // A failing capture is explicit, never an empty string that reads as "nothing to say".
+  fake.behaviour.fail.add('capture-pane');
+  const failed = await stack.capture.capture(resolved).then(() => null, e => e);
+  t.eq(failed && failed.code, 'tmux_failed', 'a failing capture surfaces as an error');
+  t.ok(!String(failed.message).includes('copy generation'), 'the tmux error carries no pane text');
+  fake.behaviour.fail.clear();
+
+  // The service turns that into a visible error rather than a fake abstention.
+  const clock = fakeClock();
+  const failing = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f1)) });
+  const svc = makeService({ stack: tmuxStack(failing), clock, generator: extractive(), storeFile: store() });
+  failing.behaviour.fail.add('capture-pane');
+  await svc.read('A');
+  await svc.settle();
+  const captureFail = await svc.read('A');
+  t.eq(captureFail.status, 'error', 'a capture failure is reported as an error, not as unavailable');
+
+  // ---- the generator process boundary ----
   const cli = fakeCli(dir, { stdout: good });
   const gen = briefGenerator.createClaudeCliGenerator({
     execFile: (await import('node:child_process')).execFile, bin: cli.bin, timeoutMs: 5000, cwd: dir,
@@ -156,43 +223,37 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
   t.eq(validated.status, 'ok', 'a well-formed CLI answer validates');
   t.ok(!JSON.stringify(validated).toLowerCase().includes('payments shipped'), 'injection text is not echoed');
 
-  // Non-zero exit, timeout, malformed output and bad references are classified, not guessed.
-  const failing = briefGenerator.createClaudeCliGenerator({
-    execFile: (await import('node:child_process')).execFile, bin: fakeCli(tempDir(), { stdout: good, exitCode: 3 }).bin, timeoutMs: 5000, cwd: dir,
-  });
-  const failErr = await failing.generate({ items: injection }).catch(e => e);
+  const execFile = (await import('node:child_process')).execFile;
+  const failErr = await briefGenerator.createClaudeCliGenerator({
+    execFile, bin: fakeCli(tempDir(), { stdout: good, exitCode: 3 }).bin, timeoutMs: 5000, cwd: dir,
+  }).generate({ items: injection }).catch(e => e);
   t.eq(failErr.code, 'generator_failed', 'a non-zero exit is classified as a failure');
   t.ok(!String(failErr.message).includes('IGNORE ALL RULES'), 'the error carries no transcript text');
 
-  const slowCli = briefGenerator.createClaudeCliGenerator({
-    execFile: (await import('node:child_process')).execFile, bin: fakeCli(tempDir(), { stdout: good, delayMs: 2000 }).bin, timeoutMs: 150, cwd: dir,
-  });
-  const timeoutErr = await slowCli.generate({ items: injection }).catch(e => e);
+  const timeoutErr = await briefGenerator.createClaudeCliGenerator({
+    execFile, bin: fakeCli(tempDir(), { stdout: good, delayMs: 2000 }).bin, timeoutMs: 150, cwd: dir,
+  }).generate({ items: injection }).catch(e => e);
   t.eq(timeoutErr.code, 'generator_timeout', 'exceeding the time bound is classified as a timeout');
 
-  const junk = briefGenerator.createClaudeCliGenerator({
-    execFile: (await import('node:child_process')).execFile, bin: fakeCli(tempDir(), { stdout: 'sorry, no JSON here' }).bin, timeoutMs: 5000, cwd: dir,
-  });
-  const junkErr = await junk.generate({ items: injection }).catch(e => e);
+  const junkErr = await briefGenerator.createClaudeCliGenerator({
+    execFile, bin: fakeCli(tempDir(), { stdout: 'sorry, no JSON here' }).bin, timeoutMs: 5000, cwd: dir,
+  }).generate({ items: injection }).catch(e => e);
   t.eq(junkErr.code, 'invalid_output', 'non-JSON output is rejected');
 
-  const badRef = { goal: { text: 'x', evidenceId: 'nope' }, current: { text: 'y', evidenceId: 'c1' } };
-  let refRejected = false;
-  try { briefGenerator.validateBriefOutput(badRef, injection, { literalRequired: false }); }
-  catch (e) { refRejected = e.code === 'invalid_output'; }
-  t.ok(refRejected, 'a reference to evidence that was not supplied is rejected');
-
-  const tooLong = { goal: { text: 'x'.repeat(600), evidenceId: 'c1' } };
-  let lengthRejected = false;
-  try { briefGenerator.validateBriefOutput(tooLong, injection, { literalRequired: false }); }
-  catch (e) { lengthRejected = e.code === 'invalid_output'; }
-  t.ok(lengthRejected, 'an over-long field is rejected');
+  const reject = (output, why) => {
+    let code = null;
+    try { briefGenerator.validateBriefOutput(output, injection, { literalRequired: false }); }
+    catch (e) { code = e.code; }
+    t.eq(code, 'invalid_output', why);
+  };
+  reject({ goal: { text: 'x', evidenceId: 'nope' }, current: { text: 'y', evidenceId: 'c1' } },
+    'a reference to evidence that was not supplied is rejected');
+  reject({ goal: { text: 'x'.repeat(600), evidenceId: 'c1' } }, 'an over-long field is rejected');
 
   // Evidence itself is bounded before it ever reaches a generator.
-  const huge = 'x'.repeat(200000);
-  const ev = (await import('node:module')).createRequire(import.meta.url)(
-    path.join(import.meta.dirname, '..', '..', 'server', 'lib', 'brief-evidence.js'));
-  const bounded = ev.buildEvidence({ capture: `> ${huge}\n`, evidenceAt: 1 });
+  const bounded = briefTmux && (await import('node:module')).createRequire(import.meta.url)(
+    path.join(import.meta.dirname, '..', '..', 'server', 'lib', 'brief-evidence.js'))
+    .buildEvidence({ capture: `> ${'x'.repeat(200000)}\n`, evidenceAt: 1 });
   t.ok(bounded.items.every(i => i.text.length <= 8 * 1024), 'evidence items are capped');
 
   // The deterministic extractor meets the same semantics without any CLI.
@@ -204,7 +265,7 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
   fs.mkdirSync(artifactDir, { recursive: true });
   fs.writeFileSync(path.join(artifactDir, 'brief-corpus-report.json'), JSON.stringify(report, null, 2));
   t.note('corpus', report.metrics);
-  t.note('cliInvocation', { argv: call.argv, cwd: call.cwd, stdinBytes: call.stdin.length });
+  t.note('tmuxInvocation', { bin: listCall.bin, args: listCall.args, timeout: listCall.opts.timeout });
 });
 
 // ── BriefService::edits_storage_identity ───────────────────────────────────────────────
@@ -212,85 +273,83 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   const clock = fakeClock();
   const home = tempDir();
   const storeFile = path.join(home, 'briefs.json');
-  const tmux = fakeTmux({ A: sessionFor('A', { pane: paneFor(byId.f1) }) });
-  const gen = countingGenerator(extractive());
-  let service = makeService({ tmux, clock, generator: gen, storeFile });
+  const fake = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f1)) });
+  let service = makeService({ stack: tmuxStack(fake), clock, generator: countingGenerator(extractive()), storeFile });
 
-  service.read('A');
+  await service.read('A');
   await service.settle();
-  let brief = service.read('A');
-  const generatedGoal = brief.goal;
+  let brief = await service.read('A');
 
   // A valid edit wins over the generated value and survives further generation.
-  brief = service.patch('A', { goal: 'ship the new judge', revision: brief.revision });
+  brief = await service.patch('A', { goal: 'ship the new judge', revision: brief.revision });
   t.eq(brief.goal, 'ship the new judge', 'the edit becomes the effective goal');
   t.eq(brief.overrides.current, null, 'the other field keeps no override');
-  tmux.set('A', sessionFor('A', { pane: paneFor(byId.f2) }));
+  fake.set('A', claudeSession('A', paneFor(byId.f2)));
   clock.advance(31000);
-  service.tick();
+  await service.tick();
   await service.settle();
-  brief = service.read('A');
+  brief = await service.read('A');
   t.eq(brief.goal, 'ship the new judge', 'a later generation cannot clobber an edit');
   t.eq(brief.current, byId.f2.expectedCurrent, 'the un-edited field still refreshes');
 
   // Edit the second field, then clear only that one.
-  brief = service.patch('A', { current: 'hand-written note', revision: brief.revision });
+  brief = await service.patch('A', { current: 'hand-written note', revision: brief.revision });
   t.eq(brief.current, 'hand-written note', 'the second field can be edited separately');
-  brief = service.patch('A', { current: null, revision: brief.revision });
+  brief = await service.patch('A', { current: null, revision: brief.revision });
   t.eq(brief.current, byId.f2.expectedCurrent, 'clearing restores the newest generated value');
   t.eq(brief.goal, 'ship the new judge', 'clearing one field leaves the other edit alone');
 
   // Invalid input is refused without changing anything.
-  const reject = (body, code, why) => {
+  const reject = async (body, code, why) => {
     let err = null;
-    try { service.patch('A', body); } catch (e) { err = e; }
+    try { await service.patch('A', body); } catch (e) { err = e; }
     t.eq(err && err.code, code, why);
   };
-  reject({ goal: 'x'.repeat(600), revision: brief.revision }, 'invalid_value', 'an over-long edit is refused');
-  reject({ goal: 42, revision: brief.revision }, 'invalid_value', 'a non-string edit is refused');
-  reject({ nonsense: 'x', revision: brief.revision }, 'unknown_field', 'an unknown field is refused');
-  reject({ goal: 'x' }, 'invalid_revision', 'an edit without a revision is refused');
-  reject({ goal: 'x', revision: brief.revision - 1 }, 'revision_conflict', 'a stale revision is a conflict');
-  t.eq(service.read('A').goal, 'ship the new judge', 'no rejected edit changed stored state');
+  await reject({ goal: 'x'.repeat(600), revision: brief.revision }, 'invalid_value', 'an over-long edit is refused');
+  await reject({ goal: 42, revision: brief.revision }, 'invalid_value', 'a non-string edit is refused');
+  await reject({ nonsense: 'x', revision: brief.revision }, 'unknown_field', 'an unknown field is refused');
+  await reject({ goal: 'x' }, 'invalid_revision', 'an edit without a revision is refused');
+  await reject({ goal: 'x', revision: brief.revision - 1 }, 'revision_conflict', 'a stale revision is a conflict');
+  t.eq((await service.read('A')).goal, 'ship the new judge', 'no rejected edit changed stored state');
 
   let unknownErr = null;
-  try { service.patch('../../etc/passwd', { goal: 'x', revision: 0 }); } catch (e) { unknownErr = e; }
+  try { await service.patch('../../etc/passwd', { goal: 'x', revision: 0 }); } catch (e) { unknownErr = e; }
   t.ok(unknownErr && (unknownErr.code === 'invalid_session' || unknownErr.code === 'unknown_session'),
     'a forged filesystem path is not a session');
   let goneErr = null;
-  try { service.read('nope'); } catch (e) { goneErr = e; }
+  try { await service.read('nope'); } catch (e) { goneErr = e; }
   t.eq(goneErr && goneErr.status, 404, 'an unknown session is a 404');
 
   // A conflict is reported through HTTP as 409, not as success.
-  const conflict = briefRoutes.respond(service, 'PATCH', 'A', { goal: 'x', revision: 0 });
+  const conflict = await briefRoutes.respond(service, 'PATCH', 'A', { goal: 'x', revision: 0 }, '');
   t.eq(conflict.status, 409, 'HTTP reports a revision conflict as 409');
   t.eq(conflict.body.ok, false, 'a conflict is never reported as ok');
 
   // Overrides survive a restart.
-  service = makeService({ tmux, clock, generator: extractive(), storeFile });
-  t.eq(service.read('A').goal, 'ship the new judge', 'the edit survives a service restart');
+  service = makeService({ stack: tmuxStack(fake), clock, generator: extractive(), storeFile });
+  t.eq((await service.read('A')).goal, 'ship the new judge', 'the edit survives a service restart');
 
   // A new incarnation under the same tmux name inherits nothing.
-  tmux.set('A', { ...sessionFor('A', { pane: paneFor(byId.f3) }), sessionId: '$A2', createdAt: 1_700_000_500 });
-  const reborn = service.read('A');
+  fake.set('A', { ...claudeSession('A', paneFor(byId.f3)), sessionId: '$A2', createdAt: 1_700_000_500 });
+  const reborn = await service.read('A');
   t.eq(reborn.overrides.goal, null, 'a reused tmux name inherits no override');
   t.eq(reborn.goal, null, 'a reused tmux name inherits no generated text');
 
   // Corrupt storage is visible, not silently treated as "no edits".
   fs.writeFileSync(storeFile, '{ not json');
-  const corrupt = makeService({ tmux, clock, generator: extractive(), storeFile });
-  t.ok(corrupt.read('A').storageError, 'corrupt storage is surfaced');
+  const corrupt = makeService({ stack: tmuxStack(fake), clock, generator: extractive(), storeFile });
+  t.ok((await corrupt.read('A')).storageError, 'corrupt storage is surfaced');
 
   // An unwritable store fails loudly; the edit is never acknowledged as saved.
-  const tmux2 = fakeTmux({ A: sessionFor('A', { pane: paneFor(byId.f1) }) });
   const readonly = makeService({
-    tmux: tmux2, clock, generator: extractive(), storeFile: path.join(home, 'ro', 'briefs.json'),
+    stack: tmuxStack(fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f1)) })), clock,
+    generator: extractive(), storeFile: path.join(home, 'ro', 'briefs.json'),
     fsImpl: { ...fs, writeFileSync: () => { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; } },
   });
   let writeErr = null;
-  try { readonly.patch('A', { goal: 'nope', revision: 0 }); } catch (e) { writeErr = e; }
+  try { await readonly.patch('A', { goal: 'nope', revision: 0 }); } catch (e) { writeErr = e; }
   t.eq(writeErr && writeErr.status, 500, 'a storage failure is an error, not a success');
-  t.eq(readonly.read('A').overrides.goal, null, 'a failed write leaves no phantom override');
+  t.eq((await readonly.read('A')).overrides.goal, null, 'a failed write leaves no phantom override');
 
   t.note('storageFile', storeFile);
 });

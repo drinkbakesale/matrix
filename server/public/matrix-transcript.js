@@ -42,10 +42,15 @@
     var mode = 'live';
     var epoch = 0;
     var following = true;
+    // What the user was doing when protection began. Resume restores it: somebody who paused
+    // while reading history must come back to the same place, not get yanked to the bottom.
+    var followingAtPause = true;
+    var scrollTopAtPause = 0;
     var staged = emptyStaged();
     var pendingTimer = null;
     var releaseTimer = null;
     var gestureY = 0;
+    var gesturePointers = [];
 
     function selectionInViewer() {
       if (typeof global.getSelection !== 'function') return false;
@@ -137,41 +142,73 @@
         notify();
         return;
       }
+      // A reader who was scrolled up keeps their place: applying staged data appends below
+      // (or replaces, on a reconnect snapshot), so restoring scrollTop keeps the same view.
+      var keepTop = !following;
+      var priorTop = viewer.scrollTop;
       if (held.snapshot !== null) { viewer.replaceChildren(); appendStream(held.snapshot); }
       for (var i = 0; i < held.outputs.length; i++) appendStream(held.outputs[i]);
       if (held.screen !== null) applyScreen(held.screen);
       prune();
-      autoScroll();
+      if (keepTop) {
+        var maxTop = Math.max(0, viewer.scrollHeight - viewer.clientHeight);
+        viewer.scrollTop = Math.min(priorTop, maxTop);
+      } else {
+        autoScroll();
+      }
+      notify();
+    }
+
+    // Leaving `live` snapshots what the user was doing, so Resume can put it back.
+    function enterProtected(next) {
+      if (mode === 'live') {
+        followingAtPause = following;
+        scrollTopAtPause = viewer.scrollTop;
+      }
+      mode = next;
       notify();
     }
 
     function setMode(next) {
       if (mode === next) return;
-      mode = next;
-      if (mode === 'live') flush();
-      else notify();
+      if (next === 'live') { mode = next; flush(); return; }
+      enterProtected(next);
     }
 
-    function beginGesture(clientY) {
+    // Moves and releases only count when they belong to the pointer that began the gesture.
+    // Without this, an unrelated pointer cancels the protection: scrolling the transcript
+    // under a stationary cursor makes the engine emit a mousemove at the old coordinates,
+    // which looked like a 140px drag and released a finger that had not moved at all.
+    function beginGesture(clientY, pointerKey) {
       if (mode === 'paused') return;
       cancelTimer(releaseTimer); releaseTimer = null;
-      gestureY = clientY || 0;
-      if (mode === 'live') setMode('pending');
+      if (mode === 'live') {
+        gestureY = clientY || 0;
+        gesturePointers = [];
+        setMode('pending');
+      }
+      if (pointerKey && gesturePointers.indexOf(pointerKey) === -1) gesturePointers.push(pointerKey);
       cancelTimer(pendingTimer);
       pendingTimer = laterTimer(function () {
         if (mode === 'pending' && !selectionInViewer()) setMode('live');
       }, PENDING_SAFETY_MS);
     }
 
-    function moveGesture(clientY) {
+    function ownsGesture(pointerKey) {
+      return !pointerKey || gesturePointers.length === 0 || gesturePointers.indexOf(pointerKey) !== -1;
+    }
+
+    function moveGesture(clientY, pointerKey) {
       if (mode !== 'pending') return;
+      if (!ownsGesture(pointerKey)) return;
       if (Math.abs((clientY || 0) - gestureY) < MOVE_SLOP) return;
       if (selectionInViewer()) { setMode('selecting'); return; }
       setMode('live');                     // a drag with no selection is a scroll
     }
 
-    function endGesture() {
+    function endGesture(pointerKey) {
       if (mode === 'paused') return;
+      if (!ownsGesture(pointerKey)) return;
       cancelTimer(releaseTimer);
       releaseTimer = laterTimer(function () {
         releaseTimer = null;
@@ -190,20 +227,28 @@
       if (target && typeof target.addEventListener === 'function') target.addEventListener(type, handler, opt);
     }
 
-    on(viewer, 'pointerdown', function (e) { beginGesture(e && e.clientY); });
+    var pointerKey = function (e) { return 'p' + (e && e.pointerId !== undefined ? e.pointerId : 0); };
+    var touchKey = function (t) { return 't' + (t && t.identifier !== undefined ? t.identifier : 0); };
+    var firstTouch = function (e) {
+      if (!e) return null;
+      if (e.touches && e.touches[0]) return e.touches[0];
+      return e.changedTouches && e.changedTouches[0] ? e.changedTouches[0] : null;
+    };
+
+    on(viewer, 'pointerdown', function (e) { beginGesture(e && e.clientY, pointerKey(e)); });
     on(viewer, 'touchstart', function (e) {
-      var t = e && e.touches && e.touches[0];
-      beginGesture(t ? t.clientY : 0);
+      var t = firstTouch(e);
+      beginGesture(t ? t.clientY : 0, touchKey(t));
     }, { passive: true });
-    on(viewer, 'pointermove', function (e) { moveGesture(e && e.clientY); });
+    on(viewer, 'pointermove', function (e) { moveGesture(e && e.clientY, pointerKey(e)); });
     on(viewer, 'touchmove', function (e) {
-      var t = e && e.touches && e.touches[0];
-      moveGesture(t ? t.clientY : 0);
+      var t = firstTouch(e);
+      moveGesture(t ? t.clientY : 0, touchKey(t));
     }, { passive: true });
-    on(viewer, 'pointerup', endGesture);
-    on(viewer, 'pointercancel', endGesture);
-    on(viewer, 'touchend', endGesture, { passive: true });
-    on(viewer, 'touchcancel', endGesture, { passive: true });
+    on(viewer, 'pointerup', function (e) { endGesture(pointerKey(e)); });
+    on(viewer, 'pointercancel', function (e) { endGesture(pointerKey(e)); });
+    on(viewer, 'touchend', function (e) { endGesture(touchKey(firstTouch(e))); }, { passive: true });
+    on(viewer, 'touchcancel', function (e) { endGesture(touchKey(firstTouch(e))); }, { passive: true });
     on(viewer, 'scroll', function () { following = isNearBottom(); }, { passive: true });
     on(doc, 'selectionchange', onSelectionChange);
 
@@ -222,6 +267,9 @@
         staged = emptyStaged();
         mode = 'live';
         following = true;
+        followingAtPause = true;
+        scrollTopAtPause = 0;
+        gesturePointers = [];
         cancelTimer(pendingTimer); pendingTimer = null;
         cancelTimer(releaseTimer); releaseTimer = null;
         viewer.replaceChildren();
@@ -257,15 +305,22 @@
       pauseForCopy: function () {
         cancelTimer(releaseTimer); releaseTimer = null;
         cancelTimer(pendingTimer); pendingTimer = null;
-        if (mode !== 'paused') { mode = 'paused'; notify(); }
+        if (mode !== 'paused') enterProtected('paused');
       },
 
+      // Resume restores the reading state protection interrupted. It never forces the view
+      // to the bottom: a user who paused while reading history stays where they were, and
+      // only a user who was following the bottom resumes following it.
       resume: function () {
-        if (mode === 'paused') { mode = 'live'; flush(); }
-        else setMode('live');
-        following = true;
-        autoScroll();
+        if (mode === 'live') return;
+        following = followingAtPause;
+        if (!following) viewer.scrollTop = scrollTopAtPause;
+        mode = 'live';
+        flush();
       },
+
+      // Test/diagnostic view of the reading state, so a browser case can assert it.
+      following: function () { return following; },
 
       // What the user sees, as plain text: one block per message, so a copy keeps the line
       // breaks the transcript shows. Control labels are never part of it.

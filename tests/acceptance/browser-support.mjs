@@ -60,15 +60,15 @@ export const reconnect = (page, dump) => page.evaluate((text) => {
   }, 1700));
 }, dump);
 
-export const startStream = (page, periodMs = 100) => page.evaluate((ms) => {
+export const startStream = (page, periodMs = 100, label = '') => page.evaluate(([ms, tag]) => {
   window.__n = 0;
   window.__timer = setInterval(() => {
     const s = window.__sockets.at(-1);
     const n = ++window.__n;
     s.onmessage({ data: JSON.stringify({ type: 'output', data: `stream line ${n}\n` }) });
-    s.onmessage({ data: JSON.stringify({ type: 'screen', data: `screen refresh ${n}\n` }) });
+    s.onmessage({ data: JSON.stringify({ type: 'screen', data: `screen refresh ${n}${tag}\n` }) });
   }, ms);
-}, periodMs);
+}, [periodMs, label]);
 
 export const stopStream = page => page.evaluate(() => { clearInterval(window.__timer); return window.__n; });
 
@@ -86,31 +86,83 @@ export async function dragSelect(page, box, { fromRatio = 0.08, toRatio = 0.8, h
   return page.evaluate(() => String(window.getSelection()));
 }
 
-// Best-effort native long press. WebKit has no constructible Touch, so the touch point comes
-// from document.createTouch/createTouchList; this is honestly recorded as a synthetic touch
-// sequence driven through the real event system, never as proof an iOS callout appeared.
-export async function touchLongPress(page, selector, holdMs = 900) {
-  return page.evaluate(async ([sel, hold]) => {
+// SYNTHETIC. Scripted DOM events only: `isTrusted` is false, so this can demonstrate a
+// causal DOM race but can never establish whether a real long press would select text.
+// It completes the gesture (release) instead of leaving a pointer down forever.
+export async function syntheticLongPress(page, selector, holdMs = 900, { release = true } = {}) {
+  return page.evaluate(async ([sel, hold, doRelease]) => {
     const el = document.querySelector(sel);
-    if (!el) return { attempted: false, reason: 'target missing' };
+    if (!el) return { kind: 'synthetic', attempted: false, reason: 'target missing' };
     const rect = el.getBoundingClientRect();
     const x = rect.x + Math.min(30, rect.width / 3);
     const y = rect.y + Math.min(14, rect.height / 2);
-    const report = { attempted: true, x, y, touchConstructor: null, selection: '', calloutStyle: null };
+    const report = {
+      kind: 'synthetic dispatchEvent sequence (isTrusted=false)', attempted: true, x, y,
+      touchConstructor: null, selectionDuringHold: '', selectionAfterRelease: '', released: false,
+      textAtPress: el.textContent, textDuringHold: '',
+    };
     try { new Touch({ identifier: 1, target: el, clientX: x, clientY: y }); report.touchConstructor = 'constructible'; }
     catch (e) { report.touchConstructor = `illegal: ${e.message}`; }
-    let list = null;
-    if (typeof document.createTouch === 'function' && typeof document.createTouchList === 'function') {
-      list = document.createTouchList(document.createTouch(window, el, 1, x, y, x, y));
-    }
+    const list = (typeof document.createTouchList === 'function' && typeof document.createTouch === 'function')
+      ? document.createTouchList(document.createTouch(window, el, 1, x, y, x, y))
+      : null;
+    const readMode = () => (typeof transcript === 'undefined' ? 'n/a' : transcript.mode());
+    report.modeBeforePress = readMode();
     el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', clientX: x, clientY: y }));
+    report.modeAfterPointerDown = readMode();
     if (list) el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, touches: list, targetTouches: list, changedTouches: list }));
+    report.modeAfterTouchStart = readMode();
     await new Promise(r => setTimeout(r, hold));
-    report.selection = String(window.getSelection());
+    report.modeDuringHold = readMode();
+    report.selectionDuringHold = String(window.getSelection());
+    report.textDuringHold = el.textContent;
+    report.stillConnected = el.isConnected;
     report.calloutStyle = getComputedStyle(el).webkitTouchCallout || null;
     report.userSelect = getComputedStyle(el).webkitUserSelect || getComputedStyle(el).userSelect || null;
+    if (doRelease) {
+      const empty = typeof document.createTouchList === 'function' ? document.createTouchList() : null;
+      if (list) el.dispatchEvent(new TouchEvent('touchend', { bubbles: true, touches: empty, targetTouches: empty, changedTouches: list }));
+      el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'touch', clientX: x, clientY: y }));
+      report.released = true;
+      await new Promise(r => setTimeout(r, 150));
+      report.selectionAfterRelease = String(window.getSelection());
+    }
     return report;
-  }, [selector, holdMs]);
+  }, [selector, holdMs, release]);
+}
+
+// TRUSTED INPUT. Driven through Playwright's input API, so the engine generates the events
+// itself (isTrusted=true) exactly as it would for a user. It is still not an iOS finger:
+// WebKit under Playwright has no SpringBoard and no selection handles, and `touchscreen`
+// exposes only a tap, so a press-and-hold has to be a held pointer.
+export async function trustedLongPress(page, box, holdMs = 900) {
+  const x = box.x + Math.min(30, box.width / 3);
+  const y = box.y + Math.min(14, box.height / 2);
+  const report = { kind: 'trusted Playwright input (isTrusted=true)', x, y, tap: null, hold: null, selection: '', error: null };
+  try {
+    await page.touchscreen.tap(x, y);
+    report.tap = 'touchscreen.tap delivered';
+  } catch (err) {
+    report.tap = `unsupported: ${err.message}`;
+  }
+  const screenText = () => page.evaluate(() => {
+    const el = document.querySelector('#terminal .msg-screen');
+    return el ? el.textContent : '';
+  });
+  try {
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    report.textAtPress = await screenText();
+    await page.waitForTimeout(holdMs);
+    report.textDuringHold = await screenText();
+    report.selectionDuringHold = await page.evaluate(() => String(window.getSelection()));
+    await page.mouse.up();
+    report.hold = `held ${holdMs}ms and released`;
+    report.selection = await page.evaluate(() => String(window.getSelection()));
+  } catch (err) {
+    report.error = err.message;
+  }
+  return report;
 }
 
 export function saveArtifact(dir, name, value) {

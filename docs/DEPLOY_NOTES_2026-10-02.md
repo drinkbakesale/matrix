@@ -53,6 +53,27 @@ the installed CLI non-interactively (`-p --tools "" --strict-mcp-config
 --no-session-persistence`, prompt on stdin, no shell, no API key, 30 s bound, isolated cwd).
 It will usually read better on real transcripts.
 
+## Running the tests
+
+The runtime dependency graph is untouched: `package.json` and `package-lock.json` are
+byte-identical to the base commit, so deploying installs nothing new. The browser acceptance
+runners need Playwright, which is pinned **outside** the runtime manifest in a private
+`tests/acceptance/package.json` with its own small lockfile, so it can never end up in a
+production install.
+
+```sh
+npm ci                                  # runtime deps, unchanged
+node --test --test-reporter=tap tests/*.test.js   # the fast suite, no browser needed
+
+npm ci --prefix tests/acceptance        # test-only: playwright 1.59.1, locked
+npm --prefix tests/acceptance run engines         # downloads the pinned WebKit + Chromium
+node tests/acceptance/service.mjs --oracle <oracle_dir> --artifacts <dir> --result <dir>/service.json
+node tests/acceptance/browser.mjs --oracle <oracle_dir> --artifacts <dir> --result <dir>/browser.json
+```
+
+Every acceptance runner resolves Playwright from `tests/acceptance/node_modules`, never from
+the repository root. Do not run any of this in the live `~/Projects/matrix` checkout.
+
 ## Limitations you should know about
 
 * **The `claude` generator's accuracy is not measured.** The 6/6 useful-summary, 2/2

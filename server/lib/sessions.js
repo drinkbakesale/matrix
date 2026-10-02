@@ -4,7 +4,7 @@
 // Every live session is returned and stays independently addressable: `name`/`targetSession`
 // is the opaque tmux routing name and `projectName` is the project it works on. Sessions that
 // share a project get an instance suffix rather than being merged away. Extracted from
-// server.js with no behaviour change, plus `sessionIncarnation` for brief identity.
+// server.js with no behaviour change.
 
 const { execSync } = require('child_process');
 const os = require('os');
@@ -124,22 +124,6 @@ function listLiveSessions() {
   }
 }
 
-// The exact live session incarnation a brief belongs to, or null when it is gone.
-function sessionIncarnation(name) {
-  const cached = attention.lastSessions();
-  const fresh = cached.length && Date.now() - attention.lastSessionsAt() < 5000 ? cached : listLiveSessions();
-  const hit = fresh.find(s => s.name === name);
-  if (!hit) return null;
-  const pane = hit.windowList.find(w => w.active);
-  return {
-    name: hit.name,
-    sessionId: hit.sessionId || '',
-    createdAt: hit.createdAt ?? null,
-    projectName: hit.projectName,
-    target: pane ? `${hit.name}:${pane.index}` : hit.name,
-  };
-}
-
 // Resolve a notification against recent session data; re-list tmux when that data is
 // stale or does not contain the target.
 function resolveLiveNotificationTarget(input) {
@@ -184,14 +168,10 @@ function sweepAttention() {
   }
 }
 
-// Bounded capture of the exact pane a session streams, used as brief evidence.
-function capturePaneText(identity, lines = 400) {
-  try {
-    return tmux(`tmux capture-pane -t '${identity.target || identity.name}' -p -S -${lines}`, { maxBuffer: 8 * 1024 * 1024 });
-  } catch { return ''; }
-}
+// Brief session resolution and pane capture deliberately do NOT live here: they run on the
+// shell-free, asynchronous, timeout-bounded boundary in server/lib/brief-tmux.js so no
+// request can block on tmux and no session name can reach a shell.
 
 module.exports = {
   listLiveSessions, resolveLiveNotificationTarget, sweepAttention,
-  sessionIncarnation, capturePaneText,
 };

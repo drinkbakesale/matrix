@@ -1,0 +1,12 @@
+{
+  "name": "matrix-acceptance",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Test-only dependencies for the Matrix browser acceptance runners. Kept out of the root manifest so the runtime dependency graph and its lockfile stay exactly as shipped.",
+  "scripts": {
+    "engines": "playwright install webkit chromium"
+  },
+  "devDependencies": {
+    "playwright": "1.59.1"
+  }
+}

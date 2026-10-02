@@ -23,11 +23,13 @@ function parseBriefPath(pathname) {
   }
 }
 
-// Pure: (method, session name, parsed body) -> { status, body }
-function respond(service, method, name, body) {
+// (method, session name, parsed body, streamed window) -> { status, body }.
+// Asynchronous because session/pane resolution is an awaited, cached, bounded process call;
+// it still never waits for generation.
+async function respond(service, method, name, body, windowName) {
   try {
-    if (method === 'GET') return { status: 200, body: { ok: true, brief: service.read(name) } };
-    if (method === 'PATCH') return { status: 200, body: { ok: true, brief: service.patch(name, body) } };
+    if (method === 'GET') return { status: 200, body: { ok: true, brief: await service.read(name, windowName) } };
+    if (method === 'PATCH') return { status: 200, body: { ok: true, brief: await service.patch(name, body, windowName) } };
     return { status: 405, body: { ok: false, code: 'method_not_allowed', message: 'use GET or PATCH' } };
   } catch (err) {
     if (err instanceof BriefRequestError) {
@@ -38,13 +40,19 @@ function respond(service, method, name, body) {
   }
 }
 
+// `window` names the tmux window the client is actually streaming, so the brief describes
+// the pane on screen rather than whichever window happens to be tmux-active.
+function windowParam(value) {
+  return typeof value === 'string' ? value : '';
+}
+
 function mountExpress(app, service) {
-  app.get('/api/sessions/:name/brief', (req, res) => {
-    const { status, body } = respond(service, 'GET', req.params.name, null);
+  app.get('/api/sessions/:name/brief', async (req, res) => {
+    const { status, body } = await respond(service, 'GET', req.params.name, null, windowParam(req.query.window));
     res.status(status).json(body);
   });
-  app.patch('/api/sessions/:name/brief', (req, res) => {
-    const { status, body } = respond(service, 'PATCH', req.params.name, req.body);
+  app.patch('/api/sessions/:name/brief', async (req, res) => {
+    const { status, body } = await respond(service, 'PATCH', req.params.name, req.body, windowParam(req.query.window));
     res.status(status).json(body);
   });
 }
@@ -84,7 +92,8 @@ function createNodeHandler(service) {
       res.end(JSON.stringify(body));
       return true;
     }
-    const { status, body } = respond(service, req.method, name, payload);
+    const query = new URL(req.url, 'http://localhost').searchParams;
+    const { status, body } = await respond(service, req.method, name, payload, windowParam(query.get('window')));
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(body));
     return true;

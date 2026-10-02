@@ -4,8 +4,9 @@
 // The phone is a LOG VIEWER, not a screen mirror: the full scrollback is sent on every
 // connection and growth is sent as `output`; a same-length change is sent as `screen`, which
 // the client treats as a replaceable block. Extracted from server.js with no behaviour
-// change, except that a capture failure now increments the error counter instead of being
-// silently flattened into an empty string (see the audit for why that mattered).
+// change — including the fact that a failed capture is flattened into an empty string. That
+// is a real defect (the terminal silently stops updating), but fixing it is audit
+// improvement 3, a separate build, not something this extraction may change.
 
 const { execSync } = require('child_process');
 const attention = require('./attention');
@@ -65,9 +66,13 @@ function attach(wss, { port }) {
     // 1 MB execSync default and would otherwise fail with ENOBUFS (the empty-terminal
     // symptom: pane-size sent, output never sent).
     function captureAll() {
-      return execSync(`tmux capture-pane -t '${target}' -p -S - 2>/dev/null`, {
-        encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-      });
+      try {
+        return execSync(`tmux capture-pane -t '${target}' -p -S - 2>/dev/null`, {
+          encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+        });
+      } catch {
+        return '';
+      }
     }
 
     function initStreaming() {
@@ -76,10 +81,7 @@ function attach(wss, { port }) {
 
       // Always send the full scrollback on connect — the client replaces its viewer with
       // this first output, for a fresh open and an automatic reconnect alike.
-      let all = '';
-      try { all = captureAll(); } catch (err) {
-        console.error(`[ws] initial capture failed for ${target}: ${err.code || err.message}`);
-      }
+      const all = captureAll();
       if (all.trim()) ws.send(JSON.stringify({ type: 'output', data: all.replace(/\n/g, '\r\n') }));
       lastLineCount = all.split('\n').length;
       lastFullText = all;

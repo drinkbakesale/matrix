@@ -10,7 +10,8 @@ const notifyRoutes = require('./lib/notify-routes');
 const voiceRoutes = require('./lib/voice-routes');
 const projectRoutes = require('./lib/project-routes');
 const paneStream = require('./lib/pane-stream');
-const { listLiveSessions, sweepAttention, sessionIncarnation, capturePaneText } = require('./lib/sessions');
+const { listLiveSessions, sweepAttention } = require('./lib/sessions');
+const { createTmux, createSessionResolver, createPaneCapture } = require('./lib/brief-tmux');
 const { createEvidenceCollector } = require('./lib/brief-evidence');
 const { createExtractiveGenerator, createClaudeCliGenerator } = require('./lib/brief-generator');
 const { BriefService, DEFAULT_EVIDENCE_INTERVAL_MS } = require('./lib/brief-service');
@@ -63,10 +64,15 @@ function selectGenerator() {
 }
 
 const { generator, literalRequired } = selectGenerator();
+// Shell-free, async, bounded tmux access for briefs only; the window the client streams is
+// what gets resolved and captured.
+const briefTmux = createTmux({});
+const briefResolver = createSessionResolver({ tmux: briefTmux });
+const briefCapture = createPaneCapture({ tmux: briefTmux });
 const briefService = new BriefService({
   storeFile: config.BRIEF_PATH,
-  resolveSession: sessionIncarnation,
-  collector: createEvidenceCollector({ capturePane: identity => capturePaneText(identity) }),
+  resolveSession: (name, window) => briefResolver.resolve(name, window),
+  collector: createEvidenceCollector({ capturePane: identity => briefCapture.capture(identity) }),
   generator,
   literalRequired,
   evidenceIntervalMs: parseInt(process.env.MATRIX_BRIEF_INTERVAL_MS, 10) || DEFAULT_EVIDENCE_INTERVAL_MS,
@@ -75,7 +81,9 @@ const briefService = new BriefService({
 briefRoutes.mountExpress(app, briefService);
 // Evidence polling is cheap; the service itself enforces the 30s evidence interval and the
 // one-job-per-session / one-generator-globally bounds.
-setInterval(() => { try { briefService.tick(); } catch (err) { console.error('[brief] tick:', err.message); } }, 5000);
+setInterval(() => {
+  briefService.tick().catch(err => console.error('[brief] tick:', err.message));
+}, 5000);
 
 // ── Build Inbox (read-only controller summary for the mobile pinned row) ──
 // Fixed command: the absolute buildctl binary with `inbox --json`. No request data is used.
