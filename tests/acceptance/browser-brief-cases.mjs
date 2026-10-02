@@ -1,7 +1,7 @@
 // Brief:: acceptance cases — the pinned view on both clients, refresh and per-field edits,
 // and cross-session isolation plus the truthful failure states.
 
-import { newPage, emit, reconnect, saveArtifact } from './browser-support.mjs';
+import { newPage, emit, saveArtifact, announceStreamTarget, emptyWindowBindingCases } from './browser-support.mjs';
 
 export const F1 = { goal: 'improve copy generation quality', current: 'add a judging step to compare candidate copy' };
 export const F2 = { goal: 'improve copy generation quality', current: 'fix inconsistent score normalization' };
@@ -299,14 +299,7 @@ export async function isolationAndFailures(ctx, t) {
   // A connection fixes its tmux target when it opens; Claude can move windows while it is
   // open. Without an explicit binding the brief re-resolves "wherever Claude is now" on
   // every poll and wanders off the pane the transcript is still showing.
-  const announce = async () => {
-    const info = await control(page, 'stream-target', { session: 'A' });
-    await page.evaluate(msg => {
-      window.__sockets.at(-1).onmessage({ data: JSON.stringify({ type: 'stream-target', ...msg }) });
-    }, info);
-    await page.waitForTimeout(80);
-    return info;
-  };
+  const announce = () => announceStreamTarget(page, control, 'A');
   await control(page, 'move-claude', { session: 'A', window: 'claude' });
   await page.evaluate(() => openTerminal('A'));
   const opened = await announce();
@@ -364,62 +357,10 @@ export async function isolationAndFailures(ctx, t) {
   await settleAndRefresh(page);
   t.eq((await readBrief(page)).goal, 'edit for the pane on screen', 'reopening the original window finds its own edit');
 
-  // ---- no Claude at open: an announced EMPTY window is still a binding ----
-  // The connection finds no Claude, keeps the bare session as its target — which tmux
-  // resolves to the active window — and announces window:"". A client that reads that as
-  // "not told yet" lets the server go looking for Claude on every later poll, so starting
-  // Claude in the inactive window silently re-points the brief off the open transcript.
-  for (const kind of ['mobile', 'desktop']) {
-    // Each client starts from a brand-new session with Claude running nowhere, so the
-    // second pass cannot inherit the first pass's window layout, brief or edit.
-    await control(page, 'move-claude', { session: 'C', window: '' });
-    await control(page, 'reincarnate', { session: 'C' });
-    const { context: cctx, page: c } = await openClient(ctx, kind, 'C');
-    const announceC = async () => {
-      const info = await control(c, 'stream-target', { session: 'C' });
-      await c.evaluate(msg => {
-        window.__sockets.at(-1).onmessage({ data: JSON.stringify({ type: 'stream-target', ...msg }) });
-      }, info);
-      await c.waitForTimeout(80);
-      return info;
-    };
-    const atOpen = await announceC();
-    t.eq(atOpen.window, '', `${kind}: a session with no Claude announces no window`);
-    t.eq(atOpen.target, 'C', `${kind}: the stream target is the session itself`);
-    t.eq(await c.evaluate(() => briefView.bound()), true, `${kind}: an announced empty window is still a binding`);
-    await control(c, 'advance', { ms: 31000 });
-    await settleAndRefresh(c);
-    t.eq((await readBrief(c)).goal, F1.goal, `${kind}: the brief describes the window being streamed`);
+  // No Claude running at open: an announced EMPTY window is still a binding, and answers
+  // still in flight from before it arrived must not land. Both delivered clients.
+  await emptyWindowBindingCases(ctx, t, { page, control, readBrief, settleAndRefresh, openClient, F1, F3 });
 
-    // Claude starts in the INACTIVE window two. This connection still streams the session.
-    await control(c, 'move-claude', { session: 'C', window: 'two' });
-    await control(c, 'advance', { ms: 31000 });
-    await settleAndRefresh(c);
-    const stillBound = await readBrief(c);
-    t.eq(stillBound.goal, F1.goal, `${kind}: starting Claude elsewhere does not re-point an open brief`);
-    t.ok(!stillBound.goal.includes(F3.goal) && !stillBound.current.includes(F3.current),
-      `${kind}: the other window's work never takes over the open session`);
-
-    await c.click('#brief-edit-goal');
-    await c.waitForSelector('#brief-input-goal');
-    await c.fill('#brief-input-goal', 'edit against the streamed pane');
-    await c.click('#brief-save-goal');
-    await c.waitForTimeout(150);
-    t.eq((await readBrief(c)).goal, 'edit against the streamed pane', `${kind}: the edit is saved against the streamed pane`);
-
-    // Reconnect through the client's own onclose path: the new connection discovers Claude.
-    await reconnect(c, 'reconnected dump\n');
-    t.eq((await announceC()).window, 'two', `${kind}: the reconnect discovers Claude's new window`);
-    await control(c, 'advance', { ms: 31000 });
-    await settleAndRefresh(c);
-    await settleAndRefresh(c);
-    t.eq(await c.evaluate(() => briefView.window()), 'two', `${kind}: the brief re-binds to the discovered window`);
-    const reboundBrief = await readBrief(c);
-    t.eq(reboundBrief.goal, F3.goal, `${kind}: after the reconnect the brief describes window two`);
-    t.ok(!reboundBrief.goal.includes('edit against the streamed pane'),
-      `${kind}: the edit stays with the pane it was made against`);
-    await cctx.close();
-  }
 
   // A new incarnation under the same tmux name inherits nothing.
   await page.evaluate(() => openTerminal('A'));

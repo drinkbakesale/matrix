@@ -165,6 +165,151 @@ export async function trustedLongPress(page, box, holdMs = 900) {
   return report;
 }
 
+// Replays a `stream-target` announcement on the page's current socket, exactly as the
+// server sends it on every connection. `override` supplies the announcement a connection
+// made EARLIER — a connection that opened before Claude started announced window:"" and
+// keeps announcing nothing until it reconnects, which live fixture state cannot express.
+export async function announceStreamTarget(page, control, session, override) {
+  const info = override || await control(page, 'stream-target', { session });
+  await page.evaluate(msg => {
+    window.__sockets.at(-1).onmessage({ data: JSON.stringify({ type: 'stream-target', ...msg }) });
+  }, info);
+  await page.waitForTimeout(80);
+  return info;
+}
+
+// No Claude running when the session is opened.
+//
+// The connection finds none, keeps the bare session as its target — which tmux resolves to
+// the active window — and announces window:"". A client that reads that as "not told yet"
+// lets the server go looking for Claude on every later poll, so starting Claude in the
+// inactive window silently re-points the brief off the open transcript. Run against both
+// delivered clients; `deps` supplies the case module's own page helpers and fixtures.
+export async function emptyWindowBindingCases(ctx, t, deps) {
+  const { page, control, readBrief, settleAndRefresh, openClient, F1, F3 } = deps;
+  for (const kind of ['mobile', 'desktop']) {
+    // Each client starts from a brand-new session with Claude running nowhere, so the
+    // second pass cannot inherit the first pass's window layout, brief or edit.
+    await control(page, 'move-claude', { session: 'C', window: '' });
+    await control(page, 'reincarnate', { session: 'C' });
+    const { context: cctx, page: c } = await openClient(ctx, kind, 'C');
+    const announceC = override => announceStreamTarget(c, control, 'C', override);
+
+    const atOpen = await announceC();
+    t.eq(atOpen.window, '', `${kind}: a session with no Claude announces no window`);
+    t.eq(atOpen.target, 'C', `${kind}: the stream target is the session itself`);
+    t.eq(await c.evaluate(() => briefView.bound()), true, `${kind}: an announced empty window is still a binding`);
+    await control(c, 'advance', { ms: 31000 });
+    await settleAndRefresh(c);
+    t.eq((await readBrief(c)).goal, F1.goal, `${kind}: the brief describes the window being streamed`);
+
+    // Claude starts in the INACTIVE window two. This connection still streams the session.
+    await control(c, 'move-claude', { session: 'C', window: 'two' });
+    await control(c, 'advance', { ms: 31000 });
+    await settleAndRefresh(c);
+    const stillBound = await readBrief(c);
+    t.eq(stillBound.goal, F1.goal, `${kind}: starting Claude elsewhere does not re-point an open brief`);
+    t.ok(!stillBound.goal.includes(F3.goal) && !stillBound.current.includes(F3.current),
+      `${kind}: the other window's work never takes over the open session`);
+
+    await c.click('#brief-edit-goal');
+    await c.waitForSelector('#brief-input-goal');
+    await c.fill('#brief-input-goal', 'edit against the streamed pane');
+    await c.click('#brief-save-goal');
+    await c.waitForTimeout(150);
+    t.eq((await readBrief(c)).goal, 'edit against the streamed pane', `${kind}: the edit is saved against the streamed pane`);
+
+    // Reconnect through the client's own onclose path: the new connection discovers Claude.
+    await reconnect(c, 'reconnected dump\n');
+    t.eq((await announceC()).window, 'two', `${kind}: the reconnect discovers Claude's new window`);
+    await control(c, 'advance', { ms: 31000 });
+    await settleAndRefresh(c);
+    await settleAndRefresh(c);
+    t.eq(await c.evaluate(() => briefView.window()), 'two', `${kind}: the brief re-binds to the discovered window`);
+    const reboundBrief = await readBrief(c);
+    t.eq(reboundBrief.goal, F3.goal, `${kind}: after the reconnect the brief describes window two`);
+    t.ok(!reboundBrief.goal.includes('edit against the streamed pane'),
+      `${kind}: the edit stays with the pane it was made against`);
+
+    await inFlightAcrossEmptyBinding(c, t, kind, { control, readBrief, settleAndRefresh, announceC, F1, F3 });
+    await cctx.close();
+  }
+}
+
+// The window string does not change, but the binding does.
+//
+// A client that has not been told its window yet asks the server to find Claude, so while
+// Claude is running in window two an UNBOUND read answers for C:two and an unbound edit is
+// addressed there. Both can still be in flight when the connection announces window:"".
+// Neither may land afterwards: the answers belong to a pane this view is no longer showing.
+// Only an epoch bump on becoming bound stops them, which is why it cannot be conditional on
+// the window string changing.
+async function inFlightAcrossEmptyBinding(page, t, kind, deps) {
+  const { control, readBrief, settleAndRefresh, announceC, F1, F3 } = deps;
+  const emptyAnnouncement = { session: 'C', window: '', target: 'C' };
+  // Back to unbound, with Claude in window two so discovery answers for a different pane.
+  await page.evaluate(() => briefView.open('C', ''));
+  t.eq(await page.evaluate(() => briefView.bound()), false, `${kind}: a fresh open is not bound yet`);
+  await control(page, 'advance', { ms: 31000 });
+  await settleAndRefresh(page);
+  t.eq((await readBrief(page)).goal, F3.goal, `${kind}: while unbound the server discovers Claude in window two`);
+
+  await control(page, 'hold', { session: 'C' });
+  // An unbound GET, then an unbound edit, both captured against C:two and held.
+  await page.evaluate(() => { briefView.refresh(); });
+  await page.waitForTimeout(150);
+  await page.click('#brief-edit-goal');
+  await page.waitForSelector('#brief-input-goal');
+  await page.fill('#brief-input-goal', 'obsolete save from the unbound view');
+  await page.click('#brief-save-goal');
+  await page.waitForTimeout(150);
+  t.ok((await control(page, 'held', { session: 'C' })).count >= 2,
+    `${kind}: an unbound read and an unbound edit are both in flight`);
+
+  // The connection announces window:"" — the same string the client already had.
+  // The edit's acknowledgement is still held, so its editor is still open and still holds
+  // the typed text when the connection announces window:"" — the same string the client
+  // already had.
+  t.ok(await page.evaluate(() => !!document.getElementById('brief-input-goal')),
+    `${kind}: the unbound edit is still open while its acknowledgement is held`);
+  await announceC(emptyAnnouncement);
+  t.eq(await page.evaluate(() => briefView.bound()), true, `${kind}: the announcement binds even with an unchanged window`);
+  t.ok(await page.evaluate(() => !document.getElementById('brief-input-goal')),
+    `${kind}: rebinding closes the editor that belonged to the other pane`);
+
+  await control(page, 'release', { session: 'C', count: 2 });   // FIFO: the GET then the PATCH
+  await page.waitForTimeout(300);
+  const stale = await page.evaluate(() => ({
+    brief: document.getElementById('brief').textContent,
+    goal: document.getElementById('brief-goal').textContent,
+    note: document.getElementById('brief-status').textContent,
+    editor: !!document.getElementById('brief-input-goal'),
+  }));
+  t.ok(!stale.goal.includes(F3.goal), `${kind}: the released unbound read cannot render the other pane's text`);
+  t.ok(!stale.brief.includes('obsolete save from the unbound view'),
+    `${kind}: the released edit acknowledgement cannot render an obsolete save`);
+  t.ok(!/not saved/i.test(stale.note), `${kind}: no obsolete save failure is reported`);
+  t.eq(stale.editor, false, `${kind}: a stale acknowledgement does not resurrect an editor`);
+
+  await control(page, 'release', { session: 'C' });
+  await control(page, 'unhold', { session: 'C' });
+  await settleAndRefresh(page);
+  // The streamed pane's own saved edit, made earlier against this exact target, survived
+  // the detour through the unbound view.
+  t.eq((await readBrief(page)).goal, 'edit against the streamed pane',
+    `${kind}: the bound view converges on the streamed pane's own brief`);
+
+  // ...and an answer arriving while the user is mid-edit leaves that editor alone.
+  await page.click('#brief-edit-goal');
+  await page.waitForSelector('#brief-input-goal');
+  await page.fill('#brief-input-goal', 'still typing this one');
+  await settleAndRefresh(page);
+  t.eq(await page.evaluate(() => document.getElementById('brief-input-goal').value), 'still typing this one',
+    `${kind}: a brief refresh does not disturb an open editor`);
+  await page.click('#brief-cancel-goal');
+  await page.waitForTimeout(80);
+}
+
 export function saveArtifact(dir, name, value) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, name);
