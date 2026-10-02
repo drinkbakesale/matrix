@@ -168,9 +168,12 @@ export function paneFor(record, { padLines = 0 } = {}) {
 }
 
 // Builds the delivered resolver/capture stack on top of the fake process.
-export function tmuxStack(fake, { timeoutMs = 5000, recentLines = 400, earlyLines = 120, ttlMs = 0 } = {}) {
+// Builds the delivered stack with the SHIPPED resolver defaults. Nothing here may relax
+// caching or identity validation: a helper that quietly disabled a cache would hide exactly
+// the class of staleness these cases exist to catch.
+export function tmuxStack(fake, { timeoutMs = 5000, recentLines = 400, earlyLines = 120 } = {}) {
   const tmux = briefTmux.createTmux({ execFileImpl: fake.execFileImpl, timeoutMs });
-  const resolver = briefTmux.createSessionResolver({ tmux, ttlMs });
+  const resolver = briefTmux.createSessionResolver({ tmux });
   const capture = briefTmux.createPaneCapture({ tmux, recentLines, earlyLines });
   return { tmux, resolver, capture };
 }

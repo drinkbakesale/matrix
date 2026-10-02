@@ -17,7 +17,7 @@ const { execFile } = require('child_process');
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
-const RESOLVE_TTL_MS = 5000;
+const MAX_WINDOW_CACHE_ENTRIES = 256;
 
 class TmuxError extends Error {
   constructor(code, message) {
@@ -71,16 +71,30 @@ function parseWindows(raw) {
 }
 
 // Resolves the exact live incarnation plus the exact window the client is streaming.
-// Cached briefly so an HTTP read is one cheap awaited lookup, not a tmux enumeration.
-function createSessionResolver({ tmux, now = Date.now, ttlMs = RESOLVE_TTL_MS }) {
-  const cache = new Map();   // key -> { at, value }
-  const inflight = new Map();
+// Resolution ALWAYS revalidates the live incarnation. A tmux name is not an identity: kill
+// `41` and start another `41` a second later and it is a different session with different
+// private content, so a name-keyed cache with any time-to-live can serve the dead session's
+// brief and let an edit address its record. The incarnation probe therefore has no TTL —
+// concurrent callers share one in-flight process call, and that is the only sharing.
+//
+// What IS cached is the per-window enumeration, keyed by the incarnation it belongs to. That
+// key changes the moment the session is recreated, so the cache cannot outlive its subject.
+function createSessionResolver({ tmux, maxWindowEntries = MAX_WINDOW_CACHE_ENTRIES } = {}) {
+  const windowCache = new Map();   // `${name}|${sessionId}|${createdAt}` -> windows[]
+  let sessionsInFlight = null;
 
-  async function lookup(name, windowName) {
-    const sessions = parseSessions(await tmux.run(['list-sessions', '-F', '#{session_name}|#{session_id}|#{session_created}']));
-    const hit = sessions.find(s => s.name === name);
-    if (!hit) return null;
+  // No TTL: every resolve confirms the session still exists and is still this incarnation.
+  function liveSessions() {
+    if (sessionsInFlight) return sessionsInFlight;
+    sessionsInFlight = tmux.run(['list-sessions', '-F', '#{session_name}|#{session_id}|#{session_created}'])
+      .then(parseSessions)
+      .catch(() => [])
+      .finally(() => { sessionsInFlight = null; });
+    return sessionsInFlight;
+  }
 
+  async function windowsFor(name, incarnationKey) {
+    if (windowCache.has(incarnationKey)) return windowCache.get(incarnationKey);
     let windows = [];
     try {
       windows = parseWindows(await tmux.run([
@@ -89,45 +103,37 @@ function createSessionResolver({ tmux, now = Date.now, ttlMs = RESOLVE_TTL_MS })
     } catch {
       windows = [];
     }
-
-    // Identical to pane-stream: requested window, else the Claude window, else no window.
-    let window = '';
-    if (windowName) {
-      window = windowName;
-    } else {
-      const claude = windows.find(w => isClaudeCmd(w.command));
-      if (claude) window = claude.name;
-    }
-    const chosen = windows.find(w => w.name === window);
-    return {
-      name: hit.name,
-      sessionId: hit.sessionId,
-      createdAt: hit.createdAt,
-      window,
-      windowIndex: chosen ? chosen.index : null,
-      target: window ? `${hit.name}:${window}` : hit.name,
-    };
+    if (windowCache.size >= maxWindowEntries) windowCache.delete(windowCache.keys().next().value);
+    windowCache.set(incarnationKey, windows);
+    return windows;
   }
 
   return {
-    // Synchronous peek used only to answer "do I already know this?"; never blocks.
-    peek(name, windowName) {
-      const entry = cache.get(`${name}\u0000${windowName || ''}`);
-      return entry && now() - entry.at < ttlMs ? entry.value : undefined;
-    },
     async resolve(name, windowName) {
-      const key = `${name}\u0000${windowName || ''}`;
-      const entry = cache.get(key);
-      if (entry && now() - entry.at < ttlMs) return entry.value;
-      if (inflight.has(key)) return inflight.get(key);
-      const job = lookup(name, windowName)
-        .then(value => { cache.set(key, { at: now(), value }); return value; })
-        .catch(() => { cache.set(key, { at: now(), value: null }); return null; })
-        .finally(() => inflight.delete(key));
-      inflight.set(key, job);
-      return job;
+      const hit = (await liveSessions()).find(s => s.name === name);
+      if (!hit) return null;
+      const incarnationKey = `${hit.name}\u0000${hit.sessionId}\u0000${hit.createdAt}`;
+      const windows = await windowsFor(name, incarnationKey);
+
+      // Identical to pane-stream: requested window, else the Claude window, else no window.
+      let window = '';
+      if (windowName) {
+        window = windowName;
+      } else {
+        const claude = windows.find(w => isClaudeCmd(w.command));
+        if (claude) window = claude.name;
+      }
+      const chosen = windows.find(w => w.name === window);
+      return {
+        name: hit.name,
+        sessionId: hit.sessionId,
+        createdAt: hit.createdAt,
+        window,
+        windowIndex: chosen ? chosen.index : null,
+        target: window ? `${hit.name}:${window}` : hit.name,
+      };
     },
-    invalidate() { cache.clear(); },
+    invalidate() { windowCache.clear(); },
   };
 }
 
@@ -159,5 +165,5 @@ function createPaneCapture({ tmux, recentLines = 400, earlyLines = 120 }) {
 module.exports = {
   TmuxError, createTmux, createSessionResolver, createPaneCapture,
   parseSessions, parseWindows, isClaudeCmd,
-  DEFAULT_TIMEOUT_MS, RESOLVE_TTL_MS,
+  DEFAULT_TIMEOUT_MS, MAX_WINDOW_CACHE_ENTRIES,
 };

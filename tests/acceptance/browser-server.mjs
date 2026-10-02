@@ -131,7 +131,6 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
       const op = url.pathname.slice('/__control/'.length);
       if (op === 'advance') {
         clock.advance(Number(url.searchParams.get('ms') || 0));
-        stack.resolver.invalidate();
         await service.tick();
         return json(200, { now: clock.now() });
       }
@@ -139,11 +138,12 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
         setPane(url.searchParams.get('session'), decodeURIComponent(url.searchParams.get('pane') || ''));
         return json(200, { ok: true });
       }
+      // Kills the session and starts another with the same name. The resolver is NOT told:
+      // noticing is the delivered code's job, and the browser cases rely on it noticing.
       if (op === 'reincarnate') {
         const name = url.searchParams.get('session');
         const prev = tmux.sessions.get(name) || {};
         tmux.set(name, { ...prev, sessionId: `${prev.sessionId}-new`, createdAt: (prev.createdAt || 0) + 1000 });
-        stack.resolver.invalidate();
         return json(200, { ok: true });
       }
       if (op === 'mode') { state.mode = url.searchParams.get('mode') || 'ok'; return json(200, { mode: state.mode }); }

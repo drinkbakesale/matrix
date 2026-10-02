@@ -386,11 +386,32 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   service = makeService({ stack: tmuxStack(fake), clock, generator: extractive(), storeFile });
   t.eq((await service.read('A')).goal, 'ship the new judge', 'the edit survives a service restart');
 
-  // A new incarnation under the same tmux name inherits nothing.
+  // A new incarnation under the same tmux name inherits nothing. This runs on the SHIPPED
+  // resolver with no cache invalidation and no clock advance: the session is killed and
+  // recreated well inside any plausible caching window, exactly as a user restarting a
+  // session would do, and the delivered code has to notice by itself.
+  const beforeRebirth = await service.read('A');
+  t.eq(beforeRebirth.goal, 'ship the new judge', 'the old incarnation has private text and an override');
   fake.set('A', { ...claudeSession('A', paneFor(byId.f3)), sessionId: '$A2', createdAt: 1_700_000_500 });
+  const callsBefore = fake.calls.length;
   const reborn = await service.read('A');
+  t.ok(fake.calls.length > callsBefore, 'the reborn read actually re-checks tmux rather than trusting a cached name');
+  t.eq(reborn.session.sessionId, '$A2', 'the brief reports the live incarnation, not the dead one');
   t.eq(reborn.overrides.goal, null, 'a reused tmux name inherits no override');
   t.eq(reborn.goal, null, 'a reused tmux name inherits no generated text');
+  t.eq(reborn.current, null, 'a reused tmux name inherits no generated current work');
+  // An edit addressed at the reborn session must not be able to reach the dead record.
+  const afterRebirthEdit = await service.patch('A', { current: 'written after rebirth', revision: reborn.revision });
+  t.eq(afterRebirthEdit.session.sessionId, '$A2', 'an edit lands on the live incarnation');
+  t.eq(afterRebirthEdit.goal, null, 'the dead incarnation\'s override is still not visible after an edit');
+  // Generation for the reborn session also goes through the same revalidating resolver.
+  await service.settle();
+  clock.advance(31000);
+  await service.tick();
+  await service.settle();
+  const regenerated = await service.read('A');
+  t.eq(regenerated.goal, byId.f3.expectedGoal, 'the reborn session generates from its own pane');
+  t.ok(!String(regenerated.goal).includes('judge'), 'no text from the dead incarnation survives generation');
 
   // Corrupt storage is visible, not silently treated as "no edits".
   fs.writeFileSync(storeFile, '{ not json');
