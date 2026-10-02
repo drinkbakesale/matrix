@@ -43,6 +43,15 @@ function attach(wss, { port }) {
     const target = window ? `${session}:${window}` : session;
     console.log(`[ws] streaming tmux target: ${target}`);
 
+    // This connection's target is now fixed for its lifetime, but the window Claude runs in
+    // is not: the user can quit it in one window and start it in another without the stream
+    // noticing. Anything else that describes "this session" has to be told which pane is
+    // actually on screen, or it drifts off to whichever window Claude moved to. Announced on
+    // every connection, so an automatic reconnect re-synchronises the binding.
+    function sendStreamTarget() {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'stream-target', session, window, target }));
+    }
+
     let pollInterval = null;
     let captureErrors = 0;
     let lastLineCount = 0;
@@ -76,6 +85,7 @@ function attach(wss, { port }) {
     }
 
     function initStreaming() {
+      sendStreamTarget();
       const size = getPaneSize();
       ws.send(JSON.stringify({ type: 'pane-size', cols: size.cols, rows: size.rows }));
 

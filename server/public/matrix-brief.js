@@ -250,6 +250,28 @@
         load();
         if (timer === null && typeof setInterval === 'function') timer = setInterval(load, POLL_MS);
       },
+      // The stream tells each client the exact tmux window its connection resolved. Until
+      // that arrives the client only knows what it asked for, which for the auto-detected
+      // case is nothing — and "nothing" means the server would re-resolve "wherever Claude
+      // is now" on every poll, so the brief would wander off the pane the transcript is
+      // showing the moment Claude moved windows. Binding pins the brief to the open stream;
+      // a reconnect announces again and re-binds.
+      bindWindow: function (name, streamedWindow) {
+        var next = typeof streamedWindow === 'string' ? streamedWindow : '';
+        if (session === null || session !== name) return false;   // not the session on screen
+        if (windowName === next) return false;                    // already the right pane
+        // A different pane is a different brief. The epoch bump makes every answer still in
+        // flight for the previous binding unrenderable, including a PATCH acknowledgement.
+        epoch += 1;
+        windowName = next;
+        latest = null;
+        appliedId = 0;
+        editing = null;
+        render();
+        load();
+        return true;
+      },
+      window: function () { return windowName; },
       close: function () {
         epoch += 1;
         session = null;

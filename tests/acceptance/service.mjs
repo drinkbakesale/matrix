@@ -11,7 +11,7 @@ import { createRun, parseArgs } from './assertions.mjs';
 import {
   briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
-  countingGenerator, fakeCli, loadCorpus, sleep,
+  countingGenerator, fakeCli, loadCorpus, sleep, paneStreamProbe,
 } from './service-support.mjs';
 import { evaluateCorpus } from './corpus.mjs';
 
@@ -105,6 +105,29 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   const settledAfterMove = await service.read('S');
   t.eq(settledAfterMove.goal, byId.f3.expectedGoal, 'the moved-to window generates from its own pane');
   t.eq(settledAfterMove.session.target, 'S:shell', 'generation stays bound to the moved-to window');
+
+  // The reopen path above follows the move. A client whose connection is ALREADY open does
+  // not: pane-stream fixed its target when that connection was made, so its transcript is
+  // still showing S:claude. Its brief and its edits have to stay on that pane too.
+  const retained = await service.read('S', 'claude');
+  t.eq(retained.session.target, 'S:claude', 'a retained stream binding holds through the move');
+  t.eq(retained.current, byId.f2.expectedCurrent, 'the retained window still describes its own pane');
+  const retainedEdit = await service.patch('S', { goal: 'edit against the pane on screen', revision: retained.revision }, 'claude');
+  t.eq(retainedEdit.session.target, 'S:claude', 'an edit is addressed to the pane the user can see');
+  t.eq((await service.read('S', 'shell')).overrides.goal, null, 'the moved-to window never received that edit');
+  // And a binding whose window has since gone fails loudly instead of capturing a ghost.
+  let goneWindow = null;
+  try { await service.read('S', 'closed-window'); } catch (e) { goneWindow = e; }
+  t.eq(goneWindow && goneWindow.code, 'unknown_window', 'a stream binding to a window that no longer exists is rejected');
+  // The stream itself announces the window it resolved, which is what the client binds to.
+  const announced = paneStreamProbe({ session: 'A', windows: [['one', 'claude'], ['two', 'bash']] });
+  t.eq(announced.first && announced.first.type, 'stream-target', 'a connection announces its target before any pane data');
+  t.eq(announced.first && announced.first.window, 'one', 'the announcement names the window pane-stream actually picked');
+  t.eq(announced.first && announced.first.target, 'A:one', 'the announced target is the one the stream polls');
+  const announcedAfterMove = paneStreamProbe({ session: 'A', windows: [['one', 'bash'], ['two', 'claude']] });
+  t.eq(announcedAfterMove.first && announcedAfterMove.first.window, 'two', 'a later connection announces the window Claude moved to');
+  t.ok(announced.types.indexOf('stream-target') < announced.types.indexOf('output'),
+    'the binding is announced before the scrollback the client renders');
 
   // Same project, different session: no cross-contamination.
   await service.read('B');

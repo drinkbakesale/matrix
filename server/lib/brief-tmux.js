@@ -129,6 +129,10 @@ function createSessionResolver({ tmux } = {}) {
         createdAt: hit.createdAt,
         window,
         windowIndex: chosen ? chosen.index : null,
+        // A client streaming a window that has since been closed or renamed is asking about
+        // a pane that no longer exists. Saying so is better than capturing `name:gone` and
+        // reporting whatever tmux does with it.
+        windowKnown: window === '' ? true : !!chosen,
         target: window ? `${hit.name}:${window}` : hit.name,
       };
     },

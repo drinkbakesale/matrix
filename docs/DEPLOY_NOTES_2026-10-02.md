@@ -20,6 +20,14 @@ touched, and no notification was sent. **You deploy.**
   per-field **Edit** / **Clear edit** that persists until you clear it
   (`server/public/matrix-brief.js`, `server/lib/brief-*.js`,
   `GET|PATCH /api/sessions/:name/brief`).
+* **One new WebSocket message.** Every connection now begins with
+  `{"type":"stream-target","session":…,"window":…,"target":…}` naming the tmux window that
+  connection resolved (`server/lib/pane-stream.js`). The brief binds to it, so if you quit
+  Claude in one window and start it in another the brief keeps describing the pane the
+  transcript is still showing, and re-synchronises when the socket reconnects. Older clients
+  ignore unknown message types, so a stale cached page is unaffected — but reload the PWA
+  after deploying so the brief gets the binding. Polling, input routing and the
+  `output`/`screen` frames are unchanged.
 * **File split.** `server/server.js`, `server/public/app.js` and `server/public/desktop.js`
   were split into cohesive modules so every touched file stays under 500 lines. Behaviour was
   preserved; the existing 62 tests still pass (63 now — one was added).

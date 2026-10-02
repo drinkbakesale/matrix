@@ -75,6 +75,14 @@ are D2 (mobile copy) and D3 (session brief).
   an extraction should smuggle in.
 * `server/server.js:1040-1048 @27534cd` **[code]** Every connection, including an automatic
   reconnect, re-sends the whole scrollback as the first `output`.
+* `server/server.js:977-993 @27534cd` **[code]** The window is resolved **once**, when the
+  connection opens, and the client is never told which one was chosen. Claude moving to
+  another window of the same session is invisible to anything that asks the server about
+  "this session" afterwards. *[candidate change: `server/lib/pane-stream.js` now sends a
+  `stream-target` message naming the resolved `session`/`window`/`target` as the first
+  message of every connection, so the pinned brief (D3) binds to the pane on screen and
+  re-synchronises on reconnect. The stream's own polling, input routing and `output`/
+  `screen` behaviour are unchanged.]*
 * `server/server.js:1054-1096 @27534cd` **[code]** The 100 ms poll sends `output` when the
   capture grew, and `screen` (the last `rows` lines) when the length is unchanged but the
   content differs. The comment at `:1029-1031` ("We NEVER clear the screen. We only APPEND")

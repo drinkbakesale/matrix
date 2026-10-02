@@ -86,6 +86,9 @@ class BriefService {
     if (!identity || identity.name !== name) {
       throw new BriefRequestError(404, 'unknown_session', 'no live session with that name');
     }
+    if (identity.windowKnown === false) {
+      throw new BriefRequestError(404, 'unknown_window', 'that window is not open in this session');
+    }
     return identity;
   }
 

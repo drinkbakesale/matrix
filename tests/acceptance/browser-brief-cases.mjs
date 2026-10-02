@@ -295,6 +295,75 @@ export async function isolationAndFailures(ctx, t) {
   await settleAndRefresh(page);
   t.eq((await readBrief(page)).goal, F1.goal, 'the streamed window\'s own brief is what is shown');
 
+  // ---- the brief is bound to the window the open stream actually resolved ----
+  // A connection fixes its tmux target when it opens; Claude can move windows while it is
+  // open. Without an explicit binding the brief re-resolves "wherever Claude is now" on
+  // every poll and wanders off the pane the transcript is still showing.
+  const announce = async () => {
+    const info = await control(page, 'stream-target', { session: 'A' });
+    await page.evaluate(msg => {
+      window.__sockets.at(-1).onmessage({ data: JSON.stringify({ type: 'stream-target', ...msg }) });
+    }, info);
+    await page.waitForTimeout(80);
+    return info;
+  };
+  await control(page, 'move-claude', { session: 'A', window: 'claude' });
+  await page.evaluate(() => openTerminal('A'));
+  const opened = await announce();
+  t.eq(opened.window, 'claude', 'the connection resolves A\'s Claude window');
+  t.eq(await page.evaluate(() => briefView.window()), 'claude', 'the client binds the brief to the streamed window');
+  await control(page, 'advance', { ms: 31000 });
+  await settleAndRefresh(page);
+  t.eq((await readBrief(page)).goal, F1.goal, 'the bound window\'s own brief is shown');
+
+  // Claude moves to the other window. This connection is still streaming A:claude, whose
+  // pane says something different from the window Claude moved to.
+  await control(page, 'move-claude', { session: 'A', window: 'shell' });
+  await control(page, 'advance', { ms: 31000 });
+  await settleAndRefresh(page);
+  const heldBinding = await readBrief(page);
+  t.eq(await page.evaluate(() => briefView.window()), 'claude', 'a move without reopening does not re-point the brief');
+  t.eq(heldBinding.goal, F1.goal, 'the brief still describes the pane the transcript is showing');
+  t.ok(!heldBinding.goal.includes(F3.goal) && !heldBinding.current.includes(F3.current),
+    'the window Claude moved to never takes over an open session\'s brief');
+
+  // An edit made against what is on screen is addressed to that pane.
+  await page.click('#brief-edit-goal');
+  await page.waitForSelector('#brief-input-goal');
+  await page.fill('#brief-input-goal', 'edit for the pane on screen');
+  await page.click('#brief-save-goal');
+  await page.waitForTimeout(150);
+  t.eq((await readBrief(page)).goal, 'edit for the pane on screen', 'the edit is saved against the bound window');
+
+  // A reconnect re-synchronises the binding, and the answer still in flight for the
+  // previous binding — carrying that edit — must never render afterwards.
+  await control(page, 'hold', { session: 'A' });
+  // Fire-and-forget: refresh() resolves only when the response arrives, and this one is
+  // being held on purpose. Returning its promise to evaluate() would hang the test.
+  await page.evaluate(() => { briefView.refresh(); });
+  await page.waitForTimeout(150);
+  t.ok((await control(page, 'held', { session: 'A' })).count >= 1, 'an answer for the previous binding is in flight');
+  const rebound = await announce();
+  t.eq(rebound.window, 'shell', 'a reconnect announces the window Claude moved to');
+  await page.waitForTimeout(120);
+  await control(page, 'release', { session: 'A', count: 1 });
+  await page.waitForTimeout(250);
+  t.ok(!String((await readBrief(page)).goal).includes('edit for the pane on screen'),
+    'a delayed answer from the previous binding never renders');
+  await control(page, 'release', { session: 'A' });
+  await control(page, 'unhold', { session: 'A' });
+  await settleAndRefresh(page);
+  await settleAndRefresh(page);
+  t.eq(await page.evaluate(() => briefView.window()), 'shell', 'the reconnect re-bound the brief to the new window');
+  t.eq((await readBrief(page)).goal, F3.goal, 'after the reconnect the brief describes the moved-to window');
+
+  // Reopening still discovers fresh, and the edit stayed with the pane it was made against.
+  await control(page, 'move-claude', { session: 'A', window: 'claude' });
+  await page.evaluate(() => openTerminal('A'));
+  await announce();
+  await settleAndRefresh(page);
+  t.eq((await readBrief(page)).goal, 'edit for the pane on screen', 'reopening the original window finds its own edit');
+
   // A new incarnation under the same tmux name inherits nothing.
   await page.evaluate(() => openTerminal('A'));
   await settleAndRefresh(page);

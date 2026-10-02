@@ -88,6 +88,12 @@ function connectWS(session) {
         scanTerminalForOutputs(clean);
       } else if (msg.type === 'screen') {
         transcript.screen(filterStatusLines(stripAnsi(msg.data)), token);
+      } else if (msg.type === 'stream-target') {
+        // Pin the brief to the pane this connection is actually streaming. A superseded
+        // connection must not re-point the brief at its own old window.
+        if (briefView && currentSession === session && transcript.isCurrent(token)) {
+          briefView.bindWindow(session, msg.window || '');
+        }
       }
     } catch {}
   };

@@ -252,6 +252,46 @@ process.stdin.on('end', () => {
   return { bin, log, read: () => JSON.parse(fs.readFileSync(log, 'utf8')) };
 }
 
+// Runs the delivered pane-stream module against a throwaway `tmux` on PATH and a fake
+// WebSocket, and records exactly what a connecting client is told. The stream fixes its
+// target when the connection opens, so what it announces at that moment is what anything
+// else describing "this session" has to bind to. No real tmux, HOME or server is involved.
+export function paneStreamProbe({ session = 'A', windows = [] } = {}) {
+  const dir = tempDir('matrix-panestream-');
+  const windowFile = path.join(dir, 'windows.txt');
+  fs.writeFileSync(windowFile, `${windows.map(([name, cmd]) => `${name}|${cmd}`).join('\n')}\n`);
+  fs.writeFileSync(path.join(dir, 'tmux'), `#!/bin/sh
+case "$1" in
+  list-panes) cat ${JSON.stringify(windowFile)} ;;
+  display-message) echo "80|24" ;;
+  capture-pane) echo "fixture pane line" ;;
+esac
+`, { mode: 0o755 });
+
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}:${previousPath}`;
+  const paneStream = require(path.join(LIB, 'pane-stream.js'));
+  const sent = [];
+  const wsHandlers = new Map();
+  const ws = {
+    readyState: 1,
+    send: raw => sent.push(JSON.parse(raw)),
+    on: (evt, cb) => wsHandlers.set(evt, cb),
+    close: () => {},
+    ping: () => {},
+  };
+  let connect = null;
+  paneStream.attach({ on: (evt, cb) => { if (evt === 'connection') connect = cb; } }, { port: 0 });
+  try {
+    connect(ws, { url: `/?session=${encodeURIComponent(session)}` });
+  } finally {
+    const onClose = wsHandlers.get('close');
+    if (onClose) onClose();           // clears the poll and ping timers this connection made
+    process.env.PATH = previousPath;
+  }
+  return { sent, first: sent[0] || null, types: sent.map(m => m.type) };
+}
+
 export function loadCorpus(oracleDir) {
   return JSON.parse(fs.readFileSync(path.join(oracleDir, 'brief-fixtures.json'), 'utf8'));
 }

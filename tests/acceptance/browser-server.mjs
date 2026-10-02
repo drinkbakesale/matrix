@@ -11,7 +11,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
-  briefGenerator, briefRoutes, fakeClock, fakeTmuxProcess, tmuxStack, makeService, tempDir,
+  briefGenerator, briefRoutes, briefTmux, fakeClock, fakeTmuxProcess, tmuxStack, makeService, tempDir,
 } from './service-support.mjs';
 
 const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json' };
@@ -145,6 +145,26 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
         const prev = tmux.sessions.get(name) || {};
         tmux.set(name, { ...prev, sessionId: `${prev.sessionId}-new`, createdAt: (prev.createdAt || 0) + 1000 });
         return json(200, { ok: true });
+      }
+      // The user quits Claude in one window and starts it in another. Same session, same
+      // incarnation, no reopen — exactly what an already-open connection cannot see.
+      if (op === 'move-claude') {
+        const name = url.searchParams.get('session');
+        const to = url.searchParams.get('window');
+        const prev = tmux.sessions.get(name) || {};
+        const windows = (prev.windows || []).map(w => ({ ...w, command: w.name === to ? 'claude' : 'bash' }));
+        tmux.set(name, { ...prev, windows });
+        return json(200, { windows: windows.map(w => ({ name: w.name, command: w.command })) });
+      }
+      // What a WebSocket connecting right now would resolve and announce, using the same
+      // predicate pane-stream uses. The stubbed socket replays this as `stream-target`,
+      // and tests/acceptance/service.mjs proves pane-stream really sends it.
+      if (op === 'stream-target') {
+        const name = url.searchParams.get('session');
+        const prev = tmux.sessions.get(name) || {};
+        const claude = (prev.windows || []).find(w => briefTmux.isClaudeCmd(w.command));
+        const window = claude ? claude.name : '';
+        return json(200, { session: name, window, target: window ? `${name}:${window}` : name });
       }
       if (op === 'mode') { state.mode = url.searchParams.get('mode') || 'ok'; return json(200, { mode: state.mode }); }
       if (op === 'settle') { await service.settle(); return json(200, { ok: true }); }
