@@ -55,7 +55,7 @@ atomic writes); deleting it loses only generated text and your brief edits.
 | `MATRIX_BRIEF_GENERATOR` | `extractive` | `claude` switches to the installed `claude` CLI |
 | `MATRIX_BRIEF_MODEL` | `claude-haiku-4-5-20251001` | only used by the `claude` generator |
 | `MATRIX_CLAUDE_BIN` | `claude` | path to the CLI |
-| `MATRIX_BRIEF_INTERVAL_MS` | `30000` | evidence re-check interval per open session |
+| `MATRIX_BRIEF_INTERVAL_MS` | `30000` | evidence re-check interval per open session. **30000 ms is a ceiling, not just a default**: a larger value is capped back to 30000 and the cap is logged, because sentence two has to track the work as it changes. A smaller value is honoured; a missing or unparseable one falls back to 30000. |
 
 The default **extractive** generator only ever shows text that literally appears in that
 session's own pane, so it cannot invent a goal — and when the pane does not say what the work

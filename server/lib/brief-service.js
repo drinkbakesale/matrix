@@ -10,6 +10,10 @@ const { BriefStore, BriefStoreError, sessionKey, FIELDS, MAX_FIELD_CHARS } = req
 const { validateBriefOutput, BriefGenerationError } = require('./brief-generator');
 
 const DEFAULT_EVIDENCE_INTERVAL_MS = 30000;
+// A ceiling, not a default. Sentence two is supposed to track the work as it changes, so an
+// interval longer than this is a brief that is allowed to go stale. Deployment config may
+// lower the interval; it must not be able to raise it.
+const MAX_EVIDENCE_INTERVAL_MS = 30000;
 const DEFAULT_GENERATION_TIMEOUT_MS = 30000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 const OPEN_SESSION_TTL_MS = 2 * 60 * 1000;
@@ -35,6 +39,20 @@ function normalizeBinding(binding) {
   const window = binding.window === undefined || binding.window === null ? '' : binding.window;
   if (typeof window !== 'string') return null;
   return { window, authoritative: !!binding.authoritative || window !== '' };
+}
+
+// Turns a configured interval (a number, or the raw string a deployment put in the
+// environment) into one the service may actually run at. Garbage and non-positive values
+// fall back to the default rather than to "never"; anything above the ceiling is capped and
+// reported through `onClamp` so the operator sees that their setting was overruled.
+function resolveEvidenceInterval(value, { onClamp } = {}) {
+  const asked = typeof value === 'number' ? value : parseInt(value, 10);
+  if (!Number.isFinite(asked) || asked <= 0) return DEFAULT_EVIDENCE_INTERVAL_MS;
+  if (asked > MAX_EVIDENCE_INTERVAL_MS) {
+    if (onClamp) onClamp(asked, MAX_EVIDENCE_INTERVAL_MS);
+    return MAX_EVIDENCE_INTERVAL_MS;
+  }
+  return asked;
 }
 
 function validOverride(value) {
@@ -63,7 +81,10 @@ class BriefService {
     this.collector = collector;
     this.generator = generator;
     this.now = now;
-    this.evidenceIntervalMs = evidenceIntervalMs;
+    // Capped here rather than at the caller: the bootstrap reads this straight out of the
+    // environment, so the only place the ceiling cannot be bypassed is below that read.
+    this.evidenceIntervalMs = resolveEvidenceInterval(evidenceIntervalMs, { onClamp: (asked, max) => onError(
+      Object.assign(new Error(`evidence interval ${asked}ms exceeds the ${max}ms maximum; using ${max}ms`), { code: 'interval_capped' })) });
     this.generationTimeoutMs = generationTimeoutMs;
     this.literalRequired = literalRequired;
     this.onError = onError;
@@ -325,6 +346,6 @@ class BriefService {
 }
 
 module.exports = {
-  BriefService, BriefRequestError,
-  DEFAULT_EVIDENCE_INTERVAL_MS, DEFAULT_GENERATION_TIMEOUT_MS, MAX_BACKOFF_MS,
+  BriefService, BriefRequestError, resolveEvidenceInterval,
+  DEFAULT_EVIDENCE_INTERVAL_MS, MAX_EVIDENCE_INTERVAL_MS, DEFAULT_GENERATION_TIMEOUT_MS, MAX_BACKOFF_MS,
 };

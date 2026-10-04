@@ -14,7 +14,7 @@ const { listLiveSessions, sweepAttention } = require('./lib/sessions');
 const { createTmux, createSessionResolver, createPaneCapture } = require('./lib/brief-tmux');
 const { createEvidenceCollector } = require('./lib/brief-evidence');
 const { createExtractiveGenerator, createClaudeCliGenerator } = require('./lib/brief-generator');
-const { BriefService, DEFAULT_EVIDENCE_INTERVAL_MS } = require('./lib/brief-service');
+const { BriefService, resolveEvidenceInterval } = require('./lib/brief-service');
 const briefRoutes = require('./lib/brief-routes');
 
 config.bootstrap();
@@ -75,7 +75,11 @@ const briefService = new BriefService({
   collector: createEvidenceCollector({ capturePane: identity => briefCapture.capture(identity) }),
   generator,
   literalRequired,
-  evidenceIntervalMs: parseInt(process.env.MATRIX_BRIEF_INTERVAL_MS, 10) || DEFAULT_EVIDENCE_INTERVAL_MS,
+  // Validated, not trusted: MATRIX_BRIEF_INTERVAL_MS may shorten the evidence interval but
+  // cannot push it past the 30s ceiling, and a garbage value falls back to the default.
+  evidenceIntervalMs: resolveEvidenceInterval(process.env.MATRIX_BRIEF_INTERVAL_MS, {
+    onClamp: (asked, max) => console.error(`[brief] MATRIX_BRIEF_INTERVAL_MS=${asked} exceeds the ${max}ms maximum; using ${max}ms`),
+  }),
   onError: err => console.error(`[brief] ${err.code || 'error'}: ${err.message}`),
 });
 briefRoutes.mountExpress(app, briefService);

@@ -104,12 +104,18 @@ export async function mobileStreamSelection(ctx, t) {
   t.eq(wk.allTouchEventsTrusted, true, 'every touch event WebKit delivered was engine-generated (isTrusted)');
   t.includes(wk.textAtPress, TARGET, 'the touched node holds real transcript text');
   t.eq(wk.textDuringHold, wk.textAtPress, 'the touched text is byte-identical across the WebKit touch');
-  // Honest capability split: WebKit delivered touch, but cannot hold it. That is a property
-  // of the automation protocol, not of the product, and it is why the visible fallback
-  // below — not a long press — is the path this build actually tests on WebKit.
-  t.eq(wk.sustained, false, 'WebKit automation cannot hold a touch down: recorded as a capability limit, not a pass');
-  t.ok(wk.limitation && wk.limitation.includes('dispatchTapEvent'),
-    'the WebKit limitation names the exact protocol facility that is missing');
+  // Honest capability split, and written so the capability is TRACKED rather than frozen:
+  // if this engine ever gains a way to hold a touch down, the first branch takes over and
+  // the sustained hold must then actually survive. Today it does not have one, so the
+  // limitation must be recorded with the exact missing protocol facility named.
+  if (wk.sustained) {
+    t.ok(wk.observedPressMs >= 850, `WebKit held the touch for >=850ms (observed ${wk.observedPressMs}ms)`);
+    t.eq(wk.allTouchEventsTrusted, true, 'the sustained WebKit touch was engine-generated');
+  } else {
+    t.ok(wk.limitation && wk.limitation.includes('dispatchTapEvent'),
+      'WebKit cannot hold a touch down, and the limitation names the exact missing protocol facility');
+    t.eq(wk.observedPressMs, 0, 'what WebKit can deliver is an atomic tap: zero press duration, recorded as such');
+  }
 
   // A SUSTAINED touch, on the engine whose automation can actually hold one.
   await sustainedTouchOnChromium(ctx, t, { target: TARGET, unicodeLine: UNICODE_LINE });

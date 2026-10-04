@@ -385,6 +385,48 @@ async function emptyBindingScenario({ clock, generator, storeFile, activePane, o
   };
 }
 
+// The evidence interval is a frozen MAXIMUM, and the production bootstrap reads it out of
+// the environment (`MATRIX_BRIEF_INTERVAL_MS`) straight into the service. So the cap has to
+// hold below that read, and a deployment must not be able to configure a brief that
+// refreshes later than the maximum. Checked both at the validator and behaviourally.
+export async function evidenceIntervalChecks({ clock, generator, storeFile, pane1, pane2, expect }) {
+  const max = briefServiceMod.MAX_EVIDENCE_INTERVAL_MS;
+  const fallback = briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS;
+  const checks = [[max, 30000, 'the frozen evidence-interval maximum is 30s']];
+  // Exactly the values a deployment could put in the environment, through the exact helper
+  // the bootstrap calls.
+  for (const [raw, want, detail] of [
+    ['600000', max, 'a ten-minute configured interval is capped at the maximum'],
+    ['86400000', max, 'a one-day configured interval is capped at the maximum'],
+    [600000, max, 'a numeric over-long interval is capped too'],
+    ['5000', 5000, 'a shorter configured interval is honoured'],
+    ['', fallback, 'an empty value falls back to the default, not to never'],
+    ['nonsense', fallback, 'a garbage value falls back to the default'],
+    ['-1', fallback, 'a negative value falls back to the default'],
+    ['0', fallback, 'zero falls back to the default'],
+    [undefined, fallback, 'an unset variable falls back to the default'],
+  ]) checks.push([briefServiceMod.resolveEvidenceInterval(raw), want, detail]);
+
+  // Behaviourally: a service constructed with an over-long interval still picks up changed
+  // work one frozen maximum later, not one configured interval later.
+  const fake = fakeTmuxProcess({ P: claudeSession('P', pane1) });
+  const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile, evidenceIntervalMs: 600000 });
+  await service.read('P');
+  await service.settle();
+  const first = await service.read('P');
+  fake.set('P', claudeSession('P', pane2));
+  clock.advance(max);
+  await service.tick();
+  await service.settle();
+  const after = await service.read('P');
+  checks.push(
+    [service.evidenceIntervalMs, max, 'a service asked for a longer interval runs at the maximum'],
+    [first.current, expect.firstCurrent, 'the session starts on its own first evidence'],
+    [after.current, expect.secondCurrent, 'changed work is picked up one frozen maximum later, not one configured interval later'],
+  );
+  return { checks, report: { maxMs: max, configuredMs: 600000, effectiveMs: service.evidenceIntervalMs } };
+}
+
 export function loadCorpus(oracleDir) {
   return JSON.parse(fs.readFileSync(path.join(oracleDir, 'brief-fixtures.json'), 'utf8'));
 }

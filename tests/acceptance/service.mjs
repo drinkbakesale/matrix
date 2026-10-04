@@ -11,7 +11,7 @@ import { createRun, parseArgs } from './assertions.mjs';
 import {
   briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
-  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks,
+  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks,
 } from './service-support.mjs';
 import { evaluateCorpus } from './corpus.mjs';
 
@@ -347,6 +347,15 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
     `the shipped service-level generation ceiling is <=30s (${briefServiceMod.DEFAULT_GENERATION_TIMEOUT_MS}ms)`);
   t.ok(briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS <= 30000 && briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS > 0,
     `the shipped evidence interval is <=30s (${briefServiceMod.DEFAULT_EVIDENCE_INTERVAL_MS}ms)`);
+  // The default being <=30s is not the same as the configured value being <=30s: the
+  // bootstrap reads MATRIX_BRIEF_INTERVAL_MS, so the ceiling is checked at that boundary.
+  const interval = await evidenceIntervalChecks({
+    clock: fakeClock(), generator: extractive(), storeFile: store(),
+    pane1: paneFor(byId.f1), pane2: paneFor(byId.f2),
+    expect: { firstCurrent: byId.f1.expectedCurrent, secondCurrent: byId.f2.expectedCurrent },
+  });
+  for (const [actual, expected, detail] of interval.checks) t.eq(actual, expected, detail);
+  t.note('evidenceInterval', interval.report);
   t.ok(briefGenerator.MAX_EVIDENCE_CHARS <= 24 * 1024, 'the shipped evidence cap is <=24 KiB');
   t.ok(briefGenerator.MAX_FIELD_CHARS <= 500, 'the shipped field cap is <=500 characters');
 
