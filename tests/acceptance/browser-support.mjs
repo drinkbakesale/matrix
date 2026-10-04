@@ -131,38 +131,126 @@ export async function syntheticLongPress(page, selector, holdMs = 900, { release
   }, [selector, holdMs, release]);
 }
 
-// TRUSTED INPUT. Driven through Playwright's input API, so the engine generates the events
-// itself (isTrusted=true) exactly as it would for a user. It is still not an iOS finger:
-// WebKit under Playwright has no SpringBoard and no selection handles, and `touchscreen`
-// exposes only a tap, so a press-and-hold has to be a held pointer.
-export async function trustedLongPress(page, box, holdMs = 900) {
+// A SUSTAINED TOUCH, delivered by the engine itself — not a mouse standing in for a finger
+// and not a scripted TouchEvent. The only mechanism in the pinned Playwright that can hold
+// a touch down for a measured interval is the Chromium devtools protocol's
+// `Input.dispatchTouchEvent`, which takes touchStart and touchEnd as separate commands.
+//
+// WebKit has no such facility: `browserContext.newCDPSession` refuses outside Chromium, and
+// playwright-core/lib/server/webkit/wkInput.js sends only `Input.dispatchTapEvent` for
+// touch — an atomic tap with no press duration. So on WebKit this reports, in the artifact,
+// that a >=850ms touch CANNOT be produced, and delivers the one real touch the engine does
+// support (a trusted tap) rather than dressing up a pointer hold as a finger.
+export async function sustainedTouch(page, context, box, holdMs = 900, { watch } = {}) {
   const x = box.x + Math.min(30, box.width / 3);
   const y = box.y + Math.min(14, box.height / 2);
-  const report = { kind: 'trusted Playwright input (isTrusted=true)', x, y, tap: null, hold: null, selection: '', error: null };
-  try {
-    await page.touchscreen.tap(x, y);
-    report.tap = 'touchscreen.tap delivered';
-  } catch (err) {
-    report.tap = `unsupported: ${err.message}`;
-  }
-  const screenText = () => page.evaluate(() => {
-    const el = document.querySelector('#terminal .msg-screen');
-    return el ? el.textContent : '';
+  const report = {
+    requestedHoldMs: holdMs, x, y,
+    mechanism: null, sustained: false, events: [], heldMs: null,
+    textAtPress: null, textDuringHold: null, selectionDuringHold: '', selectionAfterRelease: '',
+    tap: null, limitation: null, error: null,
+  };
+  const look = () => (watch ? page.evaluate(sel => {
+    const el = document.querySelector(sel);
+    return el ? el.textContent : null;
+  }, watch) : Promise.resolve(null));
+  // Record what the page actually received, with isTrusted and arrival times, so the
+  // artifact shows real input rather than a claim about it.
+  await page.evaluate(() => {
+    window.__touchLog = [];
+    for (const type of ['touchstart', 'touchend', 'touchcancel', 'pointerdown', 'pointerup']) {
+      document.addEventListener(type, e => window.__touchLog.push(
+        { type: e.type, isTrusted: e.isTrusted, at: Math.round(performance.now()) }), true);
+    }
   });
+
+  let cdp = null;
   try {
-    await page.mouse.move(x, y);
-    await page.mouse.down();
-    report.textAtPress = await screenText();
-    await page.waitForTimeout(holdMs);
-    report.textDuringHold = await screenText();
-    report.selectionDuringHold = await page.evaluate(() => String(window.getSelection()));
-    await page.mouse.up();
-    report.hold = `held ${holdMs}ms and released`;
-    report.selection = await page.evaluate(() => String(window.getSelection()));
+    cdp = await context.newCDPSession(page);
   } catch (err) {
-    report.error = err.message;
+    report.limitation = `no sustained-touch mechanism: ${err.message.split('\n')[0]}. `
+      + 'This engine\'s automation exposes only Input.dispatchTapEvent for touch (an atomic '
+      + 'tap with no press duration), so a held touch cannot be delivered here at all.';
   }
+
+  if (cdp) {
+    try {
+      const started = Date.now();
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+      report.textAtPress = await look();
+      await page.waitForTimeout(holdMs);
+      report.textDuringHold = await look();
+      report.selectionDuringHold = await page.evaluate(() => String(window.getSelection()));
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      report.heldMs = Date.now() - started;
+      report.mechanism = 'CDP Input.dispatchTouchEvent (touchStart, hold, touchEnd)';
+      report.sustained = true;
+      report.selectionAfterRelease = await page.evaluate(() => String(window.getSelection()));
+    } catch (err) {
+      report.error = err.message.split('\n')[0];
+    }
+  } else {
+    // The real touch this engine can deliver. A tap, explicitly labelled a tap.
+    try {
+      report.textAtPress = await look();
+      await page.touchscreen.tap(x, y);
+      report.tap = 'touchscreen.tap delivered (atomic, no press duration)';
+      report.mechanism = 'Playwright touchscreen.tap';
+      report.textDuringHold = await look();
+      report.selectionAfterRelease = await page.evaluate(() => String(window.getSelection()));
+    } catch (err) {
+      report.error = err.message.split('\n')[0];
+    }
+  }
+  report.events = await page.evaluate(() => window.__touchLog || []);
+  const touches = report.events.filter(e => e.type.startsWith('touch'));
+  report.touchEventsDelivered = touches.length;
+  report.allTouchEventsTrusted = touches.length > 0 && touches.every(e => e.isTrusted);
+  const down = touches.find(e => e.type === 'touchstart');
+  const up = touches.find(e => e.type === 'touchend');
+  report.observedPressMs = down && up ? up.at - down.at : null;
   return report;
+}
+
+// The sustained-touch half of the gesture evidence, run on the engine whose automation can
+// actually hold a touch down. Same delivered page and same mobile emulation as the WebKit
+// attempt; only the engine differs, because only this one exposes touchStart/touchEnd.
+export async function sustainedTouchOnChromium(ctx, t, { target, unicodeLine }) {
+  const browser = await ctx.chromium.launch();
+  try {
+    const context = await browser.newContext({ ...ctx.devices['Pixel 7'] });
+    await context.addInitScript(SOCKET_STUB);
+    const page = await context.newPage();
+    await page.goto(`${ctx.origin}/?open=A`);
+    await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
+    await emit(page, 'output', `initial history\n${unicodeLine}\n`);
+    await emit(page, 'screen', `${target}\n`);
+    await page.waitForSelector('#terminal .msg-screen');
+    await startStream(page, 100, ` ${target}`);
+    const box = await page.evaluate(() => {
+      const r = document.querySelector('#terminal .msg-screen').getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height };
+    });
+    const held = await sustainedTouch(page, context, box, 900, { watch: '#terminal .msg-screen' });
+    await stopStream(page);
+    t.note('chromiumSustainedTouch', { engine: 'chromium', version: browser.version(), ...held });
+    t.eq(held.sustained, true, 'a sustained touch was delivered through the engine, not a mouse or a scripted event');
+    t.eq(held.allTouchEventsTrusted, true, 'the sustained touch events were engine-generated (isTrusted)');
+    t.ok(held.observedPressMs >= 850,
+      `the touch was actually held down for >=850ms (page observed ${held.observedPressMs}ms between touchstart and touchend)`);
+    t.includes(held.textAtPress, target, 'the touched node holds real transcript text');
+    t.eq(held.textDuringHold, held.textAtPress,
+      'the touched text is byte-identical across a real held touch while both stream types keep arriving');
+    // Whatever the gesture recognizer does or does not do is recorded, never asserted into
+    // a pass: headless Chromium has no long-press text-selection gesture either.
+    t.note('sustainedTouchSelection', {
+      selectionDuringHold: held.selectionDuringHold,
+      producedSelection: !!held.selectionDuringHold,
+      note: 'Neither pinned engine runs the iOS long-press selection gesture. Touch delivery is proven; native selection handles are not available in either, which is why the visible fallback is mandatory.',
+    });
+  } finally {
+    await browser.close();
+  }
 }
 
 // Replays a `stream-target` announcement on the page's current socket, exactly as the

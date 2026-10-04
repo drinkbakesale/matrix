@@ -434,11 +434,30 @@ would mean a model-derived string influencing a triage view, which the contract 
   Playwright WebKit/Chromium against a loopback fixture server with a stubbed WebSocket, a fake
   tmux and an injectable clock. Desktop WebKit has no SpringBoard, no native iOS selection
   handles and no OS share sheet; a programmatic `display-mode: standalone` is **not** an
-  installed iOS PWA. The mandatory native long-press attempt is recorded honestly in
-  `copy-diagnosis.json` / the `nativeLongPress` note, including that WebKit has no
-  constructible `Touch`.
+  installed iOS PWA.
+* **The touch attempt, precisely.** Three kinds of input are recorded separately in
+  `browser-trace.json` and never conflated:
+  * `webkitTouchAttempt` — WebKit **did** receive real engine-generated touch
+    (`touchstart`/`touchend`, `isTrusted: true`), but as an **atomic tap**: both events land
+    at the same millisecond, so the observed press is 0 ms. A press-and-hold **cannot be
+    delivered to WebKit at all** under the pinned Playwright: `newCDPSession` is Chromium-only
+    and `playwright-core/lib/server/webkit/wkInput.js` sends only `Input.dispatchTapEvent`,
+    which has no press duration. This is a limitation of the automation protocol, recorded as
+    such — not a pass, and not a claim about the product.
+  * `chromiumSustainedTouch` — a genuinely **sustained** touch on the one engine whose
+    automation can hold one: CDP `Input.dispatchTouchEvent` touchStart → hold → touchEnd, with
+    the page observing 914 ms between trusted `touchstart` and `touchend` while both stream
+    types kept arriving, and the touched text byte-identical throughout.
+  * `syntheticLongPress` — scripted `dispatchEvent` (`isTrusted: false`). It proves the DOM
+    race causally and is never offered as gesture proof.
+  Neither engine runs the iOS long-press text-selection gesture, so neither produced a
+  selection from touch. That is exactly why the visible **Select / copy** fallback is
+  mandatory and is the path actually tested end to end. Whether a real iOS finger selects
+  text in the installed PWA remains **unverified** and is listed below.
 * **[observed], live:** the launchd/tmux facts in §1.8 and §1.1–§1.2 only.
-* **Unverified, and not claimed:** real APNs delivery, the installed-PWA deep link (§4.3), and
+* **Unverified, and not claimed:** real APNs delivery, the installed-PWA deep link (§4.3),
+  whether a real iOS long press selects transcript text in the installed PWA (no pinned
+  engine can run that gesture; verify by hand on the phone after deploying), and
   the accuracy of the opt-in `claude`-CLI brief generator on real transcripts. The shipped
   default brief generator is extractive and was measured on the frozen eight-record corpus
   (6/6 useful, 2/2 abstentions, 0 unsupported clauses) — that is a fixed synthetic corpus, not

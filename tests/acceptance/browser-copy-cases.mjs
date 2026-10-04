@@ -3,8 +3,8 @@
 
 import { diagnose, TARGET } from './browser-diagnosis.mjs';
 import {
-  newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, trustedLongPress,
-  engineCapabilities, saveArtifact, STANDALONE_STUB,
+  newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
+  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium,
 } from './browser-support.mjs';
 
 const UNICODE_LINE = 'café 日本語 — copy me exactly\twith a tab';
@@ -97,21 +97,22 @@ export async function mobileStreamSelection(ctx, t) {
     const r = el.getBoundingClientRect();
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   });
-  const trusted = await trustedLongPress(page, targetBox, 900);
-  const nativeSelection = !!(trusted.selection && trusted.selection.length > 0);
-  t.note('trustedLongPress', { ...trusted, producedSelection: nativeSelection });
-  t.eq(trusted.error, null, 'a trusted press-and-hold was delivered through the engine input API');
-  t.includes(trusted.textAtPress, TARGET, 'the pressed node holds real transcript text');
-  t.eq(trusted.textDuringHold, trusted.textAtPress,
-    'under a trusted hold the touched text is byte-identical while both stream types keep arriving');
-  if (nativeSelection) {
-    await page.waitForTimeout(3100);
-    const stillSelected = await page.evaluate(() => String(window.getSelection()));
-    t.eq(stillSelected, trusted.selection, 'a trusted-input selection stayed byte-identical for 3 seconds');
-  } else {
-    t.note('trustedLongPressLimitation',
-      'WebKit under Playwright produced no selection from a trusted press-and-hold: no SpringBoard, no selection handles. The visible fallback below is the tested path.');
-  }
+  const wk = await sustainedTouch(page, context, targetBox, 900, { watch: '#terminal .msg-screen' });
+  t.note('webkitTouchAttempt', { engine: 'webkit', version: ctx.browser.version(), ...wk });
+  t.eq(wk.error, null, 'the WebKit touch attempt ran without an automation error');
+  t.ok(wk.touchEventsDelivered > 0, `real touch input reached the page on WebKit (${wk.touchEventsDelivered} events)`);
+  t.eq(wk.allTouchEventsTrusted, true, 'every touch event WebKit delivered was engine-generated (isTrusted)');
+  t.includes(wk.textAtPress, TARGET, 'the touched node holds real transcript text');
+  t.eq(wk.textDuringHold, wk.textAtPress, 'the touched text is byte-identical across the WebKit touch');
+  // Honest capability split: WebKit delivered touch, but cannot hold it. That is a property
+  // of the automation protocol, not of the product, and it is why the visible fallback
+  // below — not a long press — is the path this build actually tests on WebKit.
+  t.eq(wk.sustained, false, 'WebKit automation cannot hold a touch down: recorded as a capability limit, not a pass');
+  t.ok(wk.limitation && wk.limitation.includes('dispatchTapEvent'),
+    'the WebKit limitation names the exact protocol facility that is missing');
+
+  // A SUSTAINED touch, on the engine whose automation can actually hold one.
+  await sustainedTouchOnChromium(ctx, t, { target: TARGET, unicodeLine: UNICODE_LINE });
 
   // 1b. SYNTHETIC gesture, recorded separately and never conflated with the above: it is
   // what proves the DOM race causally, and it completes with a release.
