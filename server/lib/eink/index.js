@@ -9,6 +9,7 @@ const { createPush } = require('./push');
 const { createService } = require('./service');
 const { createEvidence } = require('./evidence');
 const { createRouter } = require('./router');
+const { validateBind, isLoopback } = require('./ingress');
 
 const BASE = '/api/eink/v1';
 
@@ -41,7 +42,13 @@ function mount(app, { home, webpush, vapid = () => null, pollMs = parseInt(proce
   }
   const { service, evidence, auth, push } = parts;
   const router = createRouter({ service, evidence, auth, push, vapidPublicKey: () => (vapid() ? vapid().publicKey : null) });
-  app.use(BASE, router);
+  // On Matrix's main listener (which the legacy views bind to every interface) the e-ink API is
+  // served only to connections that arrived on loopback: the local hook and Tailscale Serve's proxy.
+  // LAN clients must use the pinned TLS listener; nothing else can reach the API.
+  app.use(BASE, (req, res, next) => {
+    if (!isLoopback(req.socket.localAddress)) return res.status(403).json({ error: 'the e-ink API is not served on this interface' });
+    next();
+  }, router);
 
   let ticking = false;
   const tick = async () => {
@@ -60,25 +67,34 @@ function mount(app, { home, webpush, vapid = () => null, pollMs = parseInt(proce
   return { ...parts, router, close: () => timers.forEach(clearInterval) };
 }
 
-// A second, TLS-only listener for the RM2 on the home LAN. It serves nothing
-// but the e-ink API and exists only when a certificate has been provisioned.
-function listenTls({ router, fs = require('fs'), home, port, host = '0.0.0.0' }) {
+// A second, TLS-only listener for the RM2 on the home LAN. It serves nothing but the e-ink API,
+// exists only when a certificate has been provisioned, and binds exactly one validated private
+// (or loopback) address of this Mac: never a wildcard, never a public address.
+function listenTls({ router, fs = require('fs'), home, port, bind = process.env.MATRIX_EINK_TLS_BIND, interfaces }) {
   const dir = path.join(home, 'eink', 'tls');
   let key; let cert;
   try {
     key = fs.readFileSync(path.join(dir, 'key.pem'));
     cert = fs.readFileSync(path.join(dir, 'cert.pem'));
   } catch (err) {
-    if (err.code === 'ENOENT') return { started: false, reason: 'no LAN certificate provisioned (run scripts/matrix-eink setup-tls)' };
+    if (err.code === 'ENOENT') return { started: false, reason: 'no LAN certificate provisioned (run scripts/matrix-eink setup-tls --bind <LAN address>)' };
     throw err;
   }
+  if (bind === undefined) {
+    try { bind = JSON.parse(fs.readFileSync(path.join(home, 'eink', 'listen.json'), 'utf8')).address; } catch (err) {
+      if (err.code !== 'ENOENT') return { started: false, reason: `eink/listen.json is unreadable: ${err.message}` };
+    }
+  }
+  const v = validateBind(bind, interfaces);
+  if (!v.ok) return { started: false, reason: `refusing to open the RM2 listener: ${v.reason}` };
   const tlsApp = express();
   tlsApp.disable('x-powered-by');
   tlsApp.use(BASE, router);
   tlsApp.use((req, res) => res.status(404).json({ error: 'only the e-ink API is served here' }));
   const server = require('https').createServer({ key, cert, minVersion: 'TLSv1.2' }, tlsApp);
-  server.listen(port, host);
-  return { started: true, server };
+  server.on('error', (err) => console.error(`[eink] RM2 listener on ${v.addr}:${port} failed: ${err.message}`));
+  server.listen({ port, host: v.addr, ipv6Only: true });
+  return { started: true, server, address: v.addr };
 }
 
 module.exports = { mount, build, listenTls, BASE };

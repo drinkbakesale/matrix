@@ -209,7 +209,40 @@ module.exports = (L) => {
       // Diagnostics never leak credentials.
       const all = outputs.join('\n') + client.stderr + g.stderr + impostor.stderr + srv.readLog();
       assert.ok(!all.includes(device) && !all.includes(ctl), 'no token in any diagnostic output or log');
-      t.note('TLS: wrong cert, pin mismatch, name mismatch refused; no downgrade; http:// and URL credentials refused; redirect refused (1 hit, not followed); gateway refuses 0.0.0.0/::/public binds and 7 non-device requests (403); LAN listener serves only the API; no token in diagnostics');
+      // Listener binding: the RM2 TLS listener opens only on one validated private address of this Mac.
+      const net = require('net');
+      const lanIf = Object.values(L.os.networkInterfaces()).flat().find((i) => i.family === 'IPv4' && !i.internal && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(i.address));
+      assert.ok(lanIf, 'this check needs the test machine to have a private LAN address');
+      const lanAddr = lanIf.address;
+      const connect = (host, port) => new Promise((res) => { const c = net.connect({ host, port }, () => { c.destroy(); res('open'); }); c.setTimeout(1500, () => { c.destroy(); res('timeout'); }); c.on('error', (e) => res(e.code)); });
+      const refusals = [['0.0.0.0', /wildcard address 0\.0\.0\.0/], ['::', /wildcard address ::/], ['::ffff:0.0.0.0', /wildcard/], ['8.8.8.8', /not a private LAN address/], ['::ffff:8.8.8.8', /not a private LAN address/], ['2001:4860:4860::8888', /not a private/], ['10.255.254.253', /not an address of this Mac/], ['not-an-address', /not an IP address/], ['', /no bind address configured/]];
+      for (const [bind, why] of refusals) {
+        const s2 = await L.startServer({ env: { ...tm.env, MATRIX_EINK_TLS_BIND: bind }, tls: true });
+        assert.notEqual(await connect('127.0.0.1', s2.tlsPort), 'open', `bind ${JSON.stringify(bind)}: nothing listens on loopback`);
+        assert.notEqual(await connect(lanAddr, s2.tlsPort), 'open', `bind ${JSON.stringify(bind)}: nothing listens on the LAN address`);
+        assert.match(s2.readLog(), /E-ink LAN endpoint not started: /, 'the refusal is logged');
+        assert.match(s2.readLog(), why, `bind ${JSON.stringify(bind)}: actionable reason`);
+        assert.equal((await L.http('GET', `${s2.base}/`)).status, 200, 'Matrix itself still runs');
+        await s2.stop();
+      }
+      const cli = L.spawnSync(process.execPath, [path.join(L.candidate, 'scripts/matrix-eink'), 'setup-tls', '--bind', '0.0.0.0'], { encoding: 'utf8', env: { ...process.env, MATRIX_HOME: L.tmp('clihome') } });
+      assert.equal(cli.status, 1);
+      assert.match(cli.stderr, /--bind refused: the wildcard address/);
+      // Bound to the LAN address: the intended LAN path works, every other path to that port is closed.
+      const s3 = await L.startServer({ env: { ...tm.env, MATRIX_EINK_TLS_BIND: lanAddr }, tls: true });
+      const dev3 = s3.token('device');
+      assert.equal(await connect(lanAddr, s3.tlsPort), 'open', 'the LAN address accepts connections');
+      assert.equal(await connect('127.0.0.1', s3.tlsPort), 'ECONNREFUSED', 'the same port on another interface is closed: the listener is not a wildcard');
+      const lanEp = { ...s3.endpoint('home-lan'), url: `https://${lanAddr}:${s3.tlsPort}` };
+      assert.equal((await tlsRequest(lanEp, 'GET', '/api/eink/v1/snapshot', { token: dev3 })).status, 200, 'the RM2 route over the LAN address works with the pinned certificate');
+      assert.match(s3.readLog(), new RegExp(`E-ink LAN endpoint \\(TLS\\) on ${lanAddr.replace(/\./g, '\\.')}:${s3.tlsPort} only`));
+      // Matrix's main listener is on every interface for the legacy views; the e-ink API on it answers loopback only
+      // (the hook and Tailscale Serve's local proxy), so no other listener bypasses the restriction.
+      assert.equal((await L.http('GET', `http://${lanAddr}:${s3.port}/api/eink/v1/snapshot`, { token: dev3 })).status, 403, 'plaintext API over the LAN interface is refused');
+      assert.equal((await L.http('POST', `http://${lanAddr}:${s3.port}/api/eink/v1/pair`, { body: { code: 'x' } })).status, 403);
+      assert.equal((await L.http('GET', `http://127.0.0.1:${s3.port}/api/eink/v1/snapshot`, { token: dev3 })).status, 200, 'the loopback path (Tailscale Serve, hook) works');
+      assert.equal((await L.http('GET', `http://${lanAddr}:${s3.port}/`)).status, 200, 'the legacy views keep their existing LAN behaviour');
+      t.note(`listener binding: ${refusals.length} wildcard/public/mapped/non-local/malformed/missing bind values refused with reasons and nothing listening; bound to ${lanAddr} only (loopback on that port refused); API on the main port is loopback-only (LAN → 403). TLS: wrong cert, pin mismatch, name mismatch refused; no downgrade; http:// and URL credentials refused; redirect refused (1 hit, not followed); gateway refuses 0.0.0.0/::/public binds and 7 non-device requests (403); LAN listener serves only the API; no token in diagnostics`);
     },
   };
 };

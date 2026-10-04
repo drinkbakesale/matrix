@@ -78,7 +78,7 @@ module.exports = ({ candidate, artifacts }) => {
     const out = fs.openSync(log, 'a');
     const proc = spawn(process.execPath, [path.join(root, 'server', 'server.js')], {
       cwd: root, stdio: ['ignore', out, out],
-      env: { ...process.env, TMUX: '', TMUX_PANE: '', PYTHON_PATH: '/usr/bin/false', MATRIX_HOME: home, MATRIX_PORT: String(port), MATRIX_EINK_TLS_PORT: String(tlsPort), MATRIX_EINK_POLL_MS: '150', MATRIX_EINK_TRANSCRIPT_ROOT: transcripts, MATRIX_BUILDCTL: '/nonexistent/buildctl', ...env },
+      env: { ...process.env, TMUX: '', TMUX_PANE: '', PYTHON_PATH: '/usr/bin/false', MATRIX_HOME: home, MATRIX_PORT: String(port), MATRIX_EINK_TLS_PORT: String(tlsPort), MATRIX_EINK_TLS_BIND: '127.0.0.1', MATRIX_EINK_POLL_MS: '150', MATRIX_EINK_TRANSCRIPT_ROOT: transcripts, MATRIX_BUILDCTL: '/nonexistent/buildctl', ...env },
     });
     procs.push(proc);
     const base = `http://127.0.0.1:${port}`;

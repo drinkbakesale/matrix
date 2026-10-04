@@ -125,6 +125,14 @@ switch (cmd) {
   case 'list': console.log(JSON.stringify(auth().list(), null, 1)); break;
   case 'revoke': if (!arg) die('usage: matrix-eink revoke <id>'); console.log(auth().revoke(arg) ? 'revoked' : die('no such token id')); break;
   case 'setup-tls': {
+    const bi = process.argv.indexOf('--bind');
+    if (bi >= 0) {
+      // The one address the RM2 listener may bind: validated now, and again every time Matrix starts.
+      const v = require('../server/lib/eink/ingress').validateBind(process.argv[bi + 1]);
+      if (!v.ok) die(`--bind refused: ${v.reason}`);
+      fs.mkdirSync(EINK, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(EINK, 'listen.json'), JSON.stringify({ address: v.addr }) + '\n');
+    }
     const info = setupTls(process.argv.includes('--force'));
     console.log(JSON.stringify(process.argv.includes('--json') ? info : { pin_sha256: info.pin_sha256, server_name: info.server_name, cert: path.join(EINK, 'tls', 'cert.pem') }));
     if (!process.argv.includes('--json')) console.error('Restart Matrix (matrix-app stop; matrix-app start) so the LAN endpoint on port 7779 starts.');
@@ -135,7 +143,7 @@ switch (cmd) {
   case 'status': {
     const tls = fs.existsSync(path.join(EINK, 'tls', 'cert.pem'));
     const hooked = HOOK_EVENTS.filter((ev) => ((readSettings().hooks || {})[ev] || []).some(isOurs));
-    console.log(JSON.stringify({ home: EINK, lan_tls_certificate: tls, hook_events_installed: hooked.length, hook_events_expected: HOOK_EVENTS.length, hook_token: fs.existsSync(path.join(EINK, 'hook-token')), tokens: auth().list().filter((t) => !t.revoked).map((t) => `${t.scope}:${t.id}`) }, null, 1));
+    console.log(JSON.stringify({ home: EINK, lan_tls_certificate: tls, lan_bind_address: (() => { try { return JSON.parse(fs.readFileSync(path.join(EINK, 'listen.json'), 'utf8')).address; } catch { return null; } })(), hook_events_installed: hooked.length, hook_events_expected: HOOK_EVENTS.length, hook_token: fs.existsSync(path.join(EINK, 'hook-token')), tokens: auth().list().filter((t) => !t.revoked).map((t) => `${t.scope}:${t.id}`) }, null, 1));
     break;
   }
   default: die('usage: matrix-eink <pair-code|token|list|revoke|setup-tls|install-hook|uninstall-hook|status>');

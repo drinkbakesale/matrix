@@ -19,8 +19,9 @@ What this gives you:
 ```bash
 cd ~/Projects/matrix
 scripts/matrix-eink install-hook     # adds the evidence hook to ~/.claude/settings.json; other hooks untouched
-scripts/matrix-eink setup-tls        # creates the pinned LAN certificate for the RM2
-matrix-app stop && matrix-app start  # Matrix now also listens on :7779 (TLS, e-ink API only)
+scripts/matrix-eink setup-tls --bind <this Mac's LAN address>   # e.g. 192.168.68.63; creates the pinned certificate and
+                                     # records the ONE address the RM2 listener may use
+matrix-app stop && matrix-app start  # Matrix now also listens on <that address>:7779 (TLS, e-ink API only)
 scripts/matrix-eink status
 ```
 
@@ -28,6 +29,28 @@ scripts/matrix-eink status
   next starts. Until a session has produced a hook event, its row says so ("No Claude evidence is bound…") instead of
   guessing a state.
 - Undo: `scripts/matrix-eink uninstall-hook` removes only the entries it added.
+
+### Who can reach what
+
+| Listener | Bound to | Serves | Reachable from |
+|---|---|---|---|
+| RM2 listener, port 7779, TLS | exactly the private address in `~/.matrix/eink/listen.json` | e-ink API only, token required | devices on that LAN subnet |
+| Matrix, port 7778 (unchanged) | every interface, as before | legacy views everywhere; **e-ink API and pairing only for connections arriving on loopback** | the hook on this Mac; the iPad through Tailscale Serve (which connects over loopback) |
+
+- The RM2 listener refuses to start on `0.0.0.0`, `::`, IPv4-mapped forms of those, any public address, an address
+  this Mac does not have, or with no address configured. Matrix logs the reason
+  (`E-ink LAN endpoint not started: …`) and keeps running. IPv6: only unique-local (`fc00::/7`) or `::1` are accepted.
+- Verify after every restart:
+  `grep 'E-ink LAN endpoint' ~/.matrix/logs/*.log | tail -1` must show `on <LAN address>:7779 only`;
+  `lsof -nP -iTCP:7779 -sTCP:LISTEN` must show that address, not `*:7779`;
+  from another device on the LAN, `curl -s -o /dev/null -w '%{http_code}' http://<LAN address>:7778/api/eink/v1/snapshot` must print `403`.
+- Firewall: no change is needed and none is made. If the macOS firewall is on (System Settings → Network → Firewall),
+  allow incoming connections for `node` when asked; do not turn the firewall off. On the router, forward **no** port to
+  7778 or 7779: that is what keeps both unreachable from the internet. Check with a phone on mobile data (Wi-Fi off):
+  `https://<your public IP>:7779` must not connect.
+- The Mac's LAN address changed? `scripts/matrix-eink setup-tls --bind <new address>`, restart Matrix, and run
+  `rm2-install install` again with the new `--url`.
+- Roll back: delete `~/.matrix/eink/listen.json` and restart Matrix; the RM2 listener stays closed.
 
 ## 2. iPad
 

@@ -1345,6 +1345,6 @@ server.listen(PORT, '0.0.0.0', () => {
   if (eink.router) {
     const tlsPort = parseInt(process.env.MATRIX_EINK_TLS_PORT, 10) || 7779;
     const tls = require('./lib/eink').listenTls({ router: eink.router, home: MATRIX_HOME, port: tlsPort });
-    console.log(tls.started ? `E-ink LAN endpoint (TLS) on port ${tlsPort}` : `E-ink LAN endpoint not started: ${tls.reason}`);
+    console.log(tls.started ? `E-ink LAN endpoint (TLS) on ${tls.address}:${tlsPort} only` : `E-ink LAN endpoint not started: ${tls.reason}`);
   }
 });
