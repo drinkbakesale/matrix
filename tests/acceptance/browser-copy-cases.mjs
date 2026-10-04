@@ -3,7 +3,7 @@
 
 import { diagnose, TARGET } from './browser-diagnosis.mjs';
 import {
-  newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
+  newPage, emit, SOCKET_STUB, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
   engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch, assertNativeSelectionSurvives, readRealClipboard,
 } from './browser-support.mjs';
 
@@ -223,6 +223,7 @@ export async function clipboardAndFailure(ctx, t) {
   // At least one engine must produce a real, exact clipboard round-trip through the visible
   // control. "Both engines said Copy failed" is a failing case, not a documented limitation.
   const roundTrips = [];
+  const subsetRoundTrips = [];
 
   for (const [engineName, launcher, device] of [
     ['webkit-mobile', ctx.webkit, ctx.devices['iPhone 13']],
@@ -233,15 +234,7 @@ export async function clipboardAndFailure(ctx, t) {
       const contextOpts = device ? { ...device } : { viewport: { width: 1280, height: 860 } };
       if (engineName.startsWith('chromium')) contextOpts.permissions = ['clipboard-read', 'clipboard-write'];
       const context = await browser.newContext(contextOpts);
-      await context.addInitScript(() => {
-        window.__sockets = [];
-        window.WebSocket = class {
-          static OPEN = 1;
-          constructor(url) { this.url = url; this.readyState = 1; window.__sockets.push(this); setTimeout(() => this.onopen && this.onopen({}), 0); }
-          send() {} close() { this.readyState = 3; }
-        };
-        window.EventSource = class { close() {} };
-      });
+      await context.addInitScript(SOCKET_STUB);
       await context.addInitScript(STANDALONE_STUB);
       const page = await context.newPage();
       await page.goto(`${ctx.origin}/?open=A`);
@@ -262,6 +255,7 @@ export async function clipboardAndFailure(ctx, t) {
       const clip = await readRealClipboard(page, context);
       report.engines[engineName] = { caps, status, state, clip: { ...clip, text: (clip.text || '').slice(0, 400) }, expectedLength: COPY_FIXTURE.length };
 
+      let clipboardWorks = false;
       if (state === 'copied') {
         t.ok(clip.ok, `${engineName}: a copy reported as succeeded is readable back from the real clipboard`);
         if (clip.ok) {
@@ -271,6 +265,7 @@ export async function clipboardAndFailure(ctx, t) {
           t.ok(!clip.text.includes('Copy selection') && !clip.text.includes('Project goal'),
             `${engineName}: no control label or brief text is included`);
           if (exact) roundTrips.push({ engine: engineName, via: clip.via, chars: clip.text.length });
+          clipboardWorks = exact;
         }
       } else {
         t.includes(status, 'Copy failed', `${engineName}: a copy that did not succeed says so instead of claiming success`);
@@ -288,14 +283,21 @@ export async function clipboardAndFailure(ctx, t) {
       await page.waitForTimeout(200);
       const subState = await page.getAttribute('#copy-sheet', 'data-copy-state');
       const subClip = subState === 'copied' ? await readRealClipboard(page, context) : null;
-      if (!subClip) {
-        t.includes(await page.textContent('#copy-status'), 'Copy failed',
-          `${engineName}: a selection copy that did not succeed says so instead of claiming success`);
-      } else {
-        t.ok(subClip.ok, `${engineName}: a selection copy reported as succeeded is readable back`);
-        t.eq(subClip.text, UNICODE_LINE, `${engineName}: Copy selection delivers exactly the selected subset`);
-        t.ok(!String(subClip.text).includes('first line') && !String(subClip.text).includes('last line'),
+      // An engine whose clipboard just carried the whole snapshot has no excuse for failing
+      // the subset: only a genuine whole-clipboard platform limitation earns the documented
+      // failure branch, and a selection-only failure must not hide behind it.
+      if (clipboardWorks) {
+        t.eq(subState, 'copied', `${engineName}: Copy selection succeeds on an engine whose Copy all just succeeded`);
+        t.ok(subClip && subClip.ok, `${engineName}: the selection copy is readable back from the real clipboard`);
+        t.eq(subClip && subClip.text, UNICODE_LINE, `${engineName}: Copy selection delivers exactly the selected subset`);
+        t.ok(subClip && !String(subClip.text).includes('first line') && !String(subClip.text).includes('last line'),
           `${engineName}: Copy selection does not drag in unselected lines`);
+        if (subClip && subClip.ok && subClip.text === UNICODE_LINE) {
+          subsetRoundTrips.push({ engine: engineName, via: subClip.via, chars: subClip.text.length });
+        }
+      } else {
+        t.includes(await page.textContent('#copy-status'), 'Copy failed',
+          `${engineName}: with no working clipboard at all, the selection copy says so instead of claiming success`);
       }
 
       // Empty selection must not copy anything else.
@@ -309,14 +311,8 @@ export async function clipboardAndFailure(ctx, t) {
 
       // A denied / unavailable clipboard must fail visibly, keeping the snapshot.
       const denied = await browser.newContext(contextOpts);
+      await denied.addInitScript(SOCKET_STUB);
       await denied.addInitScript(() => {
-        window.__sockets = [];
-        window.WebSocket = class {
-          static OPEN = 1;
-          constructor() { this.readyState = 1; window.__sockets.push(this); setTimeout(() => this.onopen && this.onopen({}), 0); }
-          send() {} close() {}
-        };
-        window.EventSource = class { close() {} };
         Object.defineProperty(navigator, 'clipboard', {
           configurable: true,
           value: { writeText: () => Promise.reject(new DOMException('NotAllowedError: write permission denied')) },
@@ -342,12 +338,16 @@ export async function clipboardAndFailure(ctx, t) {
   }
   report.limitation = 'A programmatic standalone display-mode is not an installed iOS PWA; no SpringBoard callout or OS share sheet is exercised here.';
   report.successfulRoundTrips = roundTrips;
+  report.successfulSubsetRoundTrips = subsetRoundTrips;
   saveArtifact(ctx.artifactDir, 'clipboard-evidence.json', report);
   // The whole point of the case: somewhere, the visible control really did put the exact
   // transcript text on the real system clipboard.
   t.ok(roundTrips.length >= 1,
     `at least one engine completed an exact clipboard round-trip through the visible control (got ${JSON.stringify(roundTrips)})`);
-  t.note('clipboard', { engines: report.engines, roundTrips });
+  // Copy selection is its own path and needs its own real round-trip, not Copy all's.
+  t.ok(subsetRoundTrips.length >= 1,
+    `at least one engine completed an exact clipboard round-trip for a nonempty selected subset (got ${JSON.stringify(subsetRoundTrips)})`);
+  t.note('clipboard', { engines: report.engines, roundTrips, subsetRoundTrips });
 }
 
 export async function desktopScrollLifecycle(ctx, t) {
