@@ -8,11 +8,26 @@
 // is a real defect (the terminal silently stops updating), but fixing it is audit
 // improvement 3, a separate build, not something this extraction may change.
 
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const attention = require('./attention');
 
 const POLL_MS = 100;
 const MAX_CAPTURE_ERRORS = 20;
+
+// `session` and `window` arrive in the WebSocket query string, so they are attacker-shaped
+// input. Two separate protections, because they stop two different things:
+//   1. Every tmux call below is an argument vector, never a shell string. A name containing
+//      a quote or a semicolon is one argument, not a command.
+//   2. tmux's own target syntax is `session:window.pane`, so a name carrying `:` or `.`
+//      could still address a pane the client never asked for even through argv. Names that
+//      could do that are refused outright rather than sanitised.
+const SAFE_NAME = /^[^\u0000-\u001f:.]{1,200}$/;
+
+function tmux(args, extra) {
+  return execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], ...extra });
+}
+
+const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
 
 function attach(wss, { port }) {
   wss.on('connection', (ws, req) => {
@@ -24,20 +39,33 @@ function attach(wss, { port }) {
       ws.close(1008, 'session parameter required');
       return;
     }
+    if (!SAFE_NAME.test(session) || (window && !SAFE_NAME.test(window))) {
+      ws.close(1008, 'invalid session or window name');
+      return;
+    }
 
-    // Auto-detect the window with claude running
+    // Resolve the target before using it. This enumeration already had to happen to find the
+    // Claude window; doing it unconditionally also answers "does this session exist" and
+    // "is the requested window real" from data we were fetching anyway, so a client cannot
+    // name a pane into existence. An empty or failed listing means we cannot resolve
+    // anything, and the connection is refused rather than pointed somewhere arbitrary.
+    let panes = [];
+    try {
+      panes = tmux(['list-panes', '-s', '-t', session, '-F', '#{window_name}|#{pane_current_command}'])
+        .trim().split('\n').filter(Boolean);
+    } catch { panes = []; }
+    if (!panes.length) {
+      ws.close(1008, 'no such tmux session');
+      return;
+    }
+    const names = panes.map(p => p.split('|')[0]);
+    if (window && !names.includes(window)) {
+      ws.close(1008, 'no such tmux window in that session');
+      return;
+    }
     if (!window) {
-      try {
-        const panes = execSync(
-          `tmux list-panes -s -t '${session}' -F '#{window_name}|#{pane_current_command}' 2>/dev/null`,
-          { encoding: 'utf8' }
-        ).trim().split('\n');
-        const claudePane = panes.find(p => {
-          const cmd = p.split('|')[1] || '';
-          return cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
-        });
-        if (claudePane) window = claudePane.split('|')[0];
-      } catch {}
+      const claudePane = panes.find(p => isClaudeCmd(p.split('|')[1] || ''));
+      if (claudePane) window = claudePane.split('|')[0];
     }
 
     const target = window ? `${session}:${window}` : session;
@@ -60,10 +88,7 @@ function attach(wss, { port }) {
     // Never resize the pane — the local iTerm2 owns its size.
     function getPaneSize() {
       try {
-        const info = execSync(
-          `tmux display-message -t '${target}' -p '#{pane_width}|#{pane_height}' 2>/dev/null`,
-          { encoding: 'utf8' }
-        ).trim();
+        const info = tmux(['display-message', '-t', target, '-p', '#{pane_width}|#{pane_height}']).trim();
         const [w, h] = info.split('|');
         return { cols: parseInt(w) || 80, rows: parseInt(h) || 24 };
       } catch {
@@ -76,9 +101,7 @@ function attach(wss, { port }) {
     // symptom: pane-size sent, output never sent).
     function captureAll() {
       try {
-        return execSync(`tmux capture-pane -t '${target}' -p -S - 2>/dev/null`, {
-          encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-        });
+        return tmux(['capture-pane', '-t', target, '-p', '-S', '-'], { maxBuffer: 64 * 1024 * 1024 });
       } catch {
         return '';
       }
@@ -140,8 +163,8 @@ function attach(wss, { port }) {
       try {
         const msg = JSON.parse(raw);
         if (msg.type === 'input') {
-          const hex = Buffer.from(msg.data).toString('hex').match(/.{2}/g).map(h => '0x' + h).join(' ');
-          execSync(`tmux send-keys -t '${target}' -H ${hex} 2>/dev/null`);
+          const hex = Buffer.from(msg.data).toString('hex').match(/.{2}/g).map(h => '0x' + h);
+          tmux(['send-keys', '-t', target, '-H', ...hex]);
           attention.clearForSession(session);   // the user just answered
         } else if (msg.type === 'resize') {
           const size = getPaneSize();

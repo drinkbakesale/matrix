@@ -20,19 +20,50 @@ function collapse(lines, limit) {
   return text.length > limit ? text.slice(text.length - limit) : text;
 }
 
+// Does this line introduce quoted material, so that a "> " line under it is something the
+// pane is QUOTING rather than something the user said? Two shapes cover what quoting
+// actually looks like in a pane: a lead-in ending in a colon ("Tool output: README says:"),
+// and a line under one of Claude Code's tool/assistant glyphs. A blank line, or the start
+// of the capture, is the opposite — a clean block boundary, which is where real prompts sit.
+//
+// This is a heuristic over plain text, and it is worth being exact about what it is not:
+// `capture-pane -p` gives no styling, so nothing in the bytes *proves* authorship. Text the
+// model reads can still be shaped to look like a prompt. What bounds the damage is that the
+// brief is read-only prose shown to the user and the generator never acts on it, and that
+// when every "> " run is rejected the service reports unavailable instead of inventing one.
+const QUOTE_LEAD_IN = /(:|：)\s*$/;
+const TOOL_GLYPH = /^\s*[⏺⎿]/;
+function isQuotationContext(previous) {
+  if (previous === null) return false;             // start of capture
+  if (previous.trim() === '') return false;        // blank line: a real block boundary
+  return QUOTE_LEAD_IN.test(previous) || TOOL_GLYPH.test(previous);
+}
+
 // Pull the user turns out of a captured pane in order. A turn is one or more consecutive
-// "> " lines; blank and decorative lines are dropped.
+// "> " lines that BEGIN A BLOCK: at the start of the capture, after a blank line, or
+// continuing a turn already in progress.
+//
+// The block rule is the provenance check, and it is the whole point. A pane contains plenty
+// of "> " lines that are not user turns: a README quoted back by a file read, a diff, an
+// email, a code comment. Those arrive immediately under the tool's own output with no blank
+// line between, and a collector that reads "starts with >" as "the user said this" lets any
+// text Claude happens to open rewrite the brief. A quoted line like that is not treated as
+// intent; it stays visible in the pane-tail context item, which carries no intent at all.
+// When that leaves no user turn, the service reports unavailable rather than guessing.
 function userTurns(capture) {
   const turns = [];
   let buffer = [];
+  let previous = null;            // null = start of capture, which is a block boundary
   for (const line of String(capture).split('\n')) {
     const match = USER_LINE.exec(line);
-    if (match) {
+    if (match && (buffer.length || !isQuotationContext(previous))) {
       const body = match[1].trim();
       if (body) buffer.push(body);
+      previous = line;
       continue;
     }
     if (buffer.length) { turns.push(buffer.join(' ')); buffer = []; }
+    previous = line;
   }
   if (buffer.length) turns.push(buffer.join(' '));
   return turns.filter(t => t.length > 2);

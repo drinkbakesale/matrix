@@ -31,6 +31,14 @@ touched, and no notification was sent. **You deploy.**
   Claude and is streaming the session itself", which is why starting Claude in another
   window no longer drags the brief away from the pane you are reading. Polling, input
   routing and the `output`/`screen` frames are unchanged.
+* **The WebSocket stream no longer builds shell commands.** `server/lib/pane-stream.js` used
+  to interpolate the `session` and `window` query parameters into `tmux …` shell strings; a
+  name containing a quote could run arbitrary commands. Every tmux call is now an argument
+  vector. Two behaviour changes come with it, both deliberate: a name containing a control
+  character or a tmux target separator (`:` or `.`) is refused with close code 1008, and a
+  connection whose session or window cannot be found in `tmux list-panes` is refused rather
+  than left streaming nothing. If a session of yours legitimately has a dot or colon in its
+  name, it will stop opening — tell me and the rule can resolve those names instead.
 * **File split.** `server/server.js`, `server/public/app.js` and `server/public/desktop.js`
   were split into cohesive modules so every touched file stays under 500 lines. Behaviour was
   preserved; the existing 62 tests still pass (63 now — one was added).

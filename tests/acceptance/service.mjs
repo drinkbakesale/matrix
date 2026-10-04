@@ -11,7 +11,7 @@ import { createRun, parseArgs } from './assertions.mjs';
 import {
   briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
-  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks,
+  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks, untrustedInputChecks,
 } from './service-support.mjs';
 import { evaluateCorpus } from './corpus.mjs';
 
@@ -126,8 +126,9 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
     activePane: paneFor(byId.f1), otherPane: paneFor(byId.f3),
     expect: { activeGoal: byId.f1.expectedGoal, otherGoal: byId.f3.expectedGoal },
   });
-  for (const [actual, expected, detail] of binding.checks) t.eq(actual, expected, detail);
-  t.note('streamBinding', binding.report);
+  const untrusted = await untrustedInputChecks({ clock: fakeClock(), generator: extractive(), storeFile: store() });
+  for (const [actual, expected, detail] of [...binding.checks, ...untrusted.checks]) t.eq(actual, expected, detail);
+  t.note('streamBinding', { ...binding.report, untrustedInput: untrusted.report });
 
   // Same project, different session: no cross-contamination.
   await service.read('B');

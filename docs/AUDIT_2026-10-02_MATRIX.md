@@ -38,8 +38,12 @@ are D2 (mobile copy) and D3 (session brief).
   *[now `server/lib/attention.js`]*
 * **[observed] 2026-10-02**, running the delivered listing code against this machine's real
   tmux server (read-only; `node -e "require('./server/lib/sessions.js').listLiveSessions()"`):
-  **70 live sessions**, 27 with Claude running, **0 flagged `needsAttention`**, 18 of 70 with
-  any description.
+  **70 live sessions**, 27 with Claude running, 18 of 70 with any description — from tmux
+  itself, so real.
+* **Attention state in that run is NOT a measurement.** `needsAttention` reads
+  `pendingAttention` in `attention.js` (per-process memory only `/api/notify` writes), and
+  that command is a fresh node process whose map starts empty regardless of what the running
+  server believes. **Live attention state is unverified**; establishing it needs a read-only `GET /api/sessions` on the running port compared against the same tmux listing — not done here.
 
 ### 1.2 Project identity
 
@@ -206,7 +210,7 @@ on static checks while the feature did not work.
 |---|---|---|
 | There is no state model — only a boolean | `server.js:531-533 @27534cd` sets `needsAttention` purely from `pendingAttention`, which only a notification writes (`:196-200`) | "Working", "idle", "errored" and "stuck" are not represented anywhere |
 | "Needs input" depends on a hook firing, not on observation | `bin/matrix-notify` → `/api/notify`; no polling path ever sets attention | A session that stopped without a notification is indistinguishable from one that is working |
-| **[observed]** 0 of 70 sessions flagged, with 27 Claudes running | §1.1 | The triage view is, in practice, empty |
+| Attention is in-process memory, lost on restart and invisible to any other process | `attention.js` keeps `pendingAttention` in a module variable only `/api/notify` writes; §1.1 records the live server's attention state as **unverified** from here | Triage state cannot be inspected, tested or recovered after a restart, and this audit cannot say how many sessions the running server has flagged |
 | The one heuristic that exists only *clears* flags | `server.js:1183-1194 @27534cd` looks for spinner/progress glyphs every 10 s and clears attention | The same evidence could set state, and does not |
 | "Stuck" is not defined anywhere | no occurrence of `stuck` in the repository | Nothing can be sorted or badged by it |
 | No counts, no badges, no attention total | `app.js:355-375 @27534cd` renders a per-row badge only | You must scan 70 rows to find the one that needs you |
