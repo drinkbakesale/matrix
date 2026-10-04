@@ -41,7 +41,14 @@ function mount(app, { home, webpush, vapid = () => null, pollMs = parseInt(proce
     return { error: err, close() {} };
   }
   const { service, evidence, auth, push } = parts;
-  const router = createRouter({ service, evidence, auth, push, vapidPublicKey: () => (vapid() ? vapid().publicKey : null) });
+  const api = createRouter({ service, evidence, auth, push, vapidPublicKey: () => (vapid() ? vapid().publicKey : null) });
+  // Nothing is answered until the first session collection has finished (or failed, which the
+  // snapshot then states). A client that reconnects the instant Matrix restarts must never be told
+  // "no sessions" merely because tmux had not been asked yet: it would blank and repaint every row.
+  let firstCollection;
+  const router = express.Router();
+  router.use((req, res, next) => { firstCollection.then(() => next()); });
+  router.use(api);
   // On Matrix's main listener (which the legacy views bind to every interface) the e-ink API is
   // served only to connections that arrived on loopback: the local hook and Tailscale Serve's proxy.
   // LAN clients must use the pinned TLS listener; nothing else can reach the API.
@@ -63,7 +70,7 @@ function mount(app, { home, webpush, vapid = () => null, pollMs = parseInt(proce
     setInterval(tick, pollMs),
     setInterval(() => service.broadcast('heartbeat', {}, { bump: false }), heartbeatMs),
   ];
-  tick();
+  firstCollection = tick();
   return { ...parts, router, close: () => timers.forEach(clearInterval) };
 }
 

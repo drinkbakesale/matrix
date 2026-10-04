@@ -151,6 +151,21 @@ module.exports = (L) => {
       const after = client.refreshes.slice(mark);
       const regionOf = (r) => (r.rect[1] + r.rect[3] <= 64 ? 'status' : r.rect[1] >= 1516 ? 'typed' : 'other');
       assert.ok(after.length >= 2 && after.every((r) => r.mode === 'partial' && regionOf(r) !== 'other'), `after reconnect only status and the draft strip were repainted: ${JSON.stringify(after.map((r) => [r.mode, regionOf(r)]))}`);
+      // A restarted Matrix answers nothing until it has asked tmux once: a client that reconnects at
+      // once is never shown an empty session list (which would blank and repaint every row).
+      await srv.stop('SIGKILL');
+      tm.hold('list-panes');
+      const running = () => srv.readLog().split('Matrix running').length;
+      const startsBefore = running();
+      srv = await L.startServer({ home: srv.home, env: tm.env, port: srv.port, tlsPort: srv.tlsPort, waitReady: false });
+      let early = null;
+      const first = L.until(() => L.http('GET', `${srv.api}/snapshot`, { token: ctl }), 15000, 'the restarted server to answer').then((r) => { early = r; return r; });
+      await L.until(() => tm.held() === 1 && running() > startsBefore, 4000, 'the restarted server to listen while its first collection is blocked');
+      await L.wait(300);
+      assert.equal(early, null, 'no snapshot is served before the first session collection');
+      tm.release();
+      const firstSnap = (await first).data;
+      assert.deepEqual([firstSnap.collector.ok, firstSnap.sessions.length, firstSnap.selection.session_id], [true, 2, a], 'the first snapshot after a restart already lists the sessions and the selection');
       t.note(`draft of ${full.length} chars typed half offline: kept in the browser across disconnect/selection attempt/reload/server restart, then exact on Mac and RM; 0 sends; RM repainted only status+typed (${after.length} partials)`);
     },
 
