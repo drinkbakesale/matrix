@@ -18,9 +18,6 @@ log('calls.jsonl', { argv, at: Date.now() });
 
 const kill = read('kill.json');
 const killNow = (when) => { if (kill && kill.command === cmd && kill.when === when) { try { process.kill(process.ppid, 'SIGKILL'); } catch {} } };
-const fail = read('fail.json');
-if (fail && fail.command === cmd) { process.stderr.write((fail.message || 'injected failure') + '\n'); process.exit(fail.exit || 1); }
-
 // Barrier: while hold.json names this command, the call announces itself
 // (held-<pid>) and blocks until the test writes `release`. A barrier that is
 // never released is a test defect and fails loudly.
@@ -34,6 +31,9 @@ if (hold && hold.command === cmd) {
     Atomics.wait(cell, 0, 0, 5);
   }
 }
+
+const fail = read('fail.json');
+if (fail && fail.command === cmd) { process.stderr.write((fail.message || 'injected failure') + '\n'); process.exit(fail.exit || 1); }
 
 killNow('before');
 switch (cmd) {

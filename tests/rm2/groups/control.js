@@ -35,6 +35,61 @@ module.exports = (L) => {
   async function timed(fn, limit, what) { const t0 = Date.now(); await L.until(fn, limit, what); return Date.now() - t0; }
   const typed = async (c) => (await c.dump()).visible.typed;
 
+  // A7-1: text typed in Control while a submit is being delivered is a newer draft. Neither the
+  // server's acknowledgement nor the page's own success handler may clear or replace it.
+  async function editedWhileSending(x, a, t) {
+    const draftOf = async () => (await x.snap()).sessions.find((q) => q.id === a).draft;
+    const local = () => x.page.evaluate((k) => JSON.parse(localStorage.getItem(k)), `matrix-control-draft:${a}`);
+    const settled = () => L.until(async () => !(await x.page.isDisabled('#submit')), 3000, 'the submit handler to finish');
+    const NEW = 'NEW text typed while sending'; const LATER = 'LATER text not yet saved on the Mac';
+    const revs = [];
+    await x.page.fill('#draft', 'original draft');
+    await L.until(async () => (await draftOf()).text === 'original draft', 2000, 'the original draft to be saved');
+    revs.push((await draftOf()).revision);
+    // (1) The newer text is already saved on the Mac when the acknowledgement arrives.
+    let n = x.tm.sent().length;
+    x.tm.hold('paste-buffer');
+    await x.page.click('#submit');
+    await L.until(() => x.tm.held() === 1, 3000, 'the delivery to block in tmux paste-buffer');
+    await x.page.fill('#draft', NEW);
+    await L.until(async () => (await draftOf()).text === NEW, 2000, 'the newer draft to be saved during delivery');
+    revs.push((await draftOf()).revision);
+    x.tm.release();
+    await L.until(() => x.tm.sent().length === n + 2, 3000, 'the delivery to complete');
+    await settled(); await L.wait(200);
+    assert.deepEqual(x.tm.sent().slice(n).map((q) => q.text || q.key), ['original draft', 'Enter'], 'only the submitted revision was sent');
+    assert.equal(await x.page.inputValue('#draft'), NEW, 'the page kept the text typed during delivery');
+    assert.deepEqual([(await draftOf()).text, (await draftOf()).status, (await local()).text], [NEW, 'unsent', NEW], 'server and local storage hold the newer draft');
+    revs.push((await draftOf()).revision);
+    // (2) The newer text has not reached the Mac yet: its save is held on the wire while the server clears the sent draft.
+    // (The page's own fetch is delayed: the Control service worker sits between the page and network-level interception.)
+    await x.page.evaluate(() => {
+      const real = window.fetch.bind(window);
+      const gate = new Promise((r) => { window.__letSave = r; });
+      window.fetch = (u, o) => (o && o.method === 'PUT' && String(u).endsWith('/draft') ? gate.then(() => real(u, o)) : real(u, o));
+    });
+    n = x.tm.sent().length;
+    x.tm.hold('paste-buffer');
+    await x.page.click('#submit');
+    await L.until(() => x.tm.held() === 1, 3000, 'the second delivery to block');
+    await x.page.fill('#draft', LATER);
+    x.tm.release();
+    await L.until(async () => (await draftOf()).text === '', 3000, 'the server to clear the draft it sent');
+    await settled(); await L.wait(300);
+    assert.equal(await x.page.inputValue('#draft'), LATER, 'the cleared server draft did not replace unsaved newer text');
+    assert.deepEqual([(await local()).text, (await local()).synced], [LATER, false], 'local storage keeps the unsaved newer text');
+    await x.page.evaluate(() => window.__letSave());
+    await L.until(async () => (await draftOf()).text === LATER, 3000, 'the newer text to be saved once the wire is free');
+    revs.push((await draftOf()).revision);
+    assert.deepEqual(x.tm.sent().slice(n).map((q) => q.text || q.key), [NEW, 'Enter']);
+    assert.ok(revs.every((r, i) => i === 0 || r >= revs[i - 1]) && revs[1] > revs[0] && revs[3] > revs[2], `draft revisions never go back and every edit raises them (${revs.join(' ≤ ')})`);
+    // Reload: the page comes back with the newer draft.
+    await x.page.reload();
+    await x.page.waitForFunction(() => document.getElementById('conn').textContent === 'Live', null, { timeout: 10000 });
+    await L.until(async () => (await x.page.inputValue('#draft')) === LATER, 3000, 'the newer draft after a reload');
+    t.note(`edited during delivery (tmux paste-buffer barrier): saved-in-time and held-on-the-wire edits both survive the acknowledgement; sent exactly the submitted revisions; revisions ${revs.join(' ≤ ')}; reload shows the newer draft`);
+  }
+
   // Admission interleavings, on the production server over real HTTP. The
   // collector is parked (one collection at start, then none) so every tmux
   // call counted at a barrier belongs to a command under test.
@@ -187,6 +242,8 @@ module.exports = (L) => {
       assert.equal(sa.prompt.text, 'first prompt %1', 'the last prompt is recorded separately from the draft (it changes only on hook evidence)');
       x.fire(x.list[0], 'UserPromptSubmit', { prompt: text });
       assert.equal((await x.snap()).sessions.find((q) => q.id === a).prompt.text, text);
+      // Only the submitted draft is cleared: text typed while it was being delivered stays (A7-1).
+      await editedWhileSending(x, a, t);
       t.note(`submitted ${text.length} chars incl. unicode/newlines/quotes/$()/backticks: exact paste + 1 Enter to %1; 3 marker commands not executed; only A's draft cleared`);
     },
 

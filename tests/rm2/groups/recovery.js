@@ -228,8 +228,60 @@ module.exports = (L) => {
       r = await L.http('POST', `${srv.api}/submit`, { token: ctl, body: { session_id: sid, selection_revision: s3.selection.revision, draft_revision: 2, idempotency_id: 'crash-after-ack01' } });
       assert.deepEqual([r.status, r.data.state, r.data.replayed], [200, 'acknowledged', true]);
       assert.equal(tm.sent().length, 4, 'the duplicate acknowledged command caused no extra send');
+      // (4) A7-1: a draft edited while its predecessor is being delivered is newer, unsent text. An
+      // uncertain outcome belongs to the command that was sent and must not overwrite or mark it.
+      const post = (route, body, method = 'POST') => L.http(method, `${srv.api}${route}`, { token: ctl, body });
+      const draftNow = async () => (await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data.sessions[0].draft;
+      const onDisk = () => JSON.parse(fs.readFileSync(path.join(srv.home, 'eink', 'drafts.json'), 'utf8'))[sid];
+      const sel = s3.selection.revision;
+      const NEW = 'NEW text typed while sending';
+      await L.until(async () => (await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data.sessions.length === 1, 5000, 'the session list after the restart');
+      assert.equal((await post('/draft', { session_id: sid, text: 'original draft', revision: 4 }, 'PUT')).status, 200);
+      tm.set('fail.json', { command: 'paste-buffer', message: 'injected: lost connection to tmux mid-send' });
+      tm.hold('paste-buffer');
+      let before = tm.sent().length;
+      const sending = post('/submit', { session_id: sid, selection_revision: sel, draft_revision: 4, idempotency_id: 'edit-uncertain-01' });
+      await L.until(() => tm.held() === 1, 3000, 'the delivery to block in tmux paste-buffer');
+      assert.equal((await post('/draft', { session_id: sid, text: NEW, revision: 5 }, 'PUT')).status, 200, 'the newer draft is saved during delivery');
+      tm.release();
+      r = await sending;
+      assert.deepEqual([r.status, r.data.state], [502, 'uncertain'], 'the send ended uncertain');
+      tm.set('fail.json', null);
+      assert.deepEqual(await draftNow(), { text: NEW, revision: 5, status: 'unsent' }, 'the newer draft is exactly as typed, not marked uncertain');
+      assert.deepEqual([onDisk().text, onDisk().revision, onDisk().status], [NEW, 5, 'unsent'], 'and so is drafts.json');
+      r = await post('/submit', { session_id: sid, selection_revision: sel, draft_revision: 4, idempotency_id: 'edit-uncertain-01' });
+      assert.deepEqual([r.status, r.data.state], [409, 'uncertain'], 'the uncertain command is still never replayed');
+      assert.equal(tm.sent().length, before, 'nothing was resent');
+      await srv.stop('SIGKILL');
+      srv = await L.startServer({ home: srv.home, env: tm.env });
+      ctl = srv.token('controller');
+      await L.until(async () => (await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data.sessions.length === 1, 5000, 'snapshot after restart');
+      assert.deepEqual(await draftNow(), { text: NEW, revision: 5, status: 'unsent' }, 'the newer draft survives a restart unchanged');
+      r = await post('/submit', { session_id: sid, selection_revision: sel, draft_revision: 4, idempotency_id: 'edit-uncertain-01' });
+      assert.deepEqual([r.status, r.data.state], [409, 'uncertain'], 'still uncertain after the restart');
+      r = await post('/submit', { session_id: sid, selection_revision: sel, draft_revision: 5, idempotency_id: 'edit-newer-00001' });
+      assert.equal(r.status, 200, 'the newer draft can be sent as its own command');
+      assert.deepEqual(tm.sent().slice(before).map((q) => q.text || q.key), [NEW, 'Enter'], 'and is sent exactly once');
+      // The server dies while a send is in flight and a newer draft is already saved.
+      assert.equal((await post('/draft', { session_id: sid, text: 'second original', revision: 7 }, 'PUT')).status, 200);
+      tm.hold('paste-buffer');
+      const lost = post('/submit', { session_id: sid, selection_revision: sel, draft_revision: 7, idempotency_id: 'edit-crash-00001' }).then((q) => q.status, () => 'connection lost');
+      await L.until(() => tm.held() === 1, 3000, 'the second delivery to block');
+      assert.equal((await post('/draft', { session_id: sid, text: 'typed before the crash', revision: 8 }, 'PUT')).status, 200);
+      await srv.stop('SIGKILL');
+      assert.equal(await lost, 'connection lost');
+      tm.release();
+      srv = await L.startServer({ home: srv.home, env: tm.env });
+      ctl = srv.token('controller');
+      await L.until(async () => (await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data.sessions.length === 1, 5000, 'snapshot after the crash');
+      assert.deepEqual(await draftNow(), { text: 'typed before the crash', revision: 8, status: 'unsent' }, 'the newer draft is not the one marked uncertain after a crash');
+      r = await post('/submit', { session_id: sid, selection_revision: sel, draft_revision: 7, idempotency_id: 'edit-crash-00001' });
+      assert.deepEqual([r.status, r.data.state], [409, 'uncertain'], 'the interrupted command is uncertain and not replayed');
+      before = tm.sent().length;
+      await L.wait(600);
+      assert.equal(tm.sent().length, before, 'nothing is sent on its own after the crash');
       const states = fs.readFileSync(path.join(srv.home, 'eink', 'commands.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)).map((q) => `${q.id.slice(-9)}:${q.state}`);
-      t.note(`journal: pending-only → unsent (0 sends, resend allowed); killed after send → uncertain (1 send, never retried, dup+new id → 409); acknowledged + restart → replayed 200 (0 extra). Persisted: ${states.join(', ')}`);
+      t.note(`journal: pending-only → unsent (0 sends, resend allowed); killed after send → uncertain (1 send, never retried, dup+new id → 409); acknowledged + restart → replayed 200 (0 extra); draft edited during an uncertain send and during a crash → newer text/revision kept, status unsent, across restart, old id 409 uncertain. Persisted: ${states.join(', ')}`);
     },
 
     async session_survival(t) {

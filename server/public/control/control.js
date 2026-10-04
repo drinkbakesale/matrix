@@ -120,10 +120,13 @@
   }
   function saveLocal(sid, d) { store.set(draftKey(sid), JSON.stringify(d)); }
 
-  // The server copy wins only when it is newer than what this iPad holds.
+  // The server copy wins only when it is newer than what this iPad holds. Text
+  // typed here and not yet saved on the Mac is never replaced by a server copy
+  // of the same revision (for example the cleared draft of a submit that was
+  // still in flight while the user kept typing).
   function adoptServerDraft(s) {
     const local = localDraft(s.id);
-    if (!local || s.draft.revision >= local.revision) {
+    if (!local || s.draft.revision > local.revision || (s.draft.revision === local.revision && local.synced !== false)) {
       saveLocal(s.id, { text: s.draft.text, revision: s.draft.revision, synced: true });
       const sel = selected();
       if (sel && sel.id === s.id && $('draft').value !== s.draft.text && !S.composing) $('draft').value = s.draft.text;
@@ -181,7 +184,15 @@
       const d = localDraft(s.id);
       if (!ok || !d || !d.text) { notice('Not sent: the draft is not saved on the Mac yet.'); return; }
       const r = await api('POST', '/submit', { session_id: s.id, selection_revision: S.snap.selection.revision, draft_revision: d.revision, idempotency_id: uid() });
-      if (r.status === 200) { notice(''); saveLocal(s.id, { text: '', revision: d.revision + 1, synced: true }); if ((selected() || {}).id === s.id) $('draft').value = ''; } else notice(`Not sent: ${r.data.error || r.status}`);
+      if (r.status === 200) {
+        notice('');
+        // Clear only the draft that was sent. Anything typed while it was being delivered is a newer draft and stays.
+        const now = localDraft(s.id);
+        if (now && now.revision === d.revision) {
+          saveLocal(s.id, { text: '', revision: d.revision + 1, synced: true });
+          if ((selected() || {}).id === s.id) $('draft').value = '';
+        } else if (now && !now.synced) pushDraft(s.id);
+      } else notice(`Not sent: ${r.data.error || r.status}`);
     } catch (err) {
       notice('Not sent: the connection dropped. Your draft is kept; nothing is retried automatically.');
     } finally { renderDraftControls(); }

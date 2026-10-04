@@ -44,8 +44,10 @@ function createService({ store, tmux, now = () => Date.now() }) {
   for (const rec of journal.values()) {
     if (rec.state === 'sending') {
       rec.state = 'uncertain';
+      // Only the draft revision that was actually sent carries the mark: text
+      // typed after the send began is a newer, unsent draft.
       const d = drafts[rec.session_id];
-      if (d && rec.kind === 'submit') d.status = 'uncertain';
+      if (d && rec.kind === 'submit' && d.revision === rec.draft_revision) d.status = 'uncertain';
     } else if (rec.state === 'pending') {
       rec.state = 'unsent';
     }
@@ -300,17 +302,17 @@ function createService({ store, tmux, now = () => Date.now() }) {
     if (delivering.has(session_id)) throw new CommandError(409, 'another command is being delivered to this session; nothing was sent');
   }
 
-  async function deliver(kind, id, session_id, pane, fn) {
+  async function deliver(kind, id, session_id, pane, fn, extra = {}) {
     delivering.set(session_id, id);
     try {
-      await deliverJournaled(kind, id, session_id, pane, fn);
+      await deliverJournaled(kind, id, session_id, pane, fn, extra);
     } finally {
       delivering.delete(session_id);
     }
   }
 
-  async function deliverJournaled(kind, id, session_id, pane, fn) {
-    journalWrite({ id, kind, session_id, pane: paneKey(pane), state: 'pending', at: now() });
+  async function deliverJournaled(kind, id, session_id, pane, fn, extra) {
+    journalWrite({ id, kind, session_id, pane: paneKey(pane), ...extra, state: 'pending', at: now() });
     journalWrite({ id, state: 'sending', at: now() });
     try {
       await fn();
@@ -352,10 +354,14 @@ function createService({ store, tmux, now = () => Date.now() }) {
     if (d.revision !== draft_revision) throw new CommandError(409, 'draft changed since submit was pressed; nothing was sent', { draft: d });
     if (d.status === 'uncertain') throw new CommandError(409, 'this draft was sent once without confirmation; edit it to send again');
     try {
-      await deliver('submit', idempotency_id, session_id, pane, () => tmux.sendText(pane.paneId, d.text));
+      await deliver('submit', idempotency_id, session_id, pane, () => tmux.sendText(pane.paneId, d.text), { draft_revision: d.revision });
     } catch (err) {
-      if (err.extra && err.extra.state === 'uncertain') {
-        drafts = { ...drafts, [session_id]: { ...d, status: 'uncertain' } };
+      // The uncertainty belongs to the revision that was sent. A draft edited
+      // while the send was in flight is newer unsent text and is left exactly
+      // as it is; the journal still refuses to resend this command.
+      const now_ = drafts[session_id];
+      if (err.extra && err.extra.state === 'uncertain' && now_ && now_.revision === d.revision) {
+        drafts = { ...drafts, [session_id]: { ...now_, status: 'uncertain' } };
         try { store.writeJson('drafts.json', drafts); } catch { /* status stays uncertain in memory; journal already says so */ }
         broadcast('draft', { session_id, draft: drafts[session_id] });
       }
@@ -364,7 +370,7 @@ function createService({ store, tmux, now = () => Date.now() }) {
     const cleared = { text: '', revision: d.revision + 1, status: '' };
     const cur = drafts[session_id];
     // Clear only the draft that was submitted; anything typed since stays.
-    if (cur.revision === d.revision) {
+    if (cur && cur.revision === d.revision) {
       try { saveDrafts({ ...drafts, [session_id]: cleared }); } catch (err) {
         throw new CommandError(500, `sent and acknowledged, but the draft could not be cleared on disk: ${err.message}`);
       }
