@@ -57,6 +57,7 @@ function createEvidence({ service, store, tmux, git, push, fs = require('fs'), n
       prompt: str(raw.prompt),
       tool_name: str(raw.tool_name, 200),
       tool_use_id: str(raw.tool_use_id, 200),
+      tool_input_hash: typeof raw.tool_input_hash === 'string' && /^[0-9a-f]{64}$/.test(raw.tool_input_hash) ? raw.tool_input_hash : null,
       tool_input: Array.isArray(ti.questions) ? { questions: ti.questions.slice(0, 8) } : {},
       file_path: str(ti.file_path || ti.notebook_path, 4096),
       notification_type: str(raw.notification_type, 80),

@@ -136,12 +136,34 @@ module.exports = (L) => {
       assert.deepEqual(s.question.options, []);
       assert.ok(/unavailable/i.test(s.question.reason) && s.question.reason.length > 20, `reason given: ${s.question.reason}`);
 
+      // Unknown or ambiguous ownership is never guessed: such a prompt stays pending until a turn boundary.
+      x.fire(p, conv, 'UserPromptSubmit', { prompt: 'ownership cases' });
+      // (a) two identical unfinished Bash uses: the request cannot be tied to one of them.
+      x.fire(p, conv, 'PreToolUse', { tool_name: 'Bash', tool_use_id: 'twin-1', tool_input: { command: 'make' } });
+      x.fire(p, conv, 'PreToolUse', { tool_name: 'Bash', tool_use_id: 'twin-2', tool_input: { command: 'make' } });
+      x.fire(p, conv, 'PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'make' } });
+      const ambiguousId = (await x.sess(p)).question.id;
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Bash', tool_use_id: 'twin-2', tool_input: { command: 'make' }, tool_response: {} });
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Bash', tool_use_id: 'twin-1', tool_input: { command: 'make' }, tool_response: {} });
+      s = await x.sess(p);
+      assert.deepEqual([s.state, s.question.pending, s.question.id], ['needs_input', true, ambiguousId], 'ambiguous owner: same-name completions do not resolve the prompt');
+      x.fire(p, conv, 'Stop', { last_assistant_message: 'done' });
+      assert.deepEqual([(await x.sess(p)).state, (await x.sess(p)).question.pending], ['done', false], 'the turn boundary resolves it');
+      // (b) a request with no matching started tool use at all (different input): owner unknown.
+      x.fire(p, conv, 'UserPromptSubmit', { prompt: 'ownership cases 2' });
+      x.fire(p, conv, 'PreToolUse', { tool_name: 'Bash', tool_use_id: 'solo-1', tool_input: { command: 'ls' } });
+      x.fire(p, conv, 'PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'rm -rf /tmp/other' } });
+      const unknownId = (await x.sess(p)).question.id;
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Bash', tool_use_id: 'solo-1', tool_input: { command: 'ls' }, tool_response: {} });
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Bash', tool_input: { command: 'rm -rf /tmp/other' }, tool_response: {} }); // no id at all
+      s = await x.sess(p);
+      assert.deepEqual([s.state, s.question.pending, s.question.id], ['needs_input', true, unknownId], 'unknown owner: a missing id or a same-name completion is never treated as a match');
       // A new turn clears the pending prompt; and nothing was ever sent to the pane (no auto-approval).
       x.fire(p, conv, 'UserPromptSubmit', { prompt: 'never mind' });
       s = await x.sess(p);
       assert.deepEqual([s.state, s.question.pending], ['working', false]);
       assert.deepEqual(x.tm.sent(), [], 'the observer never types into the pane');
-      t.note('AskUserQuestion: 2 questions/5 options exact, kept across 4 unrelated events; permission: 3 terminal options, suggestion excluded, kept across 3 unrelated events; unknown layout → unavailable; 0 keys sent');
+      t.note('AskUserQuestion: 2 questions/5 options exact, kept across 4 unrelated events; permission: 3 terminal options, suggestion excluded, kept across 3 unrelated events; unknown layout → unavailable; ambiguous and unknown ownership stay pending until a turn boundary; 0 keys sent');
     },
 
     async identity_isolation(t) {

@@ -47,12 +47,12 @@ module.exports = (L) => {
       return { hook_status: r.status, snapshot_status: s.status, state: me ? me.state : null, prompt: me ? me.prompt.text : null };
     },
     async display(x) {
-      const client = await L.startClient({ endpoints: [x.endpoint], token: x.tok.device, firstrunTap: false });
+      const client = await x.startClient({ endpoints: [x.endpoint], token: x.tok.device, firstrunTap: false });
       await L.until(() => client.firstrun || client.exited(), 20000, 'the client first-run screen');
       client.tap(700, 900);
       let dump = null;
       try { dump = await client.waitDump((q) => q.conn && q.conn.Status === 'fresh', 6000, 'fresh'); } catch { dump = await client.dump().catch(() => null); }
-      const out = { conn: dump ? dump.conn.Status : 'no dump', rows: dump ? Object.keys(dump.visible).filter((k) => k.startsWith('row:')).length : 0, conn_detail: dump ? dump.conn.Detail : '', trace: client.lines.slice(-6), stderr: client.stderr.slice(-400) };
+      const out = { conn: dump ? dump.conn.Status : 'no dump', rows: dump ? Object.keys(dump.visible).filter((k) => k.startsWith('row:')).length : 0, conn_detail: dump ? dump.conn.Detail : '' };
       await client.stop();
       return out;
     },
@@ -92,7 +92,7 @@ module.exports = (L) => {
       return { exit: r.status, stage: res ? res.stage : null, reason: res ? res.reason : r.stderr.trim() };
     },
     async device(x) {
-      const client = await L.startClient({ endpoints: [x.endpoint], token: x.tok.device, firstrunTap: false });
+      const client = await x.startClient({ endpoints: [x.endpoint], token: x.tok.device, firstrunTap: false });
       await L.until(() => client.firstrun || client.exited(), 20000, 'the first-run report');
       const rep = client.firstrun ? client.firstrun.firstrun : null;
       const out = { version: rep ? rep.version : null, failed_checks: rep ? rep.checks.filter((c) => !c.ok).map((c) => c.name) : null, checks: rep ? rep.checks : null };
@@ -170,16 +170,27 @@ module.exports = (L) => {
           const root = label === 'base' ? baseRoot() : L.candidate; // a fresh, unmodified base export every time
           // --- setup (must complete; a failure here is a harness error and fails the whole case) ---
           const x = await target(root, label);
-          // --- observation ---
-          const observed = await observe[group](x);
-          assert.ok(!x.srv.exited(), `${label} server was running for the ${group} probe`);
+          // --- observation: every client started for the probe is recorded in full ---
+          const clients = [];
+          x.startClient = async (o) => { const c = await L.startClient(o); clients.push(c); return c; };
+          let observed = null; let observeError = null;
+          try { observed = await observe[group](x); } catch (err) { observeError = String(err && err.stack || err); }
           // --- verdict ---
           let status = 'passed'; let detail = '';
-          try { mustHold[group](observed); } catch (err) { status = 'failed'; detail = String(err.message).split('\n')[0].slice(0, 300); }
-          entry[label] = { setup: 'completed', observed, status, detail, expected_base_failure_matched: label === 'base' ? expectedBaseFailure[group](observed) : undefined };
-          // Full traces are written before anything is cleaned up.
+          if (observeError) { status = 'error'; detail = observeError; } else {
+            try { mustHold[group](observed); } catch (err) { status = 'failed'; detail = String(err.message); }
+          }
+          entry[label] = { setup: 'completed', server_alive: !x.srv.exited(), observed, status, detail, expected_base_failure_matched: label === 'base' && observed ? expectedBaseFailure[group](observed) : undefined };
+          // Complete, untruncated evidence is written before anything is cleaned up, also when the observation failed.
           fs.writeFileSync(path.join(t.dir, `${group}-${label}-observed.json`), JSON.stringify(entry[label], null, 1));
           fs.copyFileSync(x.srv.log, path.join(t.dir, `${group}-${label}-server.log`));
+          clients.forEach((c, i) => {
+            fs.writeFileSync(path.join(t.dir, `${group}-${label}-client${i}-stdout.jsonl`), c.lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+            fs.writeFileSync(path.join(t.dir, `${group}-${label}-client${i}-stderr.txt`), c.stderr);
+          });
+          for (const f of ['calls.jsonl', 'sent.jsonl']) if (fs.existsSync(path.join(x.tm.dir, f))) fs.copyFileSync(path.join(x.tm.dir, f), path.join(t.dir, `${group}-${label}-tmux-${f}`));
+          assert.equal(observeError, null, `${label} ${group} probe could not observe (harness error, not a base failure): ${observeError}`);
+          assert.ok(!x.srv.exited(), `${label} server was running for the ${group} probe`);
           await L.cleanup();
         }
         log.groups[group] = entry;
@@ -190,7 +201,7 @@ module.exports = (L) => {
       const junit = ['<?xml version="1.0"?>', '<testsuites>'];
       for (const side of ['base', 'candidate']) {
         junit.push(`<testsuite name="RM2_regression@${side === 'base' ? BASE_COMMIT : log.candidate_commit}" tests="${Object.keys(observe).length}">`);
-        for (const [g, e] of Object.entries(log.groups)) junit.push(`<testcase classname="RM2_regression" name="${g}">${e[side].status === 'failed' ? `<failure message="${e[side].detail.replace(/[<>&"]/g, ' ')}"/>` : ''}</testcase>`);
+        for (const [g, e] of Object.entries(log.groups)) junit.push(`<testcase classname="RM2_regression" name="${g}">${e[side].status === 'failed' ? `<failure message="${e[side].detail.split('\n')[0].slice(0, 300).replace(/[<>&"]/g, ' ')}"/>` : ''}</testcase>`);
         junit.push('</testsuite>');
       }
       junit.push('</testsuites>');

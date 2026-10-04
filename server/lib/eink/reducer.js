@@ -47,11 +47,13 @@ function questionFromTool(ev) {
   return { id, kind: 'question', text, questions, options: flat, choices_available: flat.length > 0, reason: flat.length ? '' : 'question had no options' };
 }
 
-// A permission prompt belongs to the most recent started-and-unfinished use of
-// that tool (PermissionRequest carries no tool_use_id of its own).
+// A permission request carries no tool_use_id. It is tied to a tool use only
+// when exactly one started-and-unfinished use has the same tool name AND the
+// same input fingerprint; otherwise its owner is unknown and nothing is inferred.
 function permissionQuestion(ev, open) {
   const what = ev.tool_name ? `Permission needed: ${ev.tool_name}` : (ev.message || 'Claude needs your permission');
-  const owner = [...(open || [])].reverse().find((t) => !ev.tool_name || t.name === ev.tool_name) || null;
+  const same = ev.tool_name && ev.tool_input_hash ? (open || []).filter((t) => t.name === ev.tool_name && t.hash === ev.tool_input_hash) : [];
+  const owner = same.length === 1 ? same[0] : null;
   return {
     id: ev.event_id, kind: 'permission', text: what, questions: [], options: [],
     tool_use_id: owner ? owner.id : null, tool_name: ev.tool_name || (owner ? owner.name : null),
@@ -147,7 +149,7 @@ function reduce(prev, ev, ctx = {}) {
       if (s.turn === 0) break;
       progress();
       if (ev.tool_use_id) {
-        s.open_tools = (s.open_tools || []).filter((t) => t.id !== ev.tool_use_id).concat([{ id: ev.tool_use_id, name: ev.tool_name || '' }]).slice(-50);
+        s.open_tools = (s.open_tools || []).filter((t) => t.id !== ev.tool_use_id).concat([{ id: ev.tool_use_id, name: ev.tool_name || '', hash: ev.tool_input_hash || null }]).slice(-50);
       }
       if (ev.tool_name === 'AskUserQuestion') {
         s.question = questionFromTool(ev);
@@ -184,10 +186,10 @@ function reduce(prev, ev, ctx = {}) {
       // A pending prompt is resolved only by the completion of the tool use it belongs to.
       const q = s.question;
       if (q) {
+        // Only the completion of the exact tool use that owns the prompt resolves it. With an unknown
+        // owner nothing matches: the prompt stays until the turn ends or a new prompt starts.
         const owner = q.kind === 'question' ? q.id : q.tool_use_id;
-        const name = q.kind === 'question' ? 'AskUserQuestion' : q.tool_name;
-        // Match by tool-use identity; only when no identity was observed, by tool name.
-        const matches = owner ? ev.tool_use_id === owner : (name ? ev.tool_name === name : true);
+        const matches = !!owner && !!ev.tool_use_id && ev.tool_use_id === owner;
         if (matches) { s.question = null; s.state = 'working'; }
       } else if (s.state === 'needs_input') {
         s.state = 'working';

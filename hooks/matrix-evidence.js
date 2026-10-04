@@ -46,6 +46,8 @@ function build(input) {
     prompt: input.prompt,
     tool_name: input.tool_name,
     tool_use_id: input.tool_use_id,
+    // Fingerprint of the full tool input: lets Matrix tie a permission request to the exact tool use it is for.
+    tool_input_hash: input.tool_input === undefined ? undefined : crypto.createHash('sha256').update(JSON.stringify(input.tool_input)).digest('hex'),
     tool_input: { file_path: ti.file_path, notebook_path: ti.notebook_path, questions: ti.questions },
     notification_type: input.notification_type,
     message: input.message,
