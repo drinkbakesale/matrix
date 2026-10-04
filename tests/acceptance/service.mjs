@@ -11,9 +11,9 @@ import { createRun, parseArgs } from './assertions.mjs';
 import {
   briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
-  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks, untrustedInputChecks,
+  countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks,
 } from './service-support.mjs';
-import { evaluateCorpus } from './corpus.mjs';
+import { evaluateCorpus, untrustedInputChecks } from './corpus.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 const oracleDir = args.oracle;

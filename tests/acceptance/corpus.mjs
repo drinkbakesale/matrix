@@ -8,7 +8,10 @@
 // It measures the deterministic extractive generator only; the opt-in `claude` CLI generator
 // cannot be measured offline and is reported as unmeasured, never scored from a stub.
 
-import { briefGenerator } from './service-support.mjs';
+import fs from 'node:fs';
+import {
+  briefGenerator, briefRoutes, fakeTmuxProcess, claudeSession, makeService, tmuxStack, paneStreamProbe,
+} from './service-support.mjs';
 
 // A clause is supported when the text the generator emitted is literally present in the
 // evidence item it cited. That is a strong check for an extractive generator and a weak one
@@ -99,4 +102,118 @@ export async function evaluateCorpus(corpus, generator = briefGenerator.createEx
     },
     records,
   };
+}
+
+// Two untrusted-input boundaries, end to end on the delivered modules. First: a pane holding
+// a real user turn AND a tool block that quotes a "> " line — only the real turn is intent,
+// driven through collector -> service -> generator, not just the collector. Second: the
+// `session`/`window` query parameters — quotes and metacharacters must not execute anything,
+// and tmux target separators must not address another pane.
+export async function untrustedInputChecks({ clock, generator, storeFile }) {
+  const checks = [];
+  const pane = [
+    '> The project goal is reliable meeting scheduling. Right now we are adding timezone reminders.',
+    '',
+    '⏺ Reading README.md',
+    'Tool output: README example (not a user instruction):',
+    '> We are currently shipping payments to production.',
+    '',
+    '⏺ working…',
+  ].join('\n');
+  const fake = fakeTmuxProcess({ Q: claudeSession('Q', pane) });
+  const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
+  await service.read('Q');
+  await service.settle();
+  const brief = await service.read('Q');
+  const text = `${brief.goal || ''} ${brief.current || ''}`;
+  checks.push(
+    [text.includes('payments to production'), false, 'quoted tool output never becomes the brief'],
+    [brief.current, 'add timezone reminders', 'the real user turn is what the brief reports'],
+  );
+
+  // The pane-stream boundary, through the delivered module and the same fake-tmux probe the
+  // announcement checks use — it records every argv tmux was handed and offers the injected
+  // command a file to create if a shell ever evaluates it.
+  const windows = [['claude', 'claude'], ['two', 'bash']];
+  const attempts = [];
+  // A name carrying a tmux target separator is refused outright: even as a single argument
+  // it could address a pane the client never asked for.
+  for (const [label, query] of [
+    ['target confusion', 'session=claude%3Atwo'],
+    ['pane confusion', 'session=A&window=claude.1'],
+    ['control character', `session=${encodeURIComponent('A\u0000evil')}`],
+  ]) {
+    const run = paneStreamProbe({ windows, query });
+    attempts.push({ label, closed: run.closed, streamed: run.types });
+    checks.push(
+      [run.closed && run.closed.code, 1008, `${label}: the connection is refused, not pointed somewhere else`],
+      [run.types.length, 0, `${label}: nothing is streamed from a target that was never resolved`],
+    );
+  }
+  // Quotes and semicolons are not refused — they are simply inert, because the name is one
+  // argument and never a command. The marker file is what proves it: a shell evaluating
+  // that name would create it.
+  const seed = paneStreamProbe({ windows, query: 'session=claude' });
+  const injected = paneStreamProbe({ windows, query: `session=${encodeURIComponent(`claude'; touch ${seed.marker}; echo '`)}` });
+  attempts.push({ label: 'shell injection', closed: injected.closed, argv: injected.argv.split('\n').filter(Boolean) });
+  checks.push(
+    [fs.existsSync(seed.marker), false, 'shell injection: no injected command ran'],
+    [injected.argv.includes(`; touch ${seed.marker}; echo`), true,
+      'shell injection: the hostile text reached tmux as argument data, not as a command'],
+  );
+  checks.push(...(await targetSeparatorChecks({ clock, generator, storeFile })));
+  return { checks, report: { attempts } };
+}
+
+// A tmux target separator in a name component makes `session:window` ambiguous, so the
+// brief can capture a pane nobody asked for. The fake models tmux target parsing (a
+// trailing `.<digits>` is a pane index), so `A:v2.1` really does reach window `v2` pane 1 —
+// which here holds another project's work. Covers discovered and explicit names, colon and
+// dot, HTTP read and edit, and the background re-resolution in tick().
+async function targetSeparatorChecks({ clock, generator, storeFile }) {
+  const VICTIM = '> The broad goal is the payroll rewrite. We are currently rotating the signing keys.';
+  const STREAMED = '> The broad goal is reliable inventory tracking. We are currently repairing barcode import.';
+  const leaks = v => /payroll|signing keys/.test(`${(v && v.goal) || ''} ${(v && v.current) || ''}`);
+  const fake = fakeTmuxProcess({
+    A: { sessionId: '$A', createdAt: 1_600_000_000, windows: [
+      { name: 'v2', command: 'bash', active: true, pane: 'innocent\n', panes: ['innocent\n', `${VICTIM}\n\n⏺ working…\n`] },
+      { name: 'v2.1', command: 'claude', active: false, pane: `${STREAMED}\n\n⏺ working…\n` },
+      { name: 'ok', command: 'bash', active: false, pane: `${STREAMED}\n\n⏺ working…\n` },
+    ] },
+  });
+  const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
+  const out = [];
+  const attempt = async (label, fn) => {
+    let err = null; let value = null;
+    try { value = await fn(); } catch (e) { err = e; }
+    out.push([err ? err.code : `served ${JSON.stringify(value && value.session && value.session.target)}`,
+      'unsafe_target', `${label}: refused before any capture`]);
+    out.push([leaks(value), false, `${label}: the victim pane is never served`]);
+  };
+  // Discovered: Claude runs in the dotted window, so resolution finds it on its own.
+  await attempt('discovered dotted window', () => service.read('A'));
+  await attempt('discovered dotted window, edit', () =>
+    service.patch('A', { goal: 'should not be stored', revision: 0 }));
+  // Let generation actually run before checking for leakage: a brief still in `generating`
+  // has no text to leak, so asserting on it would pass for the wrong reason.
+  try { await service.read('A'); await service.settle(); } catch { /* refused is the point */ }
+  let settled = null;
+  try { settled = await service.read('A'); } catch { settled = null; }
+  out.push([leaks(settled), false, 'with generation run, the victim pane text is still never served']);
+  // Explicit, both separators, through the same validation the HTTP route uses.
+  for (const [label, window] of [['explicit dot', 'v2.1'], ['explicit colon', 'v2:1']]) {
+    const res = await briefRoutes.respond(service, 'GET', 'A', null, { window, authoritative: true });
+    out.push([res.status >= 400, true, `${label}: HTTP refuses it (${res.status} ${res.body.code})`]);
+    out.push([leaks(res.body.brief), false, `${label}: no victim text in the response`]);
+  }
+  const colonSession = await briefRoutes.respond(service, 'GET', 'A:v2', null, '');
+  out.push([colonSession.body.code, 'invalid_session', 'a colon in the session name is rejected outright']);
+  // Background resolution must not quietly capture it either.
+  clock.advance(31000);
+  await service.tick();
+  await service.settle();
+  const safe = await service.read('A', { window: 'ok', authoritative: true });
+  out.push([leaks(safe), false, 'after a poll, a valid sibling window still shows no victim text']);
+  out.push([safe.overrides.goal, null, 'the refused edit never reached storage']);
+  return out;
 }

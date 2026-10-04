@@ -8,6 +8,7 @@
 
 const { BriefStore, BriefStoreError, sessionKey, FIELDS, MAX_FIELD_CHARS } = require('./brief-store');
 const { validateBriefOutput, BriefGenerationError } = require('./brief-generator');
+const { SAFE_COMPONENT } = require('./brief-tmux');
 
 const DEFAULT_EVIDENCE_INTERVAL_MS = 30000;
 // A ceiling, not a default. Sentence two is supposed to track the work as it changes, so an
@@ -109,12 +110,15 @@ class BriefService {
   // resolves to nothing and is rejected. Resolution is asynchronous and cached at the
   // process boundary, so a request never blocks the event loop on tmux.
   async identityFor(name, binding) {
-    if (typeof name !== 'string' || !name || name.length > 200 || /[\u0000-\u001f/\\]/.test(name)) {
+    // Rejected here, before any targeted tmux call: forged paths as before, and now also
+    // the `:` / `.` that tmux reads as target separators. Checked again in the resolver,
+    // which sees names tmux itself reported.
+    if (typeof name !== 'string' || !name || /[/\\]/.test(name) || !SAFE_COMPONENT.test(name)) {
       throw new BriefRequestError(400, 'invalid_session', 'session name is not a valid tmux session name');
     }
     const bound = normalizeBinding(binding);
     if (!bound) throw new BriefRequestError(400, 'invalid_window', 'window binding is not valid');
-    if (bound.window !== '' && (bound.window.length > 200 || /[\u0000-\u001f/\\]/.test(bound.window))) {
+    if (bound.window !== '' && (/[/\\]/.test(bound.window) || !SAFE_COMPONENT.test(bound.window))) {
       throw new BriefRequestError(400, 'invalid_window', 'window is not a valid tmux window name');
     }
     // Only a session name, a window name and a boolean cross this line. The client never
@@ -122,6 +126,9 @@ class BriefService {
     const identity = await this.resolveSession(name, bound.window, { authoritative: bound.authoritative });
     if (!identity || identity.name !== name) {
       throw new BriefRequestError(404, 'unknown_session', 'no live session with that name');
+    }
+    if (identity.targetSafe === false) {
+      throw new BriefRequestError(404, 'unsafe_target', 'that window name contains a tmux target separator');
     }
     if (identity.windowKnown === false) {
       throw new BriefRequestError(404, 'unknown_window', 'that window is not open in this session');

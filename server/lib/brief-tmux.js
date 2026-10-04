@@ -28,6 +28,11 @@ class TmuxError extends Error {
 
 // Claude shows up as `claude` or as a bare version number like `2.1.85` — the same
 // predicate pane-stream uses to pick a window.
+// tmux target syntax is `session:window.pane`. A component carrying one of those
+// separators makes any target built from it ambiguous, so it is refused outright rather
+// than escaped or reasoned about. Same rule as server/lib/pane-stream.js.
+const SAFE_COMPONENT = /^[^\u0000-\u001f:.]{1,200}$/;
+
 const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
 
 function createTmux({ execFileImpl = execFile, timeoutMs = DEFAULT_TIMEOUT_MS, maxBuffer = DEFAULT_MAX_BUFFER, binary = 'tmux' } = {}) {
@@ -117,6 +122,7 @@ function createSessionResolver({ tmux } = {}) {
     // window the transcript is not showing the moment Claude starts somewhere else.
     async resolve(name, windowName, options) {
       const authoritative = !!(options && options.authoritative);
+      if (!SAFE_COMPONENT.test(String(name))) return null;
       const hit = (await liveSessions()).find(s => s.name === name);
       if (!hit) return null;
       const windows = await liveWindows(name);
@@ -132,11 +138,19 @@ function createSessionResolver({ tmux } = {}) {
         if (claude) window = claude.name;
       }
       const chosen = windows.find(w => w.name === window);
+      // The separator check applies to a DISCOVERED name as much as a requested one. tmux
+      // reporting a window called `v2.1` does not make `A:v2.1` unambiguous — it addresses
+      // window `v2`, pane 1, which is somebody else's work. There is no safe fallback here
+      // either: dropping back to the bare session would capture whatever window happens to
+      // be active, which is the same leak by another route. So we fail closed and the
+      // service reports it, before any targeted capture runs.
+      const targetSafe = window === '' ? true : SAFE_COMPONENT.test(window);
       return {
         name: hit.name,
         sessionId: hit.sessionId,
         createdAt: hit.createdAt,
         window,
+        targetSafe,
         windowIndex: chosen ? chosen.index : null,
         // A client streaming a window that has since been closed or renamed is asking about
         // a pane that no longer exists. Saying so is better than capturing `name:gone` and
@@ -180,7 +194,7 @@ function createPaneCapture({ tmux, recentLines = 400, earlyLines = 120 }) {
 }
 
 module.exports = {
-  TmuxError, createTmux, createSessionResolver, createPaneCapture,
+  TmuxError, createTmux, createSessionResolver, createPaneCapture, SAFE_COMPONENT,
   parseSessions, parseWindows, isClaudeCmd,
   DEFAULT_TIMEOUT_MS,
 };
