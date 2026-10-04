@@ -266,6 +266,7 @@ func (a *App) Apply(ev Event, now int64) {
 		}
 	case "suspend":
 		a.M.Conn = Conn{Status: "suspended", Endpoint: a.M.Conn.Endpoint, LastConfirmed: a.M.Conn.LastConfirmed}
+		a.touches, a.multi = map[int]*touchTrack{}, false // a release cannot arrive across a suspend
 		a.dirty[NStatus] = true
 	case "resume":
 		a.M.Conn = Conn{Status: "stale", Endpoint: a.M.Conn.Endpoint, LastConfirmed: a.M.Conn.LastConfirmed, Detail: "resumed, waiting for snapshot"}
@@ -298,6 +299,10 @@ func (a *App) typedReadyAt() int64 {
 
 func (a *App) cleanOwed() bool { return a.partials >= a.Cfg.CleanAfterPartials }
 
+// cleanAllowed: an owed clean waits while any finger is on the panel. Every
+// touch event, the final release included, restarts the quiet interval.
+func (a *App) cleanAllowed() bool { return a.cleanOwed() && len(a.touches) == 0 }
+
 func (a *App) cleanAt() int64 { return max(a.lastActivity, a.lastPaint) + a.Cfg.QuietMs }
 
 func (a *App) PendingPaint() bool { return len(a.dirty) > 0 || a.typedDirty }
@@ -310,7 +315,7 @@ func (a *App) NextDeadline() (int64, bool) {
 	if a.typedDirty {
 		return a.typedReadyAt(), true
 	}
-	if a.cleanOwed() {
+	if a.cleanAllowed() { // no clean deadline while a contact is down: the release reschedules it
 		return a.cleanAt(), true
 	}
 	return 0, false
@@ -336,7 +341,7 @@ func (a *App) RunDue(now int64, allowClean bool) {
 		a.lastTypedFlush = now
 		a.flush(NTyped, now)
 	}
-	if allowClean && a.cleanOwed() && !a.PendingPaint() && now >= a.cleanAt() {
+	if allowClean && a.cleanAllowed() && !a.PendingPaint() && now >= a.cleanAt() {
 		a.fail(a.Panel.Clean())
 		a.partials = 0
 		a.lastPaint = now

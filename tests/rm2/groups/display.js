@@ -269,6 +269,33 @@ module.exports = (L) => {
       const cleans = out.steps.flatMap((s) => s.refreshes).filter((r) => r.mode === 'clean').length;
       assert.equal(cleans, 4, 'four cleans in total, none repeated');
       t.note('quiet rule: no clean at +2999, one at +3001; deferred by other-session stream, touch and typing; coalesced flush at +100ms; 4 cleans total');
+      // A9-1: an owed clean never runs while a finger is on the panel, and the quiet interval restarts at the last release.
+      const touch = (type, id, at) => ({ op: 'touch', touch: [type, id, dx, dy], at_ms: at });
+      const held = [
+        d('a', 0), touch(P, 0, 100), d('ab', 200), tick(3100), tick(3300), tick(4999), // 0-5  one contact down 100 → 5000, clean owed from 200
+        touch(R, 0, 5000), tick(7999), tick(8000), tick(9000), tick(12000), // 6-10
+        d('1', 20000), d('12', 20200), touch(P, 0, 20300), touch(P, 1, 20400), touch(R, 0, 20500), // 11-15 two contacts, staggered releases
+        tick(23499), tick(23600), d('123', 24000), tick(26000), touch(R, 1, 27000), tick(29999), tick(30000), tick(31000), // 16-23
+      ];
+      const ho = L.script({ screen: [W, H], initial: two, config: cfg({ clean_after_partials: 2 }), steps: held });
+      const trace = ho.steps.map((s, i) => ({ step: i, op: held[i].op, at_ms: held[i].at_ms, touch: held[i].touch, refreshes: s.refreshes.map((r) => `${r.mode}@${r.at_ms}`), next_deadline: s.next_deadline }));
+      fs.writeFileSync(path.join(t.dir, 'held-touch-trace.json'), JSON.stringify(trace, null, 1));
+      const hm = (i) => ho.steps[i].refreshes.map((r) => r.mode);
+      const quietDuring = (from, to, what) => { for (let i = from; i <= to; i++) { assert.ok(!hm(i).includes('clean'), `no clean ${what} (step ${i} at ${held[i].at_ms}ms)`); } };
+      assert.deepEqual(hm(2), ['partial'], 'typing still paints a partial while a finger is down');
+      quietDuring(1, 5, 'while the contact is held past the quiet interval');
+      assert.deepEqual([3, 4, 5].map((i) => ho.steps[i].next_deadline), [null, null, null], 'no clean deadline is scheduled during the hold (nothing to wake for)');
+      assert.equal(ho.steps[6].next_deadline, 8000, 'the release schedules the clean a full quiet interval later');
+      assert.deepEqual(hm(7), [], 'no clean at release + 2999ms');
+      assert.deepEqual(hm(8), ['clean'], 'exactly one clean at release + 3000ms');
+      assert.deepEqual([hm(9), hm(10)], [[], []], 'the clean is not repeated');
+      quietDuring(13, 20, 'while either of two contacts is down');
+      assert.deepEqual([hm(16), hm(17), hm(19)], [[], [], []], 'releasing one contact does not allow a clean while the other is down (2999ms, 3100ms and 5500ms after it)');
+      assert.deepEqual(hm(18), ['partial'], 'a partial paint still happens with a contact down');
+      assert.deepEqual([16, 17, 19].map((i) => ho.steps[i].next_deadline), [null, null, null], 'no clean deadline while the second contact is down');
+      assert.deepEqual([hm(21), hm(22), hm(23)], [[], ['clean'], []], 'none at final release + 2999ms, exactly one at + 3000ms, none after');
+      assert.equal(ho.steps.flatMap((s) => s.refreshes).filter((r) => r.mode === 'clean').length, 2, 'two cleans in the whole held-touch run');
+      t.note('held touch: 0 cleans while one contact (100→5000ms) or either of two staggered contacts is down, no clean deadline during the hold, partials still paint, exactly one clean at final release + 3000ms; trace in held-touch-trace.json');
     },
 
     async lifecycle(t) {

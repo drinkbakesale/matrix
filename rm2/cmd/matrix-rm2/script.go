@@ -63,6 +63,7 @@ type scriptObs struct {
 	SyncError   string            `json:"sync_error,omitempty"`
 	ConnDetail  ui.Conn           `json:"conn_detail"`
 	Frame       string            `json:"frame,omitempty"`
+	Deadline    *int64            `json:"next_deadline"` // the scheduler's next wake-up after this step; null when it has none
 }
 
 func field(s string) ui.Field { return ui.Field{Available: true, Text: s} }
@@ -302,6 +303,9 @@ func observe(app *ui.App, link *wire.CaptureLink, cmds []ui.Command, regions map
 	}
 	if app.Fatal != nil {
 		o.Fatal = app.Fatal.Error()
+	}
+	if dl, ok := app.NextDeadline(); ok {
+		o.Deadline = &dl
 	}
 	for _, r := range link.Take() {
 		region := "ESCAPED"
