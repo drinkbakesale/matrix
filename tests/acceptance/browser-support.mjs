@@ -259,6 +259,56 @@ export async function sustainedTouchOnChromium(ctx, t, { target, unicodeLine }) 
   }
 }
 
+// The supported branch. Only reached if an engine CAN hold a touch down and that hold
+// actually selects text — which neither pinned engine does today. When it is reached the
+// full native-selection requirement applies and nothing here is softened: a nonempty
+// selection, byte-identical through >=3s of both stream types, and that exact text landing
+// on the real clipboard through a user copy path.
+export async function assertNativeSelectionSurvives(page, context, t, { touch, readClipboard }) {
+  const selected = touch.selectionDuringHold || touch.selectionAfterRelease || '';
+  t.ok(selected.length > 0, `the sustained native touch selected text (${JSON.stringify(selected.slice(0, 60))})`);
+  t.ok(touch.observedPressMs >= 850, `the touch was held >=850ms (observed ${touch.observedPressMs}ms)`);
+  t.eq(touch.allTouchEventsTrusted, true, 'the sustained touch was engine-generated');
+  if (!selected) return;
+  // Both stream types are still running; the selection must not move under them.
+  await page.waitForTimeout(3100);
+  t.eq(await page.evaluate(() => String(window.getSelection())), selected,
+    'the native selection stayed byte-identical through >=3s of output and screen updates');
+  // The user copy path for a live native selection.
+  await page.keyboard.press('Meta+C');
+  await page.waitForTimeout(200);
+  let clip = await readClipboard(page, context);
+  if (!clip.ok) {
+    await page.keyboard.press('Control+C');
+    await page.waitForTimeout(200);
+    clip = await readClipboard(page, context);
+  }
+  t.ok(clip.ok, 'the natively selected text reached the real clipboard');
+  t.eq(clip.text, selected, 'the clipboard holds exactly the natively selected text');
+}
+
+export async function readRealClipboard(page, context) {
+  // Preferred: ask the engine for the system clipboard.
+  const direct = await page.evaluate(async () => {
+    try { return { ok: true, text: await navigator.clipboard.readText() }; }
+    catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+  });
+  if (direct.ok) return { via: 'navigator.clipboard.readText', ...direct };
+  // Fallback: paste into an independent editable destination in a separate page.
+  const sink = await context.newPage();
+  await sink.setContent('<textarea id="sink" style="width:90%;height:200px"></textarea>');
+  await sink.click('#sink');
+  await sink.keyboard.press('Meta+V');
+  await sink.waitForTimeout(150);
+  let text = await sink.inputValue('#sink');
+  if (!text) {
+    await sink.keyboard.press('Control+V');
+    await sink.waitForTimeout(150);
+    text = await sink.inputValue('#sink');
+  }
+  await sink.close();
+  return { via: 'paste into an independent editable destination', ok: text.length > 0, text, readTextError: direct.error };
+}
 // Contract v3 discharges the mandatory native long-press requirement only on ALL of these
 // together, never on any one of them: recorded WebKit capability evidence, the delivered
 // visible fallback proven stable in mobile WebKit, and sustained-touch evidence from the

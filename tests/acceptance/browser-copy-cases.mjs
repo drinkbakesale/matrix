@@ -4,10 +4,14 @@
 import { diagnose, TARGET } from './browser-diagnosis.mjs';
 import {
   newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
-  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch,
+  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch, assertNativeSelectionSurvives, readRealClipboard,
 } from './browser-support.mjs';
 
 const UNICODE_LINE = 'café 日本語 — copy me exactly\twith a tab';
+// The clipboard oracle, fixed here rather than read back out of `#copy-text`. Reading the
+// expectation from the application's own snapshot is self-referential: a snapshot that
+// silently dropped its first or last line would still "match".
+const COPY_FIXTURE = `first line\n${UNICODE_LINE}\nlast line\n`;
 
 async function openMobile(ctx, { init = [], session = 'A' } = {}) {
   const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'], init });
@@ -115,12 +119,12 @@ export async function mobileStreamSelection(ctx, t) {
   // the sustained hold must then actually survive. Today it does not have one, so the
   // limitation must be recorded with the exact missing protocol facility named.
   if (wk.sustained) {
-    t.ok(wk.observedPressMs >= 850, `WebKit held the touch for >=850ms (observed ${wk.observedPressMs}ms)`);
-    t.eq(wk.allTouchEventsTrusted, true, 'the sustained WebKit touch was engine-generated');
+    await assertNativeSelectionSurvives(page, context, t, { touch: wk, readClipboard: readRealClipboard });
   } else {
     t.ok(wk.limitation && wk.limitation.includes('dispatchTapEvent'),
       'WebKit cannot hold a touch down, and the limitation names the exact missing protocol facility');
-    t.eq(wk.observedPressMs, 0, 'what WebKit can deliver is an atomic tap: zero press duration, recorded as such');
+    // Wall-clock measured, so an atomic tap lands at 0-1ms — nowhere near an 850ms hold.
+    t.ok(wk.observedPressMs < 50, `WebKit delivers an atomic tap, not a hold (${wk.observedPressMs}ms press)`);
     t.eq(wk.kind, 'atomic tap — NOT a long-press', 'the delivered input is labelled a tap, never a long-press');
     t.eq(wk.nativeLongPressDelivered, false, 'no native WebKit long-press is claimed from this attempt');
   }
@@ -213,28 +217,6 @@ export async function mobileStreamSelection(ctx, t) {
   await context.close();
 }
 
-async function readRealClipboard(page, context) {
-  // Preferred: ask the engine for the system clipboard.
-  const direct = await page.evaluate(async () => {
-    try { return { ok: true, text: await navigator.clipboard.readText() }; }
-    catch (e) { return { ok: false, error: String(e && e.message || e) }; }
-  });
-  if (direct.ok) return { via: 'navigator.clipboard.readText', ...direct };
-  // Fallback: paste into an independent editable destination in a separate page.
-  const sink = await context.newPage();
-  await sink.setContent('<textarea id="sink" style="width:90%;height:200px"></textarea>');
-  await sink.click('#sink');
-  await sink.keyboard.press('Meta+V');
-  await sink.waitForTimeout(150);
-  let text = await sink.inputValue('#sink');
-  if (!text) {
-    await sink.keyboard.press('Control+V');
-    await sink.waitForTimeout(150);
-    text = await sink.inputValue('#sink');
-  }
-  await sink.close();
-  return { via: 'paste into an independent editable destination', ok: text.length > 0, text, readTextError: direct.error };
-}
 
 export async function clipboardAndFailure(ctx, t) {
   const report = { engines: {} };
@@ -264,25 +246,27 @@ export async function clipboardAndFailure(ctx, t) {
       const page = await context.newPage();
       await page.goto(`${ctx.origin}/?open=A`);
       await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
-      await emit(page, 'output', `first line\n${UNICODE_LINE}\nlast line\n`);
+      await emit(page, 'output', COPY_FIXTURE);
       await page.waitForSelector('#terminal .msg');
 
       const caps = await engineCapabilities(page);
       await page.click('#copy-open');
       await page.waitForSelector('#copy-sheet:not([hidden])');
-      const expected = await page.inputValue('#copy-text');
+      // Checked before any copy, so a dropped line fails here rather than lowering the bar.
+      t.eq(await page.inputValue('#copy-text'), COPY_FIXTURE,
+        `${engineName}: the snapshot holds the fixture exactly, first and last line included`);
       await page.click('#copy-all');
       await page.waitForTimeout(200);
       const status = await page.textContent('#copy-status');
       const state = await page.getAttribute('#copy-sheet', 'data-copy-state');
       const clip = await readRealClipboard(page, context);
-      report.engines[engineName] = { caps, status, state, clip: { ...clip, text: (clip.text || '').slice(0, 400) }, expectedLength: expected.length };
+      report.engines[engineName] = { caps, status, state, clip: { ...clip, text: (clip.text || '').slice(0, 400) }, expectedLength: COPY_FIXTURE.length };
 
       if (state === 'copied') {
         t.ok(clip.ok, `${engineName}: a copy reported as succeeded is readable back from the real clipboard`);
         if (clip.ok) {
-          const exact = clip.text === expected;
-          t.eq(clip.text, expected, `${engineName}: the pasted text is exactly the transcript snapshot`);
+          const exact = clip.text === COPY_FIXTURE;
+          t.eq(clip.text, COPY_FIXTURE, `${engineName}: the pasted text is exactly the transcript snapshot`);
           t.includes(clip.text, UNICODE_LINE, `${engineName}: Unicode and tabs survive the copy`);
           t.ok(!clip.text.includes('Copy selection') && !clip.text.includes('Project goal'),
             `${engineName}: no control label or brief text is included`);
@@ -290,6 +274,28 @@ export async function clipboardAndFailure(ctx, t) {
         }
       } else {
         t.includes(status, 'Copy failed', `${engineName}: a copy that did not succeed says so instead of claiming success`);
+      }
+
+      // A NONEMPTY subset, offsets from the fixture literal: Copy selection must deliver
+      // exactly that subset and not the whole snapshot.
+      const subStart = COPY_FIXTURE.indexOf(UNICODE_LINE);
+      await page.evaluate(([s, e]) => {
+        const ta = document.getElementById('copy-text');
+        ta.focus();
+        ta.setSelectionRange(s, e);
+      }, [subStart, subStart + UNICODE_LINE.length]);
+      await page.click('#copy-selection');
+      await page.waitForTimeout(200);
+      const subState = await page.getAttribute('#copy-sheet', 'data-copy-state');
+      const subClip = subState === 'copied' ? await readRealClipboard(page, context) : null;
+      if (!subClip) {
+        t.includes(await page.textContent('#copy-status'), 'Copy failed',
+          `${engineName}: a selection copy that did not succeed says so instead of claiming success`);
+      } else {
+        t.ok(subClip.ok, `${engineName}: a selection copy reported as succeeded is readable back`);
+        t.eq(subClip.text, UNICODE_LINE, `${engineName}: Copy selection delivers exactly the selected subset`);
+        t.ok(!String(subClip.text).includes('first line') && !String(subClip.text).includes('last line'),
+          `${engineName}: Copy selection does not drag in unselected lines`);
       }
 
       // Empty selection must not copy anything else.
