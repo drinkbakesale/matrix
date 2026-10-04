@@ -8,15 +8,21 @@ set -eu
 here="$(cd "$(dirname "$0")/.." && pwd)"
 target="${1:-host}"
 out="${RM2_BUILD_DIR:-${TMPDIR:-/tmp}/matrix-rm2-build}"
-mkdir -p "$out"
+[ -d "$out" ] || mkdir -p "$out"
 case "$target" in
   host) name="matrix-rm2-host" ;;
   arm)  name="matrix-rm2-arm"; GOOS=linux; GOARCH=arm; GOARM=7; export GOOS GOARCH GOARM ;;
   gateway) : "${GOOS:?set GOOS and GOARCH for the gateway, e.g. GOOS=linux GOARCH=arm64}"; name="matrix-rm2-gateway-$GOOS-${GOARCH:?}"; export GOOS GOARCH ;;
   *) echo "rm2-build: unknown target $target" >&2; exit 2 ;;
 esac
-key="$(cd "$here/rm2" && find . -type f \( -name '*.go' -o -name '*.gz' -o -name go.mod -o -name '*.json' -o -name VERSION \) | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done | shasum -a 256 | cut -c1-16)"
-bin="$out/$name-$key"
+# Source key: names and contents of every client source file, hashed with two
+# process starts only (this script is run once per test case and must stay
+# quick on a busy machine).
+cd "$here/rm2"
+set -- go.mod VERSION *.json */*.go */*.json */*.gz */*/*.go
+key="$( { printf '%s\n' "$@"; cat "$@"; } | shasum -a 256)"
+key="${key%% *}"
+bin="$out/$name-${key%????????????????????????????????????????????????}"
 if [ -x "$bin" ]; then echo "$bin"; exit 0; fi
 command -v go >/dev/null 2>&1 || { echo "rm2-build: the Go toolchain is required (brew install go)" >&2; exit 3; }
 export GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local CGO_ENABLED=0
