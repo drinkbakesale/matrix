@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test adapter for the frozen render oracle: builds the production host client
+# and pipes the oracle's JSON stimuli into its script command. All rendering,
+# scheduling and QTFB encoding is production code under rm2/.
+set -eu
+here="$(cd "$(dirname "$0")/.." && pwd)"
+bin="$("$here/scripts/rm2-build" host)"
+exec "$bin" script

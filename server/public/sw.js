@@ -53,7 +53,9 @@ self.addEventListener('notificationclick', (e) => {
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windowClients => {
       // If app is already open, focus it and hand it the same target
       for (const client of windowClients) {
-        if (new URL(client.url).origin === self.location.origin) {
+        // The e-ink Control app (/control/) has its own worker; never hand it a phone alert.
+        const url = new URL(client.url);
+        if (url.origin === self.location.origin && !url.pathname.startsWith('/control/')) {
           return Promise.resolve(client.focus ? client.focus() : client)
             .catch(() => client)
             .then(focused => (focused || client).postMessage(message));

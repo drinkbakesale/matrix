@@ -1,0 +1,31 @@
+#!/bin/sh
+# rm2-preflight — proves a whole route from the tablet to Matrix by fetching
+# one authenticated snapshot through it. Run it with the tablet on the network
+# you want to prove (home Wi-Fi, or the travel gateway's Wi-Fi).
+#
+#   rm2-preflight --host <tablet address> [--endpoint home-lan|travel-gateway]
+#   rm2-preflight --local <config.json>   [--endpoint NAME]   (probe from this Mac with the host build)
+#
+# Each endpoint is reported separately with the stage that failed
+# (dns, connect, tls, redirect, auth, upstream, protocol). A passing home
+# route never counts for the travel route.
+set -eu
+here="$(cd "$(dirname "$0")/.." && pwd)"
+mode="" target="" endpoint=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) mode=host; target="$2"; shift 2 ;;
+    --local) mode=local; target="$2"; shift 2 ;;
+    --endpoint) endpoint="$2"; shift 2 ;;
+    *) echo "usage: rm2-preflight --host <tablet> | --local <config.json> [--endpoint NAME]" >&2; exit 2 ;;
+  esac
+done
+case "$mode" in
+  host)
+    exec "${RM2_SSH:-ssh}" -o StrictHostKeyChecking=yes -o BatchMode=yes "root@$target" \
+      "/home/root/xovi/exthome/appload/matrix-rm2/matrix-rm2 probe ${endpoint:+--endpoint $endpoint}" ;;
+  local)
+    bin="$("$here/scripts/rm2-build" host)"
+    exec "$bin" probe --config "$target" ${endpoint:+--endpoint "$endpoint"} ;;
+  *) echo "usage: rm2-preflight --host <tablet> | --local <config.json> [--endpoint NAME]" >&2; exit 2 ;;
+esac

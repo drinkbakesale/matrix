@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+// Downloads the pinned RM2 display-stack artifacts listed in rm2/DEPENDENCIES.json
+// into the dependency cache and verifies each SHA-256. Run once, with network.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+
+const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'rm2', 'DEPENDENCIES.json'), 'utf8'));
+const dir = process.env.MATRIX_RM2_DEPS || path.join(process.env.MATRIX_HOME || path.join(os.homedir(), '.matrix'), 'eink', 'rm2-deps');
+
+(async () => {
+  fs.mkdirSync(dir, { recursive: true });
+  for (const a of manifest.artifacts) {
+    const file = path.join(dir, a.file);
+    const sum = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+    if (fs.existsSync(file) && sum(fs.readFileSync(file)) === a.sha256) { console.log(`ok       ${a.file}`); continue; }
+    const res = await fetch(a.url, { redirect: 'follow' });
+    if (!res.ok) throw new Error(`${a.url}: HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (sum(buf) !== a.sha256) throw new Error(`${a.file}: SHA-256 ${sum(buf)} does not match the pinned ${a.sha256}; refusing to keep it`);
+    fs.writeFileSync(file, buf);
+    console.log(`fetched  ${a.file}`);
+  }
+  console.log(`Dependencies ready in ${dir}`);
+})().catch((err) => { console.error(`rm2-fetch-deps: ${err.message}`); process.exit(1); });

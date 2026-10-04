@@ -1,0 +1,20 @@
+#!/bin/sh
+# Builds the matrix-rm2 client. Usage: rm2-build host|arm|gateway  (prints the binary path)
+# gateway: GOOS=linux GOARCH=<arm64|arm|mipsle|amd64> rm2-build gateway
+# Reproducible: Go toolchain only, no module downloads (the module has no dependencies).
+set -eu
+here="$(cd "$(dirname "$0")/.." && pwd)"
+target="${1:-host}"
+command -v go >/dev/null 2>&1 || { echo "rm2-build: the Go toolchain is required (brew install go)" >&2; exit 3; }
+out="${RM2_BUILD_DIR:-${TMPDIR:-/tmp}/matrix-rm2-build}"
+mkdir -p "$out"
+export GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local CGO_ENABLED=0
+export GOCACHE="${GOCACHE:-$out/gocache}"
+case "$target" in
+  host) bin="$out/matrix-rm2-host" ;;
+  arm)  bin="$out/matrix-rm2-arm"; export GOOS=linux GOARCH=arm GOARM=7 ;;
+  gateway) : "${GOOS:?set GOOS and GOARCH for the gateway, e.g. GOOS=linux GOARCH=arm64}"; bin="$out/matrix-rm2-gateway-$GOOS-${GOARCH:?}"; export GOOS GOARCH ;;
+  *) echo "rm2-build: unknown target $target" >&2; exit 2 ;;
+esac
+(cd "$here/rm2" && go build -trimpath -ldflags "-s -w -buildid= -X main.buildVersion=$(cat "$here/rm2/VERSION")" -o "$bin" ./cmd/matrix-rm2) >&2
+echo "$bin"

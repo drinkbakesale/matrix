@@ -1,0 +1,142 @@
+#!/usr/bin/env node
+// matrix-eink — Mac-side administration for the e-ink workstation.
+//   pair-code                 one-time code to pair the iPad Control page
+//   token <device|hook>       issue a scoped token (printed once)
+//   list | revoke <id>        show / revoke issued tokens
+//   setup-tls                 create the pinned LAN certificate for the RM2
+//   install-hook              add the evidence hook to Claude Code (keeps other hooks)
+//   uninstall-hook            remove only what install-hook added
+//   status                    what is configured
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const { createStore } = require('../server/lib/eink/store');
+const { createAuth } = require('../server/lib/eink/auth');
+
+const HOME = process.env.MATRIX_HOME || path.join(os.homedir(), '.matrix');
+const EINK = path.join(HOME, 'eink');
+const SETTINGS = process.env.CLAUDE_SETTINGS || path.join(os.homedir(), '.claude', 'settings.json');
+const REPO = path.resolve(__dirname, '..');
+const HOOK_CMD = `node "${path.join(REPO, 'hooks', 'matrix-evidence.js')}"`;
+const HOOK_EVENTS = ['SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'Notification', 'Stop', 'StopFailure', 'SubagentStop'];
+const TLS_NAME = 'matrix-eink.local';
+
+const die = (msg) => { console.error(`matrix-eink: ${msg}`); process.exit(1); };
+const auth = () => createAuth({ store: createStore({ dir: EINK }) });
+
+function certInfo() {
+  const pem = fs.readFileSync(path.join(EINK, 'tls', 'cert.pem'), 'utf8');
+  const der = new crypto.X509Certificate(pem).raw;
+  return { cert_pem: pem, pin_sha256: crypto.createHash('sha256').update(der).digest('hex'), server_name: TLS_NAME };
+}
+
+function setupTls(force) {
+  const dir = path.join(EINK, 'tls');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const key = path.join(dir, 'key.pem');
+  const cert = path.join(dir, 'cert.pem');
+  if (fs.existsSync(cert) && !force) return certInfo();
+  try {
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '3650',
+      '-subj', `/CN=${TLS_NAME}`, '-addext', `subjectAltName=DNS:${TLS_NAME}`, '-addext', 'basicConstraints=critical,CA:TRUE',
+      '-keyout', key, '-out', cert], { stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (err) {
+    die(`openssl failed: ${String(err.stderr || err.message).trim()}`);
+  }
+  fs.chmodSync(key, 0o600);
+  return certInfo();
+}
+
+function readSettings() {
+  let text;
+  try { text = fs.readFileSync(SETTINGS, 'utf8'); } catch (err) {
+    if (err.code === 'ENOENT') return {};
+    die(`cannot read ${SETTINGS}: ${err.message}`);
+  }
+  try { return JSON.parse(text); } catch (err) { die(`${SETTINGS} is not valid JSON (${err.message}); fix it first — nothing was changed`); }
+  return {};
+}
+
+function writeSettings(obj) {
+  fs.mkdirSync(path.dirname(SETTINGS), { recursive: true });
+  const tmp = `${SETTINGS}.matrix-eink.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
+  fs.renameSync(tmp, SETTINGS);
+}
+
+const isOurs = (entry) => Array.isArray(entry.hooks) && entry.hooks.some((h) => typeof h.command === 'string' && h.command.includes('matrix-evidence.js'));
+
+function installHook() {
+  const s = readSettings();
+  s.hooks = s.hooks || {};
+  let added = 0;
+  for (const ev of HOOK_EVENTS) {
+    const list = Array.isArray(s.hooks[ev]) ? s.hooks[ev] : [];
+    if (!list.some(isOurs)) { list.push({ hooks: [{ type: 'command', command: HOOK_CMD, timeout: 5 }] }); added += 1; }
+    s.hooks[ev] = list;
+  }
+  if (added) writeSettings(s);
+  const tokenFile = path.join(EINK, 'hook-token');
+  if (!fs.existsSync(tokenFile)) {
+    const t = auth().issueToken('hook', { label: 'claude hook' });
+    fs.writeFileSync(tokenFile, t.token + '\n', { mode: 0o600 });
+  }
+  console.log(added ? `Evidence hook added to ${added} event(s) in ${SETTINGS}. Other hooks were left as they were.` : 'Evidence hook already installed; nothing changed.');
+  console.log('Claude sessions pick it up when they next start (or after /hooks in a running session).');
+}
+
+function uninstallHook() {
+  const s = readSettings();
+  let removed = 0;
+  if (s.hooks) {
+    for (const ev of Object.keys(s.hooks)) {
+      if (!Array.isArray(s.hooks[ev])) continue;
+      const keep = s.hooks[ev].filter((e) => !isOurs(e));
+      removed += s.hooks[ev].length - keep.length;
+      if (keep.length) s.hooks[ev] = keep; else delete s.hooks[ev];
+    }
+    if (Object.keys(s.hooks).length === 0) delete s.hooks;
+  }
+  if (removed) writeSettings(s);
+  const tokenFile = path.join(EINK, 'hook-token');
+  if (fs.existsSync(tokenFile)) {
+    const tok = fs.readFileSync(tokenFile, 'utf8').trim();
+    const v = auth().verify(`Bearer ${tok}`);
+    if (v.id) auth().revoke(v.id);
+    fs.unlinkSync(tokenFile);
+  }
+  console.log(removed ? `Removed the evidence hook from ${removed} event(s). Other hooks were left as they were.` : 'Evidence hook was not installed; nothing changed.');
+}
+
+const [cmd, arg] = process.argv.slice(2);
+switch (cmd) {
+  case 'pair-code': {
+    const c = auth().issuePairCode('controller');
+    console.log(`Pairing code: ${c.code}\nType it into Matrix Control on the iPad within 10 minutes. It works once.`);
+    break;
+  }
+  case 'token': {
+    if (!['device', 'hook'].includes(arg)) die('usage: matrix-eink token <device|hook>');
+    console.log(JSON.stringify(auth().issueToken(arg, { label: process.argv[5] || arg })));
+    break;
+  }
+  case 'list': console.log(JSON.stringify(auth().list(), null, 1)); break;
+  case 'revoke': if (!arg) die('usage: matrix-eink revoke <id>'); console.log(auth().revoke(arg) ? 'revoked' : die('no such token id')); break;
+  case 'setup-tls': {
+    const info = setupTls(process.argv.includes('--force'));
+    console.log(JSON.stringify(process.argv.includes('--json') ? info : { pin_sha256: info.pin_sha256, server_name: info.server_name, cert: path.join(EINK, 'tls', 'cert.pem') }));
+    if (!process.argv.includes('--json')) console.error('Restart Matrix (matrix-app stop; matrix-app start) so the LAN endpoint on port 7779 starts.');
+    break;
+  }
+  case 'install-hook': installHook(); break;
+  case 'uninstall-hook': uninstallHook(); break;
+  case 'status': {
+    const tls = fs.existsSync(path.join(EINK, 'tls', 'cert.pem'));
+    const hooked = HOOK_EVENTS.filter((ev) => ((readSettings().hooks || {})[ev] || []).some(isOurs));
+    console.log(JSON.stringify({ home: EINK, lan_tls_certificate: tls, hook_events_installed: hooked.length, hook_events_expected: HOOK_EVENTS.length, hook_token: fs.existsSync(path.join(EINK, 'hook-token')), tokens: auth().list().filter((t) => !t.revoked).map((t) => `${t.scope}:${t.id}`) }, null, 1));
+    break;
+  }
+  default: die('usage: matrix-eink <pair-code|token|list|revoke|setup-tls|install-hook|uninstall-hook|status>');
+}

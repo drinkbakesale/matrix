@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+// rm2-install — installs, checks or removes the Matrix e-ink client on a
+// reMarkable 2 over SSH. See docs/RM2_SETUP.md for the exact steps.
+//
+//   rm2-install check     --host H            first-run compatibility report only (changes nothing)
+//   rm2-install install   --host H --url URL  [--travel-url URL --travel-cert FILE]
+//   rm2-install activate  --host H            start XOVI for this boot
+//   rm2-install stock     --host H            return to the stock interface now
+//   rm2-install uninstall --host H            remove only what this installer added
+//
+// The SSH host key must already be trusted (StrictHostKeyChecking=yes): connect
+// once by hand and compare the fingerprint before running this.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const { execFileSync, spawnSync } = require('child_process');
+
+const REPO = path.resolve(__dirname, '..');
+const HOME = process.env.MATRIX_HOME || path.join(os.homedir(), '.matrix');
+const EINK = path.join(HOME, 'eink');
+const args = process.argv.slice(2);
+const cmd = args[0];
+const opt = (name, dflt) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : dflt; };
+const SSH = process.env.RM2_SSH || 'ssh';
+const SCP = process.env.RM2_SCP || 'scp';
+const host = opt('host');
+const SSH_OPTS = ['-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
+
+const die = (msg, code = 1) => { console.error(`rm2-install: ${msg}`); process.exit(code); };
+const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+
+function ssh(remote, { allowFail = false } = {}) {
+  const r = spawnSync(SSH, [...SSH_OPTS, `root@${host}`, remote], { encoding: 'utf8' });
+  if (r.error) die(`cannot run ssh: ${r.error.message}`);
+  if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|No .* host key is known/i.test(r.stderr)) {
+    die(`the tablet's SSH host key is not trusted. Run "ssh root@${host}" once by hand, compare the fingerprint it shows, accept it, then run this again.\n${r.stderr.trim()}`);
+  }
+  if (r.status !== 0 && !allowFail) die(`remote step failed (exit ${r.status}):\n${(r.stderr || r.stdout).trim()}`);
+  return r;
+}
+
+function scp(local, remotePath) {
+  const r = spawnSync(SCP, [...SSH_OPTS, '-q', local, `root@${host}:${remotePath}`], { encoding: 'utf8' });
+  if (r.error) die(`cannot run scp: ${r.error.message}`);
+  if (r.status !== 0) die(`transfer failed (exit ${r.status}): ${r.stderr.trim()}`);
+}
+
+const DEVICE = 'sh "${RM2_ROOT:-}/tmp/matrix-rm2/device.sh"';
+
+function buildBinary() {
+  if (opt('binary')) return opt('binary');
+  const r = spawnSync(path.join(REPO, 'scripts', 'rm2-build'), ['arm'], { encoding: 'utf8' });
+  if (r.status !== 0) die(`building the ARM client failed:\n${r.stderr}`);
+  const bin = r.stdout.trim().split('\n').pop();
+  const head = fs.readFileSync(bin).subarray(0, 20);
+  // ELF, 32-bit, little-endian, machine = ARM (0x28)
+  if (!(head[0] === 0x7f && head[4] === 1 && head[5] === 1 && head.readUInt16LE(18) === 0x28)) die('the built client is not a 32-bit ARM ELF binary');
+  return bin;
+}
+
+function verifiedDeps() {
+  // RM2_DEPS_MANIFEST replaces the pinned manifest (used by the sandbox tests, which cannot ship the real artifacts).
+  const manifest = JSON.parse(fs.readFileSync(process.env.RM2_DEPS_MANIFEST || path.join(REPO, 'rm2', 'DEPENDENCIES.json'), 'utf8'));
+  const dir = opt('deps-dir', process.env.MATRIX_RM2_DEPS || path.join(EINK, 'rm2-deps'));
+  const out = {};
+  for (const a of manifest.artifacts) {
+    const file = path.join(dir, a.file);
+    if (!fs.existsSync(file)) die(`pinned dependency ${a.file} is not in ${dir}. Run scripts/rm2-fetch-deps first (needs internet once).`);
+    const got = sha(file);
+    if (got !== a.sha256) die(`checksum mismatch for ${a.file}: expected ${a.sha256}, found ${got}. Refusing to install it; delete the file and run scripts/rm2-fetch-deps.`);
+    out[a.id] = file;
+  }
+  return out;
+}
+
+function clientConfig() {
+  const { createStore } = require(path.join(REPO, 'server/lib/eink/store'));
+  const { createAuth } = require(path.join(REPO, 'server/lib/eink/auth'));
+  const url = opt('url');
+  if (!url || !/^https:\/\//.test(url)) die('--url https://<mac-lan-address>:7779 is required (the home LAN endpoint)');
+  const tls = spawnSync(process.execPath, [path.join(REPO, 'scripts', 'matrix-eink'), 'setup-tls', '--json'], { encoding: 'utf8', env: process.env });
+  if (tls.status !== 0) die(`could not prepare the LAN certificate: ${tls.stderr}`);
+  const pin = JSON.parse(tls.stdout);
+  const endpoints = [{ name: 'home-lan', url, cert_pem: pin.cert_pem, server_name: pin.server_name, pin_sha256: pin.pin_sha256 }];
+  if (opt('travel-url')) {
+    const certFile = opt('travel-cert');
+    if (!certFile) die('--travel-cert <gateway certificate PEM> is required with --travel-url');
+    const pem = fs.readFileSync(certFile, 'utf8');
+    endpoints.push({ name: 'travel-gateway', url: opt('travel-url'), cert_pem: pem, server_name: opt('travel-name', ''), pin_sha256: crypto.createHash('sha256').update(new crypto.X509Certificate(pem).raw).digest('hex') });
+  }
+  const token = createAuth({ store: createStore({ dir: EINK }) }).issueToken('device', { label: `rm2 ${host}` });
+  return { config: { endpoints, token: token.token, display: {} }, tokenId: token.id };
+}
+
+function revokeToken(id) {
+  const { createStore } = require(path.join(REPO, 'server/lib/eink/store'));
+  const { createAuth } = require(path.join(REPO, 'server/lib/eink/auth'));
+  createAuth({ store: createStore({ dir: EINK }) }).revoke(id);
+}
+
+function stage(binary, deps, config) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matrix-rm2-stage-'));
+  const root = path.join(dir, 'matrix-rm2');
+  fs.mkdirSync(path.join(root, 'app'), { recursive: true });
+  execFileSync('tar', ['xzf', deps['xovi-bundle'], '-C', root]); // -> root/xovi/...
+  execFileSync('tar', ['xzf', deps.appload, '-C', root, 'appload.so']);
+  fs.copyFileSync(binary, path.join(root, 'app', 'matrix-rm2'));
+  fs.copyFileSync(binary, path.join(root, 'matrix-rm2'));
+  fs.chmodSync(path.join(root, 'matrix-rm2'), 0o755);
+  for (const f of ['launch.sh', 'external.manifest.json']) fs.copyFileSync(path.join(REPO, 'rm2', 'app', f), path.join(root, 'app', f));
+  fs.copyFileSync(path.join(REPO, 'server', 'public', 'icon-192.png'), path.join(root, 'app', 'icon.png'));
+  fs.copyFileSync(path.join(REPO, 'rm2', 'app', 'device.sh'), path.join(root, 'device.sh'));
+  if (config) fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(config, null, 1), { mode: 0o600 });
+  const sums = [];
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).forEach((e) => {
+    const p = path.join(d, e.name);
+    if (e.isDirectory()) walk(p); else if (e.isFile()) sums.push(`${sha(p)} ${path.relative(root, p)}`);
+  });
+  walk(root);
+  fs.writeFileSync(path.join(root, 'SHA256SUMS'), sums.join('\n') + '\n');
+  const tarball = path.join(dir, 'stage.tar');
+  execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2']);
+  return { dir, tarball };
+}
+
+function upload(tarball) {
+  ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2" && mkdir -p "${RM2_ROOT:-}/tmp"');
+  scp(tarball, '/tmp/matrix-rm2-stage.tar');
+  ssh('tar xf "${RM2_ROOT:-}/tmp/matrix-rm2-stage.tar" -C "${RM2_ROOT:-}/tmp" && rm -f "${RM2_ROOT:-}/tmp/matrix-rm2-stage.tar"');
+}
+
+// Runs the first-run check on the tablet and reports it on the Mac. For an
+// unsupported tablet it also writes the diagnostic PDF for USB import.
+function check() {
+  const r = ssh(`${DEVICE} check`, { allowFail: true });
+  let rep;
+  try { rep = JSON.parse(r.stdout.trim().split('\n').pop()); } catch {
+    die(`the first-run check did not produce a report (exit ${r.status}):\n${(r.stderr || r.stdout).trim()}`);
+  }
+  console.log(`Tablet model: ${rep.model || '(not readable)'}`);
+  console.log(`Tablet software version: ${rep.version || '(not readable)'}`);
+  for (const c of rep.checks) console.log(`  [${c.ok ? 'PASS' : 'FAIL'}] ${c.name}: ${c.detail}`);
+  return rep;
+}
+
+function refusePdf(rep) {
+  const out = opt('report-dir', process.cwd());
+  const json = path.join(out, 'matrix-rm2-diagnostic.json');
+  const pdf = path.join(out, 'matrix-rm2-diagnostic.pdf');
+  fs.writeFileSync(json, JSON.stringify(rep));
+  const host = spawnSync(path.join(REPO, 'scripts', 'rm2-build'), ['host'], { encoding: 'utf8' });
+  if (host.status !== 0) die(`cannot build the host tool for the diagnostic PDF: ${host.stderr}`);
+  const r = spawnSync(host.stdout.trim().split('\n').pop(), ['firstrun', '--from', json, '--pdf', pdf], { encoding: 'utf8' });
+  if (!fs.existsSync(pdf)) die(`could not write the diagnostic PDF: ${r.stderr}`);
+  console.error(`\nNOT SUPPORTED: ${rep.reason}`);
+  console.error(`Nothing was installed or changed on the tablet.`);
+  console.error(`To see this report on the tablet itself: connect it by USB, open http://10.11.99.1 on the Mac (enable "USB web interface" in the tablet's Storage settings), and drop ${pdf} onto the page. That import is a manual step and has NOT been done.`);
+}
+
+if (!['check', 'install', 'activate', 'stock', 'uninstall'].includes(cmd)) die('usage: rm2-install <check|install|activate|stock|uninstall> --host <tablet address> [options]', 2);
+if (!host) die('--host <tablet address> is required (10.11.99.1 over USB)', 2);
+
+if (cmd === 'check' || cmd === 'install') {
+  const binary = buildBinary();
+  const deps = verifiedDeps();
+  const made = cmd === 'install' ? clientConfig() : { config: null };
+  const st = stage(binary, deps, made.config);
+  upload(st.tarball);
+  let rep = check();
+  // Model/version problems stop everything before any change. A missing display
+  // stack (code 7) is expected before the first install.
+  if (!rep.supported && rep.code !== 7) {
+    if (made.tokenId) revokeToken(made.tokenId); // the device token never reached the tablet
+    refusePdf(rep);
+    ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2"');
+    process.exit(rep.code);
+  }
+  if (cmd === 'check') { ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2"'); process.exit(rep.code); }
+  const r = ssh(`${DEVICE} install`, { allowFail: true });
+  process.stdout.write(r.stdout);
+  if (r.status !== 0) {
+    revokeToken(made.tokenId); // the token never reached a working install
+    die(`install failed and was rolled back; the tablet is as it was before.\n${r.stderr.trim()}`);
+  }
+  console.log('\nInstalled. Next steps:');
+  console.log(`  1. One time per software version, build the XOVI hashtable (interactive; asks for the tablet passcode):\n       ssh -t root@${host} /home/root/xovi/rebuild_hashtable`);
+  console.log(`  2. Start it for this boot:   scripts/rm2-install activate --host ${host}`);
+  console.log('  3. On the tablet open AppLoad and tap Matrix. The first-run report appears; tap the screen to confirm touch.');
+} else {
+  // activate/stock/uninstall need device.sh on the tablet: send just the script.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matrix-rm2-ctl-'));
+  fs.mkdirSync(path.join(dir, 'matrix-rm2'));
+  fs.copyFileSync(path.join(REPO, 'rm2', 'app', 'device.sh'), path.join(dir, 'matrix-rm2', 'device.sh'));
+  const tarball = path.join(dir, 'stage.tar');
+  execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2']);
+  upload(tarball);
+  const r = ssh(`${DEVICE} ${cmd}`, { allowFail: true });
+  process.stdout.write(r.stdout);
+  process.stderr.write(r.stderr);
+  ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2"', { allowFail: true });
+  process.exit(r.status);
+}

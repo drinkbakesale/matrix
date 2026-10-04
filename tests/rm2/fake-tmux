@@ -1,0 +1,61 @@
+#!/usr/bin/env node
+// Test double for the tmux BINARY (the external boundary). It records every
+// invocation and the exact bytes "sent" to panes, and can be told to fail or
+// to kill the calling server at a chosen point (crash injection).
+// State lives in $FAKE_TMUX_DIR.
+const fs = require('fs');
+const path = require('path');
+
+const dir = process.env.FAKE_TMUX_DIR;
+if (!dir) { process.stderr.write('fake tmux: FAKE_TMUX_DIR not set\n'); process.exit(2); }
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const read = (name) => { try { return JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); } catch { return null; } };
+const log = (name, rec) => fs.appendFileSync(path.join(dir, name), JSON.stringify(rec) + '\n');
+const after = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : undefined; };
+
+log('calls.jsonl', { argv, at: Date.now() });
+
+const kill = read('kill.json');
+const killNow = (when) => { if (kill && kill.command === cmd && kill.when === when) { try { process.kill(process.ppid, 'SIGKILL'); } catch {} } };
+const fail = read('fail.json');
+if (fail && fail.command === cmd) { process.stderr.write((fail.message || 'injected failure') + '\n'); process.exit(fail.exit || 1); }
+
+killNow('before');
+switch (cmd) {
+  case 'list-panes': {
+    const lf = read('listfail.json');
+    if (lf) { process.stderr.write(lf.message + '\n'); process.exit(1); }
+    const panes = read('panes.json');
+    if (!panes) { process.stderr.write('no server running on /tmp/fake-tmux/default\n'); process.exit(1); }
+    const fmt = after('-F') || '';
+    for (const p of panes) process.stdout.write(fmt.replace(/#\{([^}]+)\}/g, (_, k) => (p[k] === undefined ? '' : String(p[k]))) + '\n');
+    break;
+  }
+  case 'set-buffer': {
+    const name = after('-b');
+    const text = argv[argv.indexOf('--') + 1];
+    fs.mkdirSync(path.join(dir, 'buffers'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'buffers', name), text);
+    break;
+  }
+  case 'paste-buffer': {
+    const name = after('-b');
+    const file = path.join(dir, 'buffers', name);
+    const text = fs.readFileSync(file, 'utf8');
+    log('sent.jsonl', { type: 'paste', pane: after('-t'), text, bracketed: argv.includes('-p'), raw: argv.includes('-r') });
+    if (argv.includes('-d')) fs.unlinkSync(file);
+    break;
+  }
+  case 'send-keys':
+    log('sent.jsonl', { type: 'key', pane: after('-t'), key: argv[argv.length - 1] });
+    break;
+  case 'capture-pane': {
+    try { process.stdout.write(fs.readFileSync(path.join(dir, `capture-${after('-t')}.txt`), 'utf8')); } catch { /* blank pane */ }
+    break;
+  }
+  default:
+    process.stderr.write(`fake tmux: unsupported command ${cmd}\n`);
+    process.exit(1);
+}
+killNow('after');

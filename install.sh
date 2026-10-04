@@ -239,6 +239,12 @@ fi
 
 echo ""
 
+# Step 7b: Evidence hook for the e-ink workstation (RM2 digest, iPad Control).
+# It only observes turns; other hooks in settings.json are left exactly as they are.
+echo -e "${BOLD}Installing e-ink evidence hook...${NC}"
+node "$REPO_DIR/scripts/matrix-eink" install-hook | sed 's/^/  /'
+echo ""
+
 # Step 8: Optional — macOS LaunchAgent for autostart
 if [[ "$(uname)" == "Darwin" ]]; then
   echo -e "Start Matrix automatically on login? [y/N] "

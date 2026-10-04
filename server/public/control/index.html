@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Matrix Control">
+<meta name="theme-color" content="#111111">
+<title>Matrix Control</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="../icon-192.png">
+<link rel="stylesheet" href="control.css">
+</head>
+<body>
+<header>
+  <strong>Matrix Control</strong>
+  <span id="conn" class="conn starting" role="status">Starting…</span>
+  <nav>
+    <a id="link-matrix" href="../">Matrix</a>
+    <a id="link-desktop" href="../desktop.html">Desktop view</a>
+  </nav>
+</header>
+
+<section id="pairing" hidden>
+  <h2>Pair this iPad</h2>
+  <p>On the Mac run <code>scripts/matrix-eink pair-code</code> and type the code here. It works once and expires in 10 minutes.</p>
+  <form id="pair-form">
+    <input id="pair-code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Pairing code" aria-label="Pairing code">
+    <button type="submit">Pair</button>
+  </form>
+  <p id="pair-error" class="error" role="alert"></p>
+</section>
+
+<main id="app" hidden>
+  <aside>
+    <h2>Sessions</h2>
+    <p id="collector" class="error" role="alert" hidden></p>
+    <ul id="sessions" role="listbox" aria-label="Sessions"></ul>
+    <div class="pager" aria-label="RM2 session rows page">
+      <button id="row-prev" type="button">RM2 rows ‹</button>
+      <button id="row-next" type="button">RM2 rows ›</button>
+    </div>
+  </aside>
+
+  <section id="detail">
+    <h2 id="sel-title">No session selected</h2>
+    <p id="sel-state"></p>
+    <p id="notice" class="error" role="alert"></p>
+
+    <div id="binding" hidden>
+      <p>Several Claude panes run in this session. Choose the one to follow:</p>
+      <div id="binding-options"></div>
+    </div>
+
+    <div id="question" hidden>
+      <h3>Waiting on you</h3>
+      <pre id="question-text"></pre>
+      <p id="question-note" class="muted"></p>
+      <div id="question-options"></div>
+      <button id="question-send" type="button" hidden>Send selected choices</button>
+    </div>
+
+    <label for="draft">Draft for the selected session <span id="draft-status" class="muted"></span></label>
+    <textarea id="draft" rows="6" spellcheck="false" autocomplete="off" placeholder="Type here. Nothing is sent until you press Send."></textarea>
+    <div class="row">
+      <button id="submit" type="button">Send (⌘/Ctrl + Enter)</button>
+      <span class="muted">Enter adds a new line.</span>
+    </div>
+
+    <div class="row keys" aria-label="Special keys">
+      <button type="button" data-key="Escape">Esc</button>
+      <button type="button" data-key="Enter">Enter</button>
+      <button type="button" data-key="Up">↑</button>
+      <button type="button" data-key="Down">↓</button>
+      <button type="button" data-key="Tab">Tab</button>
+      <button type="button" data-key="1">1</button>
+      <button type="button" data-key="2">2</button>
+      <button type="button" data-key="3">3</button>
+      <button type="button" data-key="4">4</button>
+      <button type="button" data-key="C-c">Ctrl‑C</button>
+    </div>
+
+    <div class="pager" aria-label="RM2 digest page">
+      <button id="digest-prev" type="button">RM2 digest ‹</button>
+      <button id="digest-next" type="button">RM2 digest ›</button>
+      <button id="draft-prev" type="button">RM2 draft ‹</button>
+      <button id="draft-next" type="button">RM2 draft ›</button>
+    </div>
+
+    <h3>Your last prompt</h3>
+    <pre id="prompt"></pre>
+    <h3>Claude's last complete message</h3>
+    <pre id="message"></pre>
+    <h3>Files changed</h3>
+    <pre id="files"></pre>
+  </section>
+</main>
+
+<footer>
+  <button id="notify-enable" type="button">Enable notifications on this device</button>
+  <span id="notify-status" class="muted" role="status"></span>
+  <button id="unpair" type="button">Unpair</button>
+</footer>
+<script src="control.js"></script>
+</body>
+</html>
