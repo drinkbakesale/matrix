@@ -53,6 +53,13 @@ module.exports = ({ candidate, artifacts }) => {
       sent: () => lines('sent.jsonl'),
       setCapture: (paneId, text) => fs.writeFileSync(path.join(dir, `capture-${paneId}.txt`), text),
       set: (name, obj) => (obj === null ? fs.rmSync(path.join(dir, name), { force: true }) : fs.writeFileSync(path.join(dir, name), JSON.stringify(obj))),
+      // Barrier on one tmux command: calls started after hold() block inside the binary until release().
+      hold: (command) => {
+        for (const f of fs.readdirSync(dir)) if (f === 'release' || f.startsWith('held-')) fs.rmSync(path.join(dir, f));
+        fs.writeFileSync(path.join(dir, 'hold.json'), JSON.stringify({ command }));
+      },
+      held: () => fs.readdirSync(dir).filter((f) => f.startsWith('held-')).length,
+      release: () => { fs.rmSync(path.join(dir, 'hold.json'), { force: true }); fs.writeFileSync(path.join(dir, 'release'), ''); },
     };
   }
 

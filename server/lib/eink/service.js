@@ -260,7 +260,56 @@ function createService({ store, tmux, now = () => Date.now() }) {
     return { status: 409, body: { error: 'command already in progress', state: rec.state } };
   }
 
+  // Admission. Everything between a command's arrival and the start of its
+  // delivery is asynchronous (tmux is asked whether the pane is alive, the
+  // terminal is read for an answer), so two rules make it atomic:
+  //  - the idempotency id is reserved synchronously, before the first await:
+  //    a second request with the same id cannot also pass validation;
+  //  - commitCheck() runs synchronously immediately before the journal write
+  //    that starts delivery, against the state as it is at that instant.
+  const inflight = new Set(); // idempotency ids admitted and not yet finished
+  const delivering = new Map(); // session id -> idempotency id being delivered
+
+  function admit(id) {
+    if (!idOk(id)) throw new CommandError(400, 'idempotency_id required');
+    if (inflight.has(id)) return { status: 409, body: { error: 'command already in progress', state: 'in_progress' } };
+    const again = replay(id);
+    if (again) return again;
+    inflight.add(id);
+    return null;
+  }
+
+  // Throws unless the command may be delivered right now: the selection is
+  // still the one the user saw, the session still resolves to the same pane
+  // and the same Claude conversation, the answered question (if any) is still
+  // the pending one, and no other command is mid-delivery to this session.
+  function commitCheck(target, { session_id, selection_revision, question_id }) {
+    if (st.selection.session_id !== session_id || st.selection.revision !== selection_revision) {
+      throw new CommandError(409, 'selection changed while this was being checked; nothing was sent', { selection: st.selection });
+    }
+    const sess = st.sessions.get(session_id);
+    const res = sess ? agentPane(sess) : { reason: 'session ended or is no longer listed' };
+    if (!res.pane) throw new CommandError(409, `${res.reason}; nothing was sent`);
+    if (paneKey(res.pane) !== paneKey(target.pane) || res.binding.conversation_id !== target.binding.conversation_id) {
+      throw new CommandError(409, 'the target pane or its Claude conversation changed while this was being checked; nothing was sent');
+    }
+    if (question_id !== undefined) {
+      const q = res.binding.reducer.question;
+      if (!q || q.id !== question_id) throw new CommandError(409, 'that question is no longer pending; nothing was sent');
+    }
+    if (delivering.has(session_id)) throw new CommandError(409, 'another command is being delivered to this session; nothing was sent');
+  }
+
   async function deliver(kind, id, session_id, pane, fn) {
+    delivering.set(session_id, id);
+    try {
+      await deliverJournaled(kind, id, session_id, pane, fn);
+    } finally {
+      delivering.delete(session_id);
+    }
+  }
+
+  async function deliverJournaled(kind, id, session_id, pane, fn) {
     journalWrite({ id, kind, session_id, pane: paneKey(pane), state: 'pending', at: now() });
     journalWrite({ id, state: 'sending', at: now() });
     try {
@@ -283,11 +332,21 @@ function createService({ store, tmux, now = () => Date.now() }) {
 
   const idOk = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(id);
 
-  async function submit({ session_id, selection_revision, draft_revision, idempotency_id }) {
-    if (!idOk(idempotency_id)) throw new CommandError(400, 'idempotency_id required');
-    const again = replay(idempotency_id);
+  async function submit(cmd) {
+    const again = admit(cmd.idempotency_id);
     if (again) return again;
-    const { pane } = await resolveTarget({ session_id, selection_revision });
+    try {
+      return await submitAdmitted(cmd);
+    } finally {
+      inflight.delete(cmd.idempotency_id);
+    }
+  }
+
+  async function submitAdmitted({ session_id, selection_revision, draft_revision, idempotency_id }) {
+    const target = await resolveTarget({ session_id, selection_revision });
+    const { pane } = target;
+    // No await from here to the journal write inside deliver().
+    commitCheck(target, { session_id, selection_revision });
     const d = drafts[session_id];
     if (!d || !d.text) throw new CommandError(409, 'draft is empty; nothing to send');
     if (d.revision !== draft_revision) throw new CommandError(409, 'draft changed since submit was pressed; nothing was sent', { draft: d });
@@ -314,15 +373,24 @@ function createService({ store, tmux, now = () => Date.now() }) {
     return { status: 200, body: { ok: true, state: 'acknowledged', submitted: { session_id, pane_id: pane.paneId, chars: d.text.length } } };
   }
 
-  async function sendKeysCommand(kind, { session_id, selection_revision, idempotency_id }, keysFor) {
-    if (!idOk(idempotency_id)) throw new CommandError(400, 'idempotency_id required');
-    const again = replay(idempotency_id);
+  async function sendKeysCommand(kind, cmd, keysFor) {
+    const again = admit(cmd.idempotency_id);
     if (again) return again;
+    try {
+      return await sendKeysAdmitted(kind, cmd, keysFor);
+    } finally {
+      inflight.delete(cmd.idempotency_id);
+    }
+  }
+
+  async function sendKeysAdmitted(kind, { session_id, selection_revision, idempotency_id, question_id }, keysFor) {
     const target = await resolveTarget({ session_id, selection_revision });
     const keys = await keysFor(target);
     if (!Array.isArray(keys) || keys.length === 0 || keys.length > 12 || !keys.every((k) => ALLOWED_KEYS.has(k))) {
       throw new CommandError(400, 'key sequence not allowed; nothing was sent');
     }
+    // No await from here to the journal write inside deliver().
+    commitCheck(target, { session_id, selection_revision, question_id: kind === 'answer' ? String(question_id) : undefined });
     await deliver(kind, idempotency_id, session_id, target.pane, () => tmux.sendKeys(target.pane.paneId, keys));
     return { status: 200, body: { ok: true, state: 'acknowledged', keys } };
   }

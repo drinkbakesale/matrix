@@ -5,16 +5,17 @@ module.exports = (L) => {
   const { assert, fs, path } = L;
   const P = 0x10; const R = 0x11;
 
-  async function setup({ client = true, page = true, panes } = {}) {
+  async function setup({ client = true, page = true, panes, env = {} } = {}) {
     const tm = L.fakeTmux();
     const list = (panes || [
       { session_id: '$1', session_name: 'proj', pane_id: '%1', '@matrix_project': 'proj' },
       { session_id: '$2', session_name: 'proj-2', pane_id: '%2', '@matrix_project': 'proj' },
     ]).map((p) => tm.pane(p));
     tm.setPanes(list);
-    const srv = await L.startServer({ env: tm.env, tls: true });
+    const srv = await L.startServer({ env: { ...tm.env, ...env }, tls: true });
     L.hookToken(srv);
     const ctl = srv.token('controller');
+    await L.until(async () => (await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data.sessions.length === list.length, 5000, 'the first session collection');
     const fire = (pane, name, extra = {}) => L.hook(srv, pane, { session_id: `conv-${pane.pane_id.slice(1)}-control`, transcript_path: path.join(srv.transcripts, `c${pane.pane_id.slice(1)}.jsonl`), hook_event_name: name, ...extra });
     for (const p of list) { fire(p, 'UserPromptSubmit', { prompt: `first prompt ${p.pane_id}` }); fire(p, 'Stop', { last_assistant_message: `answer ${p.pane_id}` }); }
     const snap = async () => (await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data;
@@ -34,7 +35,36 @@ module.exports = (L) => {
   async function timed(fn, limit, what) { const t0 = Date.now(); await L.until(fn, limit, what); return Date.now() - t0; }
   const typed = async (c) => (await c.dump()).visible.typed;
 
-  return {
+  // Admission interleavings, on the production server over real HTTP. The
+  // collector is parked (one collection at start, then none) so every tmux
+  // call counted at a barrier belongs to a command under test.
+  async function admission() {
+    const x = await setup({ client: false, page: false, env: { MATRIX_EINK_POLL_MS: '3600000' } });
+    x.post = (route, body) => L.http('POST', `${x.srv.api}${route}`, { token: x.ctl, body });
+    x.rev = async () => (await x.snap()).selection.revision;
+    x.draft = async (id, text, revision) => assert.equal((await L.http('PUT', `${x.srv.api}/draft`, { token: x.ctl, body: { session_id: id, text, revision } })).status, 200);
+    x.sent = () => x.tm.sent().map((s) => (s.type === 'paste' ? `${s.pane}:paste:${s.text}` : `${s.pane}:${s.key}`));
+    // Starts `first`, waits until it is blocked inside tmux `command`, runs `during`, then releases.
+    x.atBarrier = async (command, first, during) => {
+      x.tm.hold(command);
+      const pending = first();
+      await L.until(() => x.tm.held() === 1, 3000, `the command to block in tmux ${command}`);
+      const mid = await during();
+      assert.equal(x.tm.held(), 1, 'only the first command reached tmux while the barrier was up');
+      x.tm.release();
+      return [await pending, mid];
+    };
+    x.ask = async (pane, id) => {
+      const input = { questions: [{ question: 'Which?', header: 'Q', multiSelect: false, options: [{ label: 'One' }, { label: 'Two' }] }] };
+      x.fire(pane, 'PreToolUse', { tool_name: 'AskUserQuestion', tool_use_id: id, tool_input: input });
+      const sid = L.sessionId(pane);
+      const q = await L.until(async () => { const s = (await x.snap()).sessions.find((v) => v.id === sid); return s.question.pending ? s.question : null; }, 3000, 'the question to be pending');
+      return { qid: q.id, resolve: () => x.fire(pane, 'PostToolUse', { tool_name: 'AskUserQuestion', tool_use_id: id, tool_input: input, tool_response: {} }) };
+    };
+    return x;
+  }
+
+  const cases = {
     async bidirectional_selection(t) {
       const x = await setup();
       const [a, b] = x.ids;
@@ -205,6 +235,11 @@ module.exports = (L) => {
       assert.equal(fin.session_id, winner);
       await L.until(async () => (await x.pageSelected()) === winner, 2000, 'page converges on the winner');
       t.note('stale submit/answer/key → 409 ×4, 0 sends, draft A retained; simultaneous selections → one 200 + one 409, shared final revision');
+      // The same guarantees when the requests overlap inside the server (A6-1).
+      await L.cleanup();
+      await cases.duplicate_command_admission(t);
+      await L.cleanup();
+      await cases.revalidation_before_delivery(t);
     },
 
     async pending_answer(t) {
@@ -264,6 +299,103 @@ module.exports = (L) => {
       t.note('clicks: single choice → [2]; multi choice → [1,3,Enter]; permission → [1]; 7 rejections (stale id, undisplayed choice, 2 choices, bad key, prompt gone, resolved, replaced session) → 0 keys');
     },
 
+    // A6-1: one idempotency id is delivered at most once, however the requests interleave.
+    async duplicate_command_admission(t) {
+      const x = await admission();
+      const [a] = x.ids; const pa = x.list[0];
+      await x.select(a);
+      const sel = await x.rev();
+      await x.draft(a, 'send me once', 1);
+      const inProgress = (r, what) => { assert.equal(r.status, 409, `${what}: the duplicate is refused`); assert.equal(r.data.state, 'in_progress', `${what}: refused as in progress`); };
+
+      // submit: the duplicate arrives while the first is still validating its target.
+      const submit = { session_id: a, selection_revision: sel, draft_revision: 1, idempotency_id: 'dup-submit-0001' };
+      let [first, dup] = await x.atBarrier('list-panes', () => x.post('/submit', submit), () => x.post('/submit', submit));
+      inProgress(dup, 'submit');
+      assert.equal(first.status, 200);
+      assert.deepEqual(x.sent(), ['%1:paste:send me once', '%1:Enter'], 'exactly one paste and one Enter');
+      const replay = await x.post('/submit', submit);
+      assert.deepEqual([replay.status, replay.data.replayed], [200, true], 'a later retry is answered from the journal');
+      assert.equal(x.sent().length, 2, 'the retry sent nothing');
+
+      // key
+      const key = { session_id: a, selection_revision: sel, keys: ['Down'], idempotency_id: 'dup-key-000001' };
+      [first, dup] = await x.atBarrier('list-panes', () => x.post('/key', key), () => x.post('/key', key));
+      inProgress(dup, 'key');
+      assert.equal(first.status, 200);
+      assert.deepEqual(x.sent().slice(2), ['%1:Down'], 'exactly one key');
+
+      // answer
+      const q = await x.ask(pa, 'ask-dup');
+      const answer = { session_id: a, selection_revision: sel, question_id: q.qid, keys: ['2'], idempotency_id: 'dup-answer-0001' };
+      [first, dup] = await x.atBarrier('list-panes', () => x.post('/answer', answer), () => x.post('/answer', answer));
+      inProgress(dup, 'answer');
+      assert.equal(first.status, 200);
+      assert.deepEqual(x.sent().slice(3), ['%1:2'], 'exactly one answer key');
+
+      // Two different ids for the same draft (a double tap): both validate, one delivers.
+      await x.draft(a, 'double tap', 3);
+      x.tm.hold('list-panes');
+      const pair = [1, 2].map((n) => x.post('/submit', { session_id: a, selection_revision: sel, draft_revision: 3, idempotency_id: `dup-double-000${n}` }));
+      await L.until(() => x.tm.held() === 2, 3000, 'both submits to block in tmux list-panes');
+      x.tm.release();
+      const statuses = (await Promise.all(pair)).map((r) => r.status).sort();
+      assert.deepEqual(statuses, [200, 409], 'one double-tapped submit delivers, the other is refused');
+      assert.deepEqual(x.sent().slice(4), ['%1:paste:double tap', '%1:Enter'], 'the draft was pasted once');
+      t.note('same id concurrently at a tmux list-panes barrier: submit/key/answer → 200 + 409 in_progress, 1 delivery each, later retry replayed; two ids for one draft → 200 + 409, 1 paste');
+    },
+
+    // A6-1: what was true when validation started must still be true at the instant delivery starts.
+    async revalidation_before_delivery(t) {
+      const x = await admission();
+      const [a, b] = x.ids; const pa = x.list[0];
+      await x.select(a);
+      let sel = await x.rev();
+      await x.draft(a, 'for A only', 1);
+      const selectB = async () => { const r = await x.post('/select', { session_id: b, base_revision: sel }); assert.equal(r.status, 200, 'the selection moved to B during validation'); };
+      const refused = (r, what, re) => { assert.equal(r.status, 409, `${what} is refused`); assert.match(r.data.error, re, what); assert.deepEqual(x.sent(), [], `${what}: nothing was sent to any pane`); };
+
+      // The selection changes while tmux is being asked whether the pane is alive.
+      const submit = { session_id: a, draft_revision: 1, idempotency_id: 'reval-submit-001' };
+      let [r] = await x.atBarrier('list-panes', () => x.post('/submit', { ...submit, selection_revision: sel }), selectB);
+      refused(r, 'submit after a selection change', /selection changed/);
+      assert.equal((await x.snap()).sessions.find((s) => s.id === a).draft.text, 'for A only', 'the draft is kept');
+      await x.select(a); sel = await x.rev();
+      [r] = await x.atBarrier('list-panes', () => x.post('/key', { session_id: a, selection_revision: sel, keys: ['Enter'], idempotency_id: 'reval-key-00001' }), selectB);
+      refused(r, 'key after a selection change', /selection changed/);
+      await x.select(a); sel = await x.rev();
+      let q = await x.ask(pa, 'ask-reval-1');
+      [r] = await x.atBarrier('list-panes', () => x.post('/answer', { session_id: a, selection_revision: sel, question_id: q.qid, keys: ['1'], idempotency_id: 'reval-answer-001' }), selectB);
+      refused(r, 'answer after a selection change', /selection changed/);
+      await x.select(a); sel = await x.rev();
+
+      // The question is answered elsewhere while validation is in flight.
+      [r] = await x.atBarrier('list-panes', () => x.post('/answer', { session_id: a, selection_revision: sel, question_id: q.qid, keys: ['1'], idempotency_id: 'reval-answer-002' }), async () => q.resolve());
+      refused(r, 'answer to a question resolved during validation', /no longer pending/);
+      // ...and while the terminal is being read for a permission prompt.
+      x.tm.setCapture('%1', [' Do you want to make this edit to app.js?', ' ❯ 1. Yes', '   2. No'].join('\n'));
+      x.fire(pa, 'PreToolUse', { tool_name: 'Edit', tool_use_id: 'ed-reval', tool_input: { file_path: '/w/app.js' } });
+      x.fire(pa, 'PermissionRequest', { tool_name: 'Edit', tool_input: { file_path: '/w/app.js' } });
+      const perm = await L.until(async () => { const s = (await x.snap()).sessions.find((v) => v.id === a); return s.question.pending && s.question.choices_available ? s.question : null; }, 3000, 'the permission prompt');
+      [r] = await x.atBarrier('capture-pane', () => x.post('/answer', { session_id: a, selection_revision: sel, question_id: perm.id, keys: ['1'], idempotency_id: 'reval-answer-003' }),
+        async () => x.fire(pa, 'PostToolUse', { tool_name: 'Edit', tool_use_id: 'ed-reval', tool_input: { file_path: '/w/app.js' }, tool_response: {} }));
+      refused(r, 'answer to a permission prompt resolved during the terminal read', /no longer pending/);
+
+      // A different Claude conversation takes over the pane during validation.
+      [r] = await x.atBarrier('list-panes', () => x.post('/submit', { ...submit, selection_revision: sel, idempotency_id: 'reval-submit-002' }),
+        async () => L.hook(x.srv, pa, { session_id: 'conv-1-replacement', hook_event_name: 'UserPromptSubmit', prompt: 'a new conversation' }));
+      refused(r, 'submit after the conversation changed', /conversation changed/);
+      [r] = await x.atBarrier('list-panes', () => x.post('/key', { session_id: a, selection_revision: sel, keys: ['Enter'], idempotency_id: 'reval-key-00002' }),
+        async () => L.hook(x.srv, pa, { session_id: 'conv-1-replacement-2', hook_event_name: 'UserPromptSubmit', prompt: 'another conversation' }));
+      refused(r, 'key after the conversation changed', /conversation changed/);
+
+      // A refused command did not burn its id: the same id delivers once the state is settled.
+      const ok = await x.post('/submit', { ...submit, selection_revision: sel });
+      assert.equal(ok.status, 200, 'the refused id can be sent again');
+      assert.deepEqual(x.sent(), ['%1:paste:for A only', '%1:Enter']);
+      t.note('at a tmux barrier: selection change → submit/key/answer 409; question resolved during list-panes and during capture-pane → answer 409; conversation replaced → submit/key 409; 0 sends across 7 refusals; refused id later delivered once');
+    },
+
     async quick_access(t) {
       const x = await setup({ client: false, page: false });
       const page = await L.newPage();
@@ -310,4 +442,8 @@ module.exports = (L) => {
       t.note(`manifest start_url/scope relative (/control/); 0 permission prompts before the click, 1 after; ${controls.length} controls mouse-reachable; Matrix link round trip kept the draft`);
     },
   };
+  // The frozen runner reports one result per expected id, so the admission interleavings run (and
+  // gate) as part of selection_race rather than as ids it would not report.
+  const { duplicate_command_admission, revalidation_before_delivery, ...reported } = cases; // eslint-disable-line no-unused-vars
+  return reported;
 };

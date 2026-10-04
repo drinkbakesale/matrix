@@ -21,6 +21,20 @@ const killNow = (when) => { if (kill && kill.command === cmd && kill.when === wh
 const fail = read('fail.json');
 if (fail && fail.command === cmd) { process.stderr.write((fail.message || 'injected failure') + '\n'); process.exit(fail.exit || 1); }
 
+// Barrier: while hold.json names this command, the call announces itself
+// (held-<pid>) and blocks until the test writes `release`. A barrier that is
+// never released is a test defect and fails loudly.
+const hold = read('hold.json');
+if (hold && hold.command === cmd) {
+  fs.writeFileSync(path.join(dir, `held-${process.pid}`), '');
+  const end = Date.now() + 4000;
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  while (!fs.existsSync(path.join(dir, 'release'))) {
+    if (Date.now() > end) { process.stderr.write('fake tmux: barrier was never released\n'); process.exit(3); }
+    Atomics.wait(cell, 0, 0, 5);
+  }
+}
+
 killNow('before');
 switch (cmd) {
   case 'list-panes': {
