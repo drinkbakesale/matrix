@@ -24,12 +24,40 @@ module.exports = (L) => {
     return { direct, log, env: { TMUX_TMPDIR: sock, TMUX: '', TMUX_PANE: '', PATH: `${shim}:${process.env.PATH}`, MATRIX_TMUX: path.join(shim, 'tmux') }, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) };
   }
 
+  // Real pointer selection of the marker word in the terminal view, then a real copy shortcut.
+  // Returns what the page's own selection and copy handling produced.
+  async function selectAndCopy(page) {
+    await page.evaluate(() => { window.__copied = null; document.addEventListener('copy', (e) => { window.__copied = String(getSelection()); window.__copyPrevented = e.defaultPrevented; }); });
+    const at = await page.evaluate(() => {
+      const walker = document.createTreeWalker(document.getElementById('terminal'), NodeFilter.SHOW_TEXT);
+      let node; while ((node = walker.nextNode())) { const i = node.data.indexOf('MARKERWORD'); if (i >= 0) { const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 10); const b = r.getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; } }
+      return null;
+    });
+    if (!at) return { selection: 'marker not rendered', copied: null };
+    await page.mouse.dblclick(at.x, at.y);
+    const selection = await page.evaluate(() => String(getSelection()).trim());
+    await page.keyboard.press('Meta+C');
+    await page.waitForTimeout(150);
+    return { selection, copied: await page.evaluate(() => (window.__copied === null ? null : window.__copied.trim())) };
+  }
+
+  // Executes a worker source file with a double for the browser's worker runtime and reports what a notification click does.
+  async function legacyWorkerClick(root, windows) {
+    const vm = require('vm');
+    const handlers = {}; const opened = []; const posted = []; const focused = [];
+    const clients = { claim: async () => {}, matchAll: async () => windows.map((url) => ({ url, focus: async function focus() { focused.push(url); return this; }, postMessage: (m) => posted.push({ url, target: m.targetSession }) })), openWindow: async (u) => { opened.push(String(u)); } };
+    const self = { addEventListener: (n, fn) => { handlers[n] = fn; }, skipWaiting() {}, location: new URL('http://matrix.test/'), registration: { scope: 'http://matrix.test/', showNotification: async () => {} }, clients };
+    vm.runInNewContext(fs.readFileSync(path.join(root, 'server/public/sw.js'), 'utf8'), { self, clients, caches: { keys: async () => [] }, URL, fetch: () => {}, Promise, console });
+    let p; handlers.notificationclick({ notification: { close() {}, data: { targetSession: 'tmux-7', project: 'p' } }, waitUntil: (q) => { p = q; } }); await p;
+    return { opened, posted, focused };
+  }
+
   // The same legacy flow, run on whichever server root is given. Returns plain observations.
   async function legacyFlow(root, extra) {
     const tx = realTmux();
     try {
       const script = path.join(L.tmp('pane'), 'pane.sh');
-      fs.writeFileSync(script, '#!/bin/sh\nprintf "LEGACY-MARKER-OUTPUT\\n"\nexec cat\n', { mode: 0o755 });
+      fs.writeFileSync(script, '#!/bin/sh\nprintf "LEGACY-MARKER-OUTPUT MARKERWORD tail\\n"\nexec cat\n', { mode: 0o755 });
       if (tx.direct('new-session', '-d', '-s', 'legacyproj', '-x', '100', '-y', '30', script).status !== 0) throw new Error('tmux new-session failed');
       const size = () => tx.direct('list-panes', '-a', '-F', '#{window_width}x#{window_height} #{pane_pid}').stdout.trim();
       const before = size();
@@ -52,12 +80,10 @@ module.exports = (L) => {
       });
       obs.terminalShowsOutput = true;
       obs.termViewVisible = await page.isVisible('#term-view');
-      // Select and copy text from the terminal view.
-      obs.selection = await page.evaluate(() => {
-        const walker = document.createTreeWalker(document.getElementById('terminal'), NodeFilter.SHOW_TEXT);
-        let node; while ((node = walker.nextNode())) { const i = node.data.indexOf('LEGACY-MARKER-OUTPUT'); if (i >= 0) { const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 20); const s = getSelection(); s.removeAllRanges(); s.addRange(r); return s.toString(); } }
-        return '';
-      });
+      // Select and copy text from the terminal view with real pointer and keyboard input.
+      const phoneCopy = await selectAndCopy(page);
+      obs.phoneSelection = phoneCopy.selection;
+      obs.phoneCopied = phoneCopy.copied;
       obs.userSelect = await page.evaluate(() => getComputedStyle(document.getElementById('terminal')).webkitUserSelect || getComputedStyle(document.getElementById('terminal')).userSelect);
       // Send input through the legacy input bar.
       await page.fill('#text-input', 'legacy hello');
@@ -69,15 +95,28 @@ module.exports = (L) => {
       await page.tap('#back-btn');
       await page.waitForSelector('#list-view', { state: 'visible' });
       obs.backToList = await page.isVisible('.session-card[data-session="legacyproj"]');
-      // Desktop view.
+      // Desktop view: navigate to the session, read its output, select + copy, send input.
       const desk = await L.newPage({ viewport: { width: 1400, height: 900 } });
       await desk.goto(`${srv.base}/desktop.html`);
-      await desk.waitForFunction((want) => document.body.textContent.includes(want), label, { timeout: 10000 }).catch(async (err) => { throw new Error(`desktop view never listed the session "${label}": ${JSON.stringify((await desk.textContent('body')).replace(/\s+/g, ' ').slice(0, 300))}`); });
+      await desk.waitForSelector('.project-item[data-session="legacyproj"]', { timeout: 10000 });
       obs.desktopListsSession = true;
+      await desk.click('.project-item[data-session="legacyproj"]');
+      await desk.waitForFunction(() => document.getElementById('terminal').textContent.includes('MARKERWORD'), null, { timeout: 10000 });
+      obs.desktopShowsOutput = await desk.isVisible('#chat-view');
+      obs.desktopTitle = (await desk.textContent('#chat-title')) === label;
+      const deskCopy = await selectAndCopy(desk);
+      obs.desktopSelection = deskCopy.selection;
+      obs.desktopCopied = deskCopy.copied;
+      await desk.fill('#chat-input', 'desktop hello');
+      await desk.click('#chat-send');
+      await L.until(() => tx.direct('capture-pane', '-p', '-t', 'legacyproj').stdout.includes('desktop hello'), 8000, 'desktop send to reach the pane');
+      obs.desktopSendDelivered = true;
       // Legacy notification endpoints.
       obs.notifyStatus = (await L.http('POST', `${srv.base}/api/notify`, { body: { project: 'legacyproj', session: 'legacyproj', tmuxSession: 'legacyproj', message: 'needs input' } })).status;
       obs.vapidStatus = (await L.http('GET', `${srv.base}/api/push/vapid-key`)).status;
-      obs.swRouting = (await (await fetch(`${srv.base}/sw.js`)).text()).includes('`/?open=${encodeURIComponent(targetSession)}`');
+      // Legacy notification click, executed from this root's own worker source.
+      obs.clickNoWindow = JSON.stringify(await legacyWorkerClick(root, []));
+      obs.clickPhoneWindow = JSON.stringify(await legacyWorkerClick(root, ['http://matrix.test/']));
       const more = extra ? await extra({ srv, page, tx, sockets }) : {};
       obs.sizeUnchanged = size() === before;
       obs.destructiveCalls = tx.calls().filter((l) => /^(kill-|resize-|respawn-)/.test(l)).length;
@@ -111,8 +150,11 @@ module.exports = (L) => {
       });
       for (const [k, v] of Object.entries(base.obs)) if (v === false || v === '' || v === 0) if (!['destructiveCalls'].includes(k)) t.note(`base observation ${k}=${JSON.stringify(v)}`);
       assert.deepEqual(cand.obs, base.obs, 'the legacy phone/desktop flow observes exactly the same on the candidate as on the exact base');
-      for (const k of ['apiListsSession', 'phoneListsSession', 'terminalShowsOutput', 'termViewVisible', 'sendDelivered', 'websocketOpened', 'backToList', 'desktopListsSession', 'swRouting', 'sizeUnchanged']) assert.equal(cand.obs[k], true, `legacy ${k}`);
-      assert.equal(cand.obs.selection, 'LEGACY-MARKER-OUTPUT', 'terminal text can be selected for copying');
+      for (const k of ['apiListsSession', 'phoneListsSession', 'terminalShowsOutput', 'termViewVisible', 'sendDelivered', 'websocketOpened', 'backToList', 'desktopListsSession', 'desktopShowsOutput', 'desktopTitle', 'desktopSendDelivered', 'sizeUnchanged']) assert.equal(cand.obs[k], true, `legacy ${k}`);
+      assert.equal(cand.obs.desktopSelection, 'MARKERWORD', 'desktop: a real double-click selects terminal text');
+      assert.equal(cand.obs.desktopCopied, 'MARKERWORD', 'desktop: the copy shortcut copies that selection');
+      assert.equal(cand.obs.clickNoWindow, JSON.stringify({ opened: ['/?open=tmux-7'], posted: [], focused: [] }), 'legacy notification click opens the phone view on the exact session');
+      assert.equal(cand.obs.clickPhoneWindow, JSON.stringify({ opened: [], posted: [{ url: 'http://matrix.test/', target: 'tmux-7' }], focused: ['http://matrix.test/'] }), 'with the phone view open it is focused and handed the target');
       assert.equal(cand.obs.destructiveCalls, 0);
       assert.deepEqual([cand.more.sseSnapshot, cand.more.controlLists, cand.more.legacyStillWorks, cand.more.wsFramesAfter, cand.more.einkResize], [true, true, true, true, 0], 'Control and the event stream coexist with the legacy WebSocket; no resize');
       t.note(`legacy flow identical on base 27534cd and candidate: ${JSON.stringify(cand.obs)}; coexistence: ${JSON.stringify(cand.more)}`);

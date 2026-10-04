@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ type scriptStep struct {
 	State   string          `json:"state"`
 	Raw     json.RawMessage `json:"raw"`   // snapshot/session/selection/view/conn/draft payloads
 	Touch   []int32         `json:"touch"` // inputType, devID, x, y  (QTFB encoded and decoded)
+	Hex     string          `json:"hex"`   // touch_raw: 24 server->client bytes exactly as AppLoad would send them
 	Net     string          `json:"net"`   // connecting, closed, message: drives the production Sync
 	Type    string          `json:"type"`  // SSE message type for net=message
 	FailAt  int             `json:"fail_at"`
@@ -208,6 +210,19 @@ func scriptMain(in io.Reader, out io.Writer) error {
 					continue
 				}
 				ev = ui.Event{Kind: "touch", Touch: sev.Touch}
+			case "touch_raw":
+				b, err := hex.DecodeString(st.Hex)
+				if err != nil || len(b) != wire.MsgSize {
+					return fmt.Errorf("step %d: touch_raw needs %d hex-encoded bytes", i, wire.MsgSize)
+				}
+				var m wire.Msg
+				copy(m[:], b)
+				sev := wire.DecodeServer(m)
+				if sev.Touch == nil {
+					emit(i, observe(app, link, cmds, regions))
+					continue
+				}
+				ev = ui.Event{Kind: "touch", Touch: sev.Touch}
 			case "suspend", "resume":
 				ev = ui.Event{Kind: st.Op}
 			case "fail_panel":
@@ -300,7 +315,7 @@ func observe(app *ui.App, link *wire.CaptureLink, cmds []ui.Command, regions map
 				}
 			}
 		}
-		o.Refreshes = append(o.Refreshes, map[string]any{"mode": r.Mode, "rect": r.Rect, "sent_rect": r.Sent, "region": region, "at_ms": r.AtMs, "refresh_mode": r.Wave})
+		o.Refreshes = append(o.Refreshes, map[string]any{"mode": r.Mode, "rect": r.Rect, "sent_rect": r.Sent, "raw": r.Raw, "region": region, "at_ms": r.AtMs, "refresh_mode": r.Wave})
 	}
 	return o
 }

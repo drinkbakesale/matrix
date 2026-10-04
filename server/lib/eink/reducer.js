@@ -16,6 +16,7 @@ function initial(conversationId) {
     message: { available: false, text: '', reason: 'No completed Claude message observed since the evidence hook attached' },
     question: null,
     tool_paths: [],
+    open_tools: [], // tool uses that started and have not completed: [{ id, name }]
     progress_at: 0,
     last_seq: 0,
     turn_seq: 0,
@@ -46,10 +47,14 @@ function questionFromTool(ev) {
   return { id, kind: 'question', text, questions, options: flat, choices_available: flat.length > 0, reason: flat.length ? '' : 'question had no options' };
 }
 
-function permissionQuestion(ev) {
+// A permission prompt belongs to the most recent started-and-unfinished use of
+// that tool (PermissionRequest carries no tool_use_id of its own).
+function permissionQuestion(ev, open) {
   const what = ev.tool_name ? `Permission needed: ${ev.tool_name}` : (ev.message || 'Claude needs your permission');
+  const owner = [...(open || [])].reverse().find((t) => !ev.tool_name || t.name === ev.tool_name) || null;
   return {
     id: ev.event_id, kind: 'permission', text: what, questions: [], options: [],
+    tool_use_id: owner ? owner.id : null, tool_name: ev.tool_name || (owner ? owner.name : null),
     // Hook permission_suggestions are NOT the displayed choices; the choices are
     // read from the terminal by the prompt adapter, or reported unavailable.
     choices_available: false, reason: 'displayed choices not read from the terminal yet',
@@ -132,6 +137,7 @@ function reduce(prev, ev, ctx = {}) {
       s.stuck_count = 0;
       s.question = null;
       s.tool_paths = [];
+      s.open_tools = [];
       s.prompt = typeof ev.prompt === 'string'
         ? { available: true, text: ev.prompt, reason: '' }
         : { available: false, text: '', reason: 'prompt hook carried no prompt text' };
@@ -140,18 +146,19 @@ function reduce(prev, ev, ctx = {}) {
     case 'PreToolUse':
       if (s.turn === 0) break;
       progress();
+      if (ev.tool_use_id) {
+        s.open_tools = (s.open_tools || []).filter((t) => t.id !== ev.tool_use_id).concat([{ id: ev.tool_use_id, name: ev.tool_name || '' }]).slice(-50);
+      }
       if (ev.tool_name === 'AskUserQuestion') {
         s.question = questionFromTool(ev);
         s.state = 'needs_input';
         s.state_reason = '';
-      } else if (s.question) {
-        s.question = null; // Claude moved on: the earlier prompt was resolved
-        s.state = 'working';
       }
+      // An unrelated tool starting (a parallel call, a subagent's tool) does not answer a pending prompt.
       break;
     case 'PermissionRequest':
       if (s.turn === 0) break;
-      s.question = permissionQuestion(ev);
+      s.question = permissionQuestion(ev, s.open_tools);
       s.state = 'needs_input';
       s.state_reason = '';
       s.no_progress = false;
@@ -160,7 +167,7 @@ function reduce(prev, ev, ctx = {}) {
       if (s.turn === 0) break;
       const type = ev.notification_type || (/permission/i.test(ev.message || '') ? 'permission_prompt' : '');
       if (type === 'permission_prompt' && s.state !== 'done') {
-        if (!(s.question && s.question.kind === 'permission')) s.question = permissionQuestion(ev);
+        if (!(s.question && s.question.kind === 'permission')) s.question = permissionQuestion(ev, s.open_tools);
         s.state = 'needs_input';
         s.state_reason = '';
       } else if (type === 'elicitation_dialog' && s.state !== 'done') {
@@ -170,13 +177,24 @@ function reduce(prev, ev, ctx = {}) {
       break;
     }
     case 'PostToolUse':
-    case 'PostToolUseFailure':
+    case 'PostToolUseFailure': {
       if (s.turn === 0) break;
       progress();
-      if (s.question && (s.question.kind !== 'question' || ev.tool_name === 'AskUserQuestion')) s.question = null;
-      if (!s.question && (s.state === 'needs_input' || s.state === 'working')) s.state = 'working';
+      s.open_tools = (s.open_tools || []).filter((t) => t.id !== ev.tool_use_id);
+      // A pending prompt is resolved only by the completion of the tool use it belongs to.
+      const q = s.question;
+      if (q) {
+        const owner = q.kind === 'question' ? q.id : q.tool_use_id;
+        const name = q.kind === 'question' ? 'AskUserQuestion' : q.tool_name;
+        // Match by tool-use identity; only when no identity was observed, by tool name.
+        const matches = owner ? ev.tool_use_id === owner : (name ? ev.tool_name === name : true);
+        if (matches) { s.question = null; s.state = 'working'; }
+      } else if (s.state === 'needs_input') {
+        s.state = 'working';
+      }
       if (ev.kind === 'PostToolUse' && WRITE_TOOLS.has(ev.tool_name) && ev.file_path && !s.tool_paths.includes(ev.file_path)) s.tool_paths.push(ev.file_path);
       break;
+    }
     case 'Stop':
       if (s.turn === 0) break;
       s.question = null;

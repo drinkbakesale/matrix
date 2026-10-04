@@ -140,6 +140,24 @@ module.exports = (L) => {
       r = L.spawnSync(bin, ['run', '--backend', 'capture', '--root', okRoot, '--state-dir', L.tmp('s2'), '--config', cfg], { encoding: 'utf8', timeout: 20000, env: { ...process.env, MATRIX_RM2_CAPTURE_FAIL_AT: '1' } });
       assert.equal(r.status, 1);
       assert.match(r.stderr, /display probe failed/);
+      // Files are all present, but the display backend answers the handshake with something this client
+      // was not built for (another framebuffer geometry, or not an initialise response at all).
+      const le = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b; };
+      const initResp = (type, key, size) => Buffer.concat([Buffer.from([type, 0, 0, 0]), le(key), le(size), Buffer.alloc(12)]).toString('hex');
+      for (const [name, fixture, want] of [
+        ['other framebuffer geometry', initResp(0, 7, 1620 * 2160 * 2), /incompatible display backend: framebuffer is 6998400 bytes, this client needs 5256576/],
+        ['not an initialise response', initResp(3, 0, 0), /incompatible display backend: expected an initialise response \(type 0\), got message type 3/],
+      ]) {
+        const sdir = L.tmp('sx');
+        r = L.spawnSync(bin, ['run', '--backend', 'capture', '--root', okRoot, '--state-dir', sdir, '--config', cfg], { encoding: 'utf8', timeout: 20000, env: { ...process.env, MATRIX_RM2_CAPTURE_INIT: fixture } });
+        assert.equal(r.status, 8, `${name}: refused with the display-probe exit code`);
+        assert.equal(r.stdout, '', `${name}: nothing was drawn and no refresh was sent`);
+        assert.match(r.stderr, want, name);
+        const repx = JSON.parse(fs.readFileSync(path.join(sdir, 'firstrun-report.json'), 'utf8'));
+        assert.deepEqual([repx.supported, repx.code], [false, 8], `${name}: recorded for Mac diagnostics`);
+      }
+      const valid = L.spawnSync(bin, ['run', '--backend', 'capture', '--root', okRoot, '--state-dir', L.tmp('sv'), '--config', cfg, '--firstrun-touch-seconds', '1'], { encoding: 'utf8', timeout: 20000, env: { ...process.env, MATRIX_RM2_CAPTURE_INIT: initResp(0, 7, 1404 * 1872 * 2) } });
+      assert.ok(valid.stdout.includes('"firstrun"'), 'the pinned backend\'s own handshake answer is accepted and the first-run screen is drawn');
       // Supported version, display works, touch probe fails (no tap).
       const s3 = L.tmp('s3');
       r = L.spawnSync(bin, ['run', '--backend', 'capture', '--root', okRoot, '--state-dir', s3, '--config', cfg, '--firstrun-touch-seconds', '1'], { encoding: 'utf8', timeout: 20000 });
@@ -156,7 +174,7 @@ module.exports = (L) => {
       for (const want of ['SUPPORTED', 'Software version: 3.28.0.162', 'Device model: reMarkable 2.0', '[PASS] display probe', '[PASS] route home-lan: authenticated snapshot received', 'TOUCH CHECK: tap anywhere']) assert.ok(screen.includes(want), `first-run screen shows: ${want}`);
       const repOk = JSON.parse(fs.readFileSync(path.join(client.dir, 'state', 'firstrun-report.json'), 'utf8'));
       assert.ok(repOk.checks.some((c) => c.name === 'touch probe' && c.ok), 'touch probe recorded after the tap');
-      t.note(`first-run matrix: ${seen.join(', ')}; unsupported → exit 4 with 0 display output; display probe failure and touch probe failure → non-zero with report; supported → on-screen report with version, display, route and touch checks`);
+      t.note(`first-run matrix: ${seen.join(', ')}; unsupported → exit 4 with 0 display output; incompatible backend handshake (2 fixtures) → exit 8 with 0 display output; display probe failure and touch probe failure → non-zero with report; supported → on-screen report with version, display, route and touch checks`);
     },
 
     async install_restore(t) {
@@ -210,9 +228,15 @@ module.exports = (L) => {
           await L.until(() => { send({ dump: true }); return /"Status":"fresh"/.test(out); }, 15000, 'installed client connected');
           if (how === 'exit-button') { send({ touch: [0x10, 0, 1312, 31] }); send({ touch: [0x11, 0, 1312, 31] }); } else p.kill('SIGTERM'); // AppLoad's close gesture ends the process
           const code = await new Promise((ok) => p.once('exit', (c) => ok(c)));
-          assert.equal(code, 0, `${how}: the client releases the display and exits cleanly`);
+          assert.equal(code, 0, `${how}: the client exits cleanly`);
+          // Observed at the display link: the client sent MESSAGE_TERMINATE, which is what makes AppLoad drop the
+          // framebuffer and hand display and input back.
+          assert.ok(/\{"released":true\}/.test(out), `${how}: the backend was released (MESSAGE_TERMINATE sent) before exit`);
         }
-        assert.equal(sb.install('stock').status, 0);
+        // Stock restoration through the device adapter: the stock script ran on the (sandbox) tablet after activation.
+        r = sb.install('stock');
+        assert.equal(r.status, 0, r.stderr);
+        assert.match(r.stdout, /stock interface restored/);
         assert.deepEqual(sb.xoviState(), ['started', 'stock']);
         // Repeat install: idempotent.
         r = sb.install('install');

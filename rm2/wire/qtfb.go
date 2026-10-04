@@ -178,6 +178,33 @@ func DecodeClient(m Msg) ClientOp {
 	return ClientOp{Kind: "unknown"}
 }
 
+// CheckInit validates AppLoad's answer to MESSAGE_INITIALIZE. Anything other
+// than an initialise response carrying a 1404x1872 RGB565 framebuffer means the
+// installed display backend does not speak the protocol this client was built
+// for; the caller must stop before drawing.
+func CheckInit(m Msg) (ServerEvent, error) {
+	ev := DecodeServer(m)
+	want := int32(ui.ScreenW * ui.ScreenH * 2)
+	if ev.Type != MsgInitialize {
+		return ev, fmt.Errorf("incompatible display backend: expected an initialise response (type %d), got message type %d", MsgInitialize, ev.Type)
+	}
+	if ev.ShmSize != want {
+		return ev, fmt.Errorf("incompatible display backend: framebuffer is %d bytes, this client needs %d (1404x1872 RGB565)", ev.ShmSize, want)
+	}
+	return ev, nil
+}
+
+// Release tells the backend the client is done (MESSAGE_TERMINATE) and closes
+// the link, so AppLoad drops the framebuffer and returns input and display to
+// the stock interface.
+func Release(l Link) error {
+	err := l.Send(EncodeTerminate())
+	if cerr := l.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
 // Link carries QTFB messages and exposes the shared RGB565 framebuffer.
 type Link interface {
 	Send(Msg) error

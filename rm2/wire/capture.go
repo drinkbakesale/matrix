@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"encoding/hex"
 	"errors"
 	"sync"
 
@@ -15,6 +16,7 @@ type Refresh struct {
 	Sent []int  `json:"sent_rect,omitempty"` // rectangle in the wire message
 	AtMs int64  `json:"at_ms"`
 	Wave int32  `json:"refresh_mode"`
+	Raw  string `json:"raw"` // the 24 bytes exactly as sent on the wire, hex
 }
 
 // CaptureLink is an in-memory Link for the host build. It records nothing
@@ -31,6 +33,8 @@ type CaptureLink struct {
 	closed bool
 	FailAt int // if >0, the Nth Send fails (backend failure injection)
 	sends  int
+	// Released is set when the client sent MESSAGE_TERMINATE.
+	Released bool
 }
 
 func NewCaptureLink(clock func() int64) *CaptureLink {
@@ -53,15 +57,18 @@ func (c *CaptureLink) Send(m Msg) error {
 	c.Ops = append(c.Ops, op)
 	now := c.Clock()
 	full := []int{0, 0, ui.ScreenW, ui.ScreenH}
+	raw := hex.EncodeToString(m[:])
 	switch op.Kind {
+	case "terminate":
+		c.Released = true
 	case "refresh_mode":
 		c.mode = op.Mode
 	case "update_all":
-		c.Trace = append(c.Trace, Refresh{Mode: "init", Rect: full, AtMs: now, Wave: c.mode})
+		c.Trace = append(c.Trace, Refresh{Mode: "init", Rect: full, AtMs: now, Wave: c.mode, Raw: raw})
 	case "partial":
-		c.Trace = append(c.Trace, Refresh{Mode: "partial", Rect: PanelRect(op.Rect).List(), Sent: op.Rect.List(), AtMs: now, Wave: c.mode})
+		c.Trace = append(c.Trace, Refresh{Mode: "partial", Rect: PanelRect(op.Rect).List(), Sent: op.Rect.List(), AtMs: now, Wave: c.mode, Raw: raw})
 	case "clean":
-		c.Trace = append(c.Trace, Refresh{Mode: "clean", Rect: full, AtMs: now, Wave: c.mode})
+		c.Trace = append(c.Trace, Refresh{Mode: "clean", Rect: full, AtMs: now, Wave: c.mode, Raw: raw})
 	}
 	return nil
 }

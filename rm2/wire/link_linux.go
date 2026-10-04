@@ -43,12 +43,12 @@ func DialDevice(socketPath, keyText string) (*DeviceLink, error) {
 		l.Close()
 		return nil, fmt.Errorf("qtfb init response: %w", err)
 	}
-	ev := DecodeServer(m)
-	want := int32(ui.ScreenW * ui.ScreenH * 2)
-	if ev.Type != MsgInitialize || ev.ShmSize != want {
+	ev, err := CheckInit(m)
+	if err != nil {
 		l.Close()
-		return nil, fmt.Errorf("qtfb init: unexpected response type %d size %d (want %d bytes for 1404x1872 RGB565)", ev.Type, ev.ShmSize, want)
+		return nil, err
 	}
+	want := int32(ui.ScreenW * ui.ScreenH * 2)
 	shm, err := os.OpenFile(fmt.Sprintf("/dev/shm/qtfb_%d", ev.ShmKey), os.O_RDWR, 0)
 	if err != nil {
 		l.Close()
@@ -98,7 +98,6 @@ func (l *DeviceLink) Close() error {
 		l.shm.Close()
 	}
 	if l.fd >= 0 {
-		syscall.Write(l.fd, func() []byte { m := EncodeTerminate(); return m[:] }())
 		syscall.Close(l.fd)
 		l.fd = -1
 	}

@@ -126,14 +126,21 @@ module.exports = (L) => {
       // Provider 500: bounded retry with a stable tag, visible while failing.
       const calls = [];
       let mode = 'fail';
-      x = system({ sender: async (s, payload) => { calls.push({ endpoint: s.endpoint, payload: JSON.parse(payload) }); if (mode === 'fail' && s.endpoint.endsWith('-1')) { const e = new Error('provider said 500'); e.statusCode = 500; throw e; } if (s.endpoint.endsWith('-3')) { const e = new Error('gone'); e.statusCode = 410; throw e; } } });
+      x = system({ sender: async (s, payload) => { calls.push({ endpoint: s.endpoint, payload: JSON.parse(payload) }); if (mode === 'fail' && s.endpoint.endsWith('-1')) { const e = new Error('provider said 500'); e.statusCode = 500; throw e; } if (s.endpoint.endsWith('-3')) { const e = new Error('gone'); e.statusCode = 410; throw e; } if (s.endpoint.endsWith('-4')) { const e = new Error('not found'); e.statusCode = 404; throw e; } } });
       await x.sys.evidence.collect();
-      x.sys.push.subscribe(sub(1)); x.sys.push.subscribe(sub(2)); x.sys.push.subscribe(sub(3));
+      x.sys.push.subscribe(sub(1)); x.sys.push.subscribe(sub(2)); x.sys.push.subscribe(sub(3)); x.sys.push.subscribe(sub(4));
       await x.ev('UserPromptSubmit', { prompt: 'p' }); await x.ev('Stop', { last_assistant_message: 'm' });
       const by = (n) => calls.filter((c) => c.endpoint.endsWith(`-${n}`));
-      assert.deepEqual([by(1).length, by(2).length, by(3).length], [1, 1, 1]);
+      assert.deepEqual([by(1).length, by(2).length, by(3).length, by(4).length], [1, 1, 1, 1]);
       h = x.sys.push.health();
-      assert.equal(h.subscriptions, 2, 'the 410 subscription was pruned, and only that one');
+      // Expired subscriptions: HTTP 410 (device 3) and HTTP 404 (device 4) are each pruned; nothing else is.
+      const left = x.sys.push._doc().subscriptions.map((q) => q.sub.endpoint.slice(-8)).sort();
+      assert.deepEqual(left, ['device-1', 'device-2'], 'exactly the 404 and the 410 subscription were pruned');
+      const dropped = x.sys.push._doc().transitions[0].deliveries.filter((q) => q.status === 'dropped');
+      assert.equal(dropped.length, 2, 'the 404 and the 410 delivery are recorded as dropped, never as delivered');
+      assert.match(h.detail, /expired \(HTTP (404|410)\) and was removed; re-enable notifications on that device/, 'the expired subscription stays visible in health');
+      assert.equal(by(2).filter((c) => c.payload.kind === 'done').length, 1, 'the healthy subscription received its transition exactly once');
+      assert.equal(h.subscriptions, 2);
       assert.equal(h.ok, false);
       assert.equal(h.pending, 1, 'the failed delivery is scheduled, not dropped and not claimed');
       await x.pump();
@@ -177,7 +184,7 @@ module.exports = (L) => {
       assert.equal(x.sent.length, 1, 'delivered once after the disk recovered');
       assert.ok(!/cannot save/.test(x.sys.push.health().detail));
       delete process.env.FAKE_TMUX_DIR;
-      t.note('no VAPID / no subscription visible; 500 → 4 bounded attempts with one tag then "failed permanently"; 410 pruned only that subscription; recovery delivers once; ENOSPC on outbox → not claimed, visible, delivered after recovery');
+      t.note('no VAPID / no subscription visible; 500 → 4 bounded attempts with one tag then "failed permanently"; 404 and 410 each pruned only their own subscription, health keeps saying so; recovery delivers once; ENOSPC on outbox → not claimed, visible, delivered after recovery');
     },
 
     async click_routing(t) {

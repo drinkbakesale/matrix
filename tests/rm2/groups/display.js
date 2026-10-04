@@ -68,6 +68,18 @@ module.exports = (L) => {
           if (i !== 11) assert.deepEqual(st.refreshes, [], `step ${i} (${steps[i].op}): no refresh`);
         }
       }
+      // Wire bytes, specified here from the pinned AppLoad ABI (src/qtfb/common.h at 7ec0830, 32-bit ARM layout):
+      //   struct ClientMessage { uint8_t type; /* 3 pad */ union { struct { int type; int x, y, w, h; } update; ... }; }  = 24 bytes
+      //   MESSAGE_UPDATE = 1, UPDATE_ALL = 0, UPDATE_PARTIAL = 1, MESSAGE_REQUEST_FULL_REFRESH = 6
+      const le = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b; };
+      const partialBytes = (x, y, w, h) => Buffer.concat([Buffer.from([1, 0, 0, 0]), le(1), le(x), le(y), le(w), le(h)]).toString('hex');
+      const cleanBytes = Buffer.concat([Buffer.from([6]), Buffer.alloc(23)]).toString('hex');
+      let rawChecked = 0;
+      for (const st of out.steps) for (const r of st.refreshes) {
+        if (r.mode === 'partial') { assert.equal(r.raw, partialBytes(...r.sent_rect), 'partial update bytes match the ABI layout'); rawChecked++; }
+        if (r.mode === 'clean') { assert.equal(r.raw, cleanBytes, 'clean refresh is exactly MESSAGE_REQUEST_FULL_REFRESH'); rawChecked++; }
+      }
+      assert.ok(rawChecked >= 5);
       const clean = out.steps[11].refreshes;
       assert.equal(clean.length, 1);
       assert.deepEqual([clean[0].mode, clean[0].region, clean[0].rect], ['clean', 'screen', [0, 0, W, H]], 'clean = the panel full-refresh request, whole screen');
@@ -76,7 +88,7 @@ module.exports = (L) => {
       assert.match(bad.fatal, /refusing invalid partial rectangle/, 'a null rectangle is refused by the encoder');
       assert.deepEqual(bad.refreshes, [], 'and never becomes a full paint');
       assert.equal(bad.full_paints, 1, 'only the launch full paint happened');
-      t.note(`${checked} region-isolation pixel checks; 5 stream steps 0 changed pixels; clean at 4601 not 4599; invalid rect refused`);
+      t.note(`${checked} region-isolation pixel checks; 5 stream steps 0 changed pixels; clean at 4601 not 4599; ${rawChecked} sent messages byte-identical to independently built ABI fixtures; invalid rect refused`);
     },
 
     async real_touch(t) {
@@ -113,7 +125,26 @@ module.exports = (L) => {
       const first = L.readPGM(out.steps[0].frame); const last = L.readPGM(out.steps[out.steps.length - 1].frame);
       assert.equal(changedBox(first, last).n, 0, 'touch draws nothing: no pointer cursor and no optimistic mark');
       assert.ok(out.steps.every((s) => s.refreshes.length === 0), 'touch causes no refresh');
-      t.note('9 touch scenarios via QTFB-encoded input: 3 selections (center + both corners), 6 rejections; 0 pixels drawn');
+      // Forwarded input as raw bytes, specified here from the pinned ABI rather than through the client's encoder:
+      //   struct ServerMessage { uint8_t type; /* 3 pad */ union { struct { int inputType; int devId; int x, y, d; } userInput; ... }; }
+      //   MESSAGE_USERINPUT = 4, INPUT_TOUCH_PRESS = 0x10, INPUT_TOUCH_RELEASE = 0x11, INPUT_PEN_PRESS = 0x20,
+      //   MESSAGE_DEVICE_STATE_INIT = 8 { int reason = ROTATION(0); int rotation; }.  Coordinates are native portrait framebuffer pixels.
+      const le = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b; };
+      const input = (type, dev, x, y) => Buffer.concat([Buffer.from([4, 0, 0, 0]), le(type), le(dev), le(x), le(y), le(0)]).toString('hex');
+      const rawTap = (x, y, at) => [{ op: 'touch_raw', hex: input(0x10, 0, x, y), at_ms: at }, { op: 'touch_raw', hex: input(0x11, 0, x, y), at_ms: at + 40 }];
+      const rot = Buffer.concat([Buffer.from([8, 0, 0, 0]), le(0), le(0), Buffer.alloc(12)]).toString('hex');
+      const raw = L.script({ screen: [W, H], initial: two, config: cfg(), steps: [
+        { op: 'touch_raw', hex: rot, at_ms: 10 }, // 0: device-state packet (rotation 0) is not input
+        ...rawTap(bx, by, 100), // 1,2: native-orientation tap on row B
+        ...rawTap(by, bx, 300), // 3,4: the same point with x/y transposed (a landscape reading) is not row B
+        { op: 'touch_raw', hex: input(0x20, 0, bx, by), at_ms: 500 }, { op: 'touch_raw', hex: input(0x21, 0, bx, by), at_ms: 540 }, // 5,6: pen
+        ...rawTap(W - 1, H - 1, 700), // 7,8: bottom-right native corner is inside the screen, hits no row
+      ] });
+      const rsel = (i) => (raw.steps[i].commands || []).filter((c) => c.Kind === 'select').map((c) => c.SessionID);
+      assert.deepEqual([rsel(0), rsel(2), rsel(4), rsel(6)], [[], ['B'], [], []], 'raw ABI touch packets: native-orientation tap selects B; rotation packet, transposed point and pen do not');
+      assert.ok(raw.steps.every((q) => q.refreshes.length === 0 && !q.fatal), 'raw input causes no refresh and no error');
+      assert.ok(by > 100 && by < 300 && bx > 300, 'row B sits near the top of the portrait screen, so the transposed point is elsewhere');
+      t.note('9 touch scenarios via QTFB-encoded input + 5 raw ABI packet fixtures (rotation, native tap, transposed, pen, corner): 3 selections (center + both corners), 6 rejections; 0 pixels drawn');
     },
 
     async pagination(t) {
@@ -179,7 +210,35 @@ module.exports = (L) => {
       assert.ok(viewStep.visible_text.digest.includes('message-line-') , 'iPad paging moved the digest');
       const order = Object.entries(probe.regions).filter(([k]) => k.startsWith('row:')).sort((a, b) => a[1][1] - b[1][1]).map(([k]) => k);
       assert.deepEqual(order, ids.slice(0, 7).map((i) => `row:${i}`), 'rows keep their order');
-      t.note(`17 rows over 3 pages; digest ${digestPages.length} pages: 150 message lines, 30 files, 12 options all present; draft 40 lines rebuilt from ${pages.length} pages`);
+      // iPad paging: the real Control buttons in WebKit, the real server, and the production client over TLS.
+      const tm = L.fakeTmux(); const pane = tm.pane({}); tm.setPanes([pane]);
+      const srv = await L.startServer({ env: tm.env, tls: true });
+      L.hookToken(srv);
+      const longMsg = Array.from({ length: 150 }, (_, i) => `ipad-line-${i + 1}`).join('\n');
+      L.hook(srv, pane, { session_id: 'conv-paging-0001', hook_event_name: 'UserPromptSubmit', prompt: 'page me' });
+      L.hook(srv, pane, { session_id: 'conv-paging-0001', hook_event_name: 'Stop', last_assistant_message: longMsg });
+      const client = await L.startClient({ endpoints: [srv.endpoint()], token: srv.token('device') });
+      const page = await L.openControl(srv);
+      await page.click('#sessions li');
+      let d = await client.waitDump((q) => (q.visible.digest || '').includes('ipad-line-1'), 8000, 'the digest on the RM2');
+      const seen = [d.visible.digest];
+      const mark = client.refreshes.length;
+      let same = 0;
+      for (let i = 0; i < 14 && same < 2; i++) {
+        await page.click('#digest-next');
+        await L.wait(350);
+        d = await client.dump();
+        if (d.visible.digest === seen[seen.length - 1]) same += 1; else { same = 0; seen.push(d.visible.digest); }
+      }
+      const viaIpad = seen.join('\n');
+      for (let i = 1; i <= 150; i++) assert.ok(new RegExp(`ipad-line-${i}(\\n|$)`).test(viaIpad), `iPad paging reaches message line ${i}`);
+      const paged = client.refreshes.slice(mark);
+      assert.ok(paged.length >= seen.length - 1 && paged.every((r) => r.mode === 'partial' && r.rect[1] >= 608 && r.rect[1] + r.rect[3] <= 1508), `iPad paging repainted only the digest region (${paged.length} partials)`);
+      const lastPage = d.view.digest_page;
+      await page.click('#digest-prev');
+      await client.waitDump((q) => q.view.digest_page === lastPage - 1, 3000, 'paging back from the iPad');
+      await client.stop();
+      t.note(`iPad Control buttons paged the RM2 digest through ${seen.length} pages (150 lines reachable, ${paged.length} digest-only partials); 17 rows over 3 pages; digest ${digestPages.length} pages: 150 message lines, 30 files, 12 options all present; draft 40 lines rebuilt from ${pages.length} pages`);
     },
 
     async quiet_boundaries(t) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -104,6 +105,23 @@ func runMain(args []string) error {
 			capture.FailAt = v
 		}
 		link = capture
+		// The capture backend replays AppLoad's initialise response so the same
+		// compatibility check runs on the host; a fixture can supply another answer.
+		resp := wire.EncodeInitResponse(1, int32(ui.ScreenW*ui.ScreenH*2))
+		if h := os.Getenv("MATRIX_RM2_CAPTURE_INIT"); h != "" {
+			b, err := hex.DecodeString(h)
+			if err != nil || len(b) != wire.MsgSize {
+				return fmt.Errorf("MATRIX_RM2_CAPTURE_INIT must be %d hex-encoded bytes", wire.MsgSize)
+			}
+			copy(resp[:], b)
+		}
+		if _, err := wire.CheckInit(resp); err != nil {
+			rep.Supported, rep.Code, rep.Reason = false, firstrun.CodeDisplayFail, "display probe failed: "+err.Error()
+			rep.Checks = append(rep.Checks, firstrun.Check{Name: "display probe", OK: false, Detail: err.Error()})
+			writeReport(rep)
+			fmt.Fprintln(os.Stderr, "fatal: display probe failed:", err)
+			os.Exit(firstrun.CodeDisplayFail)
+		}
 	case "qtfb":
 		l, err := wire.DialDevice(wire.SocketPath, os.Getenv("QTFB_KEY"))
 		if err != nil {
@@ -116,7 +134,14 @@ func runMain(args []string) error {
 	default:
 		return fmt.Errorf("unknown backend %q", *backend)
 	}
-	defer link.Close()
+	// On every exit path the backend is told the client is done, so AppLoad
+	// releases the display and input to the stock interface.
+	defer func() {
+		wire.Release(link)
+		if capture != nil {
+			json.NewEncoder(os.Stdout).Encode(map[string]any{"released": capture.Released})
+		}
+	}()
 	mode := int32(wire.RefreshFast)
 	if cfg.Display.RefreshMode != nil {
 		mode = *cfg.Display.RefreshMode

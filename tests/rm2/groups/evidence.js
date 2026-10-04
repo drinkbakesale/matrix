@@ -90,6 +90,15 @@ module.exports = (L) => {
       assert.ok(s.question.text.includes('Which database?') && s.question.text.includes('Which features?'), 'both question texts shown');
       assert.deepEqual(s.question.options.map((o) => `${o.key}=${o.label}`), ['1.1=Postgres — server', '1.2=SQLite — file', '2.1=Auth', '2.2=Search', '2.3=Export'], 'exact options, no invented ones');
       assert.equal(s.question.choices_available, true);
+      // Unrelated tool activity (a parallel call, a subagent) does not resolve the pending question.
+      const pendingQ = JSON.stringify(s.question);
+      x.fire(p, conv, 'PreToolUse', { tool_name: 'Read', tool_use_id: 'other-read-1', tool_input: { file_path: '/w/x.js' } });
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Read', tool_use_id: 'other-read-1', tool_input: { file_path: '/w/x.js' }, tool_response: 'x' });
+      x.fire(p, conv, 'PostToolUseFailure', { tool_name: 'Bash', tool_use_id: 'other-bash-1', tool_input: { command: 'false' }, error: 'exit 1' });
+      x.fire(p, conv, 'SubagentStop', { last_assistant_message: 'sub done' });
+      s = await x.sess(p);
+      assert.equal(s.state, 'needs_input', 'still waiting on the question after unrelated tool completions');
+      assert.equal(JSON.stringify(s.question), pendingQ, 'same pending id, text and options');
       x.fire(p, conv, 'PostToolUse', { tool_name: 'AskUserQuestion', tool_use_id: 'ask1', tool_input: { questions }, tool_response: { answers: {} } });
       s = await x.sess(p);
       assert.deepEqual([s.state, s.question.pending], ['working', false], 'answering clears the question');
@@ -104,6 +113,14 @@ module.exports = (L) => {
       assert.deepEqual(s.question.options, [{ key: '1', label: 'Yes' }, { key: '2', label: "Yes, and don't ask again for rm commands" }, { key: '3', label: 'No, and tell Claude what to do differently (esc)' }]);
       assert.ok(!JSON.stringify(s).includes('SUGGESTED-RULE'), 'permission suggestions are not advertised as choices');
       assert.ok(s.question.text.includes('Do you want to proceed?'));
+      // Unrelated completions, and another Bash call that is not the one waiting, leave the permission prompt pending.
+      const pendingP = JSON.stringify(s.question);
+      x.fire(p, conv, 'PreToolUse', { tool_name: 'Grep', tool_use_id: 'other-grep-1', tool_input: { pattern: 'x' } });
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Grep', tool_use_id: 'other-grep-1', tool_input: { pattern: 'x' }, tool_response: 'x' });
+      x.fire(p, conv, 'PostToolUse', { tool_name: 'Bash', tool_use_id: 'b0-earlier', tool_input: { command: 'ls' }, tool_response: {} });
+      s = await x.sess(p);
+      assert.equal(s.state, 'needs_input', 'still waiting on the permission after unrelated tool completions');
+      assert.equal(JSON.stringify(s.question), pendingP, 'same pending permission id and terminal options');
       x.fire(p, conv, 'PostToolUse', { tool_name: 'Bash', tool_use_id: 'b1', tool_input: { command: 'rm -rf build' }, tool_response: {} });
       s = await x.sess(p);
       assert.deepEqual([s.state, s.question.pending], ['working', false], 'tool completion resolves the permission prompt');
@@ -124,7 +141,7 @@ module.exports = (L) => {
       s = await x.sess(p);
       assert.deepEqual([s.state, s.question.pending], ['working', false]);
       assert.deepEqual(x.tm.sent(), [], 'the observer never types into the pane');
-      t.note('AskUserQuestion: 2 questions/5 options exact; permission: 3 terminal options, suggestion excluded; unknown layout → unavailable; 0 keys sent');
+      t.note('AskUserQuestion: 2 questions/5 options exact, kept across 4 unrelated events; permission: 3 terminal options, suggestion excluded, kept across 3 unrelated events; unknown layout → unavailable; 0 keys sent');
     },
 
     async identity_isolation(t) {
