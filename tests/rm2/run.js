@@ -23,8 +23,9 @@ const resultFile = path.resolve(arg('result'));
       await fn({ note: (s) => notes.push(String(s)), dir: lib.caseDir(name) });
       assertions.push({ id, status: 'passed', detail: notes.join(' | ').slice(0, 1400) || 'all assertions held' });
     } catch (err) {
-      assertions.push({ id, status: 'failed', detail: `${err && err.message}`.slice(0, 1400) });
-      fs.writeFileSync(path.join(artifacts, `${name}.error.txt`), `${err && err.stack}\n\nnotes:\n${notes.join('\n')}`);
+      assertions.push({ id, status: 'failed', detail: `${err && err.message}${err && err.cause ? ` (${err.cause.code || err.cause.message})` : ''}`.slice(0, 1400) });
+      const cause = err && err.cause ? `\ncause: ${err.cause.stack || err.cause.code || err.cause}` : '';
+      fs.writeFileSync(path.join(artifacts, `${name}.error.txt`), `${err && err.stack}${cause}\n\nnotes:\n${notes.join('\n')}`);
     }
     fs.writeFileSync(path.join(artifacts, `${name}.notes.txt`), `${id} ${assertions[assertions.length - 1].status} in ${Date.now() - started}ms\n${notes.join('\n')}\n`);
     await lib.cleanup();

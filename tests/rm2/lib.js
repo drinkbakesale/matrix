@@ -103,16 +103,30 @@ module.exports = ({ candidate, artifacts }) => {
     return srv;
   }
 
+  // One request per connection (no keep-alive pool): a harness request can never be written to an
+  // idle socket the server is closing, however slowly the machine is running.
   async function http(method, url, { token, body, headers = {} } = {}) {
-    const res = await fetch(url, {
-      method, redirect: 'manual',
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...headers },
-      body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
+    const payload = body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body));
+    const all = { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...headers };
+    if (!url.startsWith('http://')) {
+      const res = await fetch(url, { method, redirect: 'manual', headers: all, body: payload });
+      return parsed(res.status, await res.text());
+    }
+    return new Promise((resolve, reject) => {
+      const req = require('http').request(url, { method, agent: false, headers: { ...all, ...(payload !== undefined ? { 'Content-Length': Buffer.byteLength(payload) } : {}) } }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(parsed(res.statusCode, Buffer.concat(chunks).toString('utf8'))));
+        res.on('error', reject);
+      });
+      req.on('error', (err) => reject(new Error(`${method} ${url} failed: ${err.code || err.message}`, { cause: err })));
+      req.end(payload);
     });
-    const text = await res.text();
+  }
+  function parsed(status, text) {
     let data = null;
     try { data = JSON.parse(text); } catch { /* not JSON */ }
-    return { status: res.status, data, text };
+    return { status, data, text };
   }
 
   // ---- real hook script --------------------------------------------------
