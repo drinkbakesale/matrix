@@ -164,7 +164,10 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
         const prev = tmux.sessions.get(name) || {};
         const claude = (prev.windows || []).find(w => briefTmux.isClaudeCmd(w.command));
         const window = claude ? claude.name : '';
-        return json(200, { session: name, window, target: window ? `${name}:${window}` : name });
+        // The target is the tmux identifier for the resolved window, or for the session
+        // itself when no Claude was found — never a string built out of the names.
+        const sessionId = tmux.sessionIdOf(name);
+        return json(200, { session: name, window, sessionId, target: window ? tmux.windowId(name, window) : sessionId });
       }
       if (op === 'mode') { state.mode = url.searchParams.get('mode') || 'ok'; return json(200, { mode: state.mode }); }
       if (op === 'settle') { await service.settle(); return json(200, { ok: true }); }

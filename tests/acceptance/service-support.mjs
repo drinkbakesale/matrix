@@ -30,24 +30,15 @@ export function tempDir(prefix = 'matrix-brief-') {
 }
 
 export function cleanupAll() {
-  while (cleanups.length) {
-    try { cleanups.pop()(); } catch {}
-  }
+  while (cleanups.length) { try { cleanups.pop()(); } catch {} }
 }
 
 export function fakeClock(start = 1_700_000_000_000) {
   let value = start;
-  return {
-    now: () => value,
-    advance(ms) { value += ms; return value; },
-    set(ms) { value = ms; return value; },
-  };
+  return { now: () => value, advance(ms) { value += ms; return value; }, set(ms) { value = ms; return value; } };
 }
 
-function argAfter(args, flag) {
-  const at = args.indexOf(flag);
-  return at >= 0 ? args[at + 1] : undefined;
-}
+function argAfter(args, flag) { const at = args.indexOf(flag); return at >= 0 ? args[at + 1] : undefined; }
 
 function lastLines(text, n) {
   const lines = String(text).split('\n');
@@ -56,28 +47,50 @@ function lastLines(text, n) {
 
 // A fake `tmux` executable. Sessions hold real multi-window panes with real scrollback, so
 // window selection and the early/recent capture split are genuinely exercised.
-//   session: { sessionId, createdAt, windows: [{ name, command, active, pane }] }
+//   session: { sessionId, createdAt, windows: [{ name, command, active, pane, panes? }] }
+//
+// Two things make it a fake tmux rather than a lookup table:
+//   1. It RENDERS whatever `-F` format it is handed, so one fixture serves code that asks
+//      for different fields — including the pre-repair code a regression has to fail on.
+//   2. It models tmux TARGET parsing, verified against tmux 3.6a: `@id`/`$id` are exact,
+//      while `session:window.pane` splits a trailing `.<digits>` off as a pane index BEFORE
+//      matching the window name, so `A:v2.1` really reaches window `v2`, pane 1.
+// Window ids are opaque counters carrying nothing from the name, so code that built a target
+// out of names could not accidentally produce one.
 export function fakeTmuxProcess(initial = {}) {
   const sessions = new Map(Object.entries(initial));
   const calls = [];
   const behaviour = { delayMs: 0, fail: new Set() };
+  const windowIds = new Map();                     // `${sessionId}\u0000${name}` -> `@n`
+  let nextWindowId = 0;
 
-  function windowsOf(name) {
-    const s = sessions.get(name);
-    return s ? (s.windows || []) : [];
+  // tmux accepts a session name or a session id wherever a session is addressed.
+  function sessionBy(key) {
+    for (const [name, s] of sessions) if (name === key || s.sessionId === key) return s;
+    return null;
   }
+  const windowsOf = key => { const s = sessionBy(key); return s ? (s.windows || []) : []; };
+  const key2 = (sid, w) => `${sid}\u0000${w}`;
+  function idFor(sessionId, windowName) {
+    const k = key2(sessionId, windowName);
+    if (!windowIds.has(k)) { nextWindowId += 1; windowIds.set(k, `@${nextWindowId}`); }
+    return windowIds.get(k);
+  }
+  const render = (fmt, vars) => String(fmt).replace(/#\{([a-z_]+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
 
-  // Models tmux target parsing, not a lookup keyed by the raw string: `session:window.pane`,
-  // where a trailing `.<digits>` is split off as a pane index BEFORE the window is matched.
-  // That is the dangerous reading, and it is exactly why a name carrying a separator must be
-  // refused rather than reasoned about — a window legitimately called `v2.1` addresses
-  // window `v2`, pane 1.
   function paneTextForTarget(target) {
     const raw = String(target);
-    const colon = raw.indexOf(':');
-    const name = colon === -1 ? raw : raw.slice(0, colon);
+    if (raw.startsWith('@')) {                     // an exact window id addresses one window
+      for (const s of sessions.values()) {
+        const hit = (s.windows || []).find(w => windowIds.get(key2(s.sessionId, w.name)) === raw);
+        if (hit) return String(hit.pane || '');
+      }
+      return null;
+    }
+    const colon = raw.indexOf(':');                // `$id` or a bare name addresses a session
+    const key = colon === -1 ? raw : raw.slice(0, colon);
     let rest = colon === -1 ? '' : raw.slice(colon + 1);
-    const windows = windowsOf(name);
+    const windows = windowsOf(key);
     if (!windows.length) return null;
     if (!rest) { const a = windows.find(w => w.active) || windows[0]; return a ? String(a.pane || '') : null; }
     let paneIndex = null;
@@ -93,18 +106,27 @@ export function fakeTmuxProcess(initial = {}) {
     const cmd = args[0];
     if (behaviour.fail.has(cmd)) throw Object.assign(new Error(`fake tmux: ${cmd} failed`), { code: 1 });
     if (cmd === 'list-sessions') {
-      return [...sessions.entries()].map(([name, s]) => `${name}|${s.sessionId}|${s.createdAt}`).join('\n') + '\n';
+      const fmt = argAfter(args, '-F') || '#{session_name}';
+      return [...sessions.entries()].map(([name, s]) => render(fmt, {
+        session_name: name, session_id: s.sessionId, session_created: s.createdAt,
+      })).join('\n') + '\n';
     }
     if (cmd === 'list-panes') {
-      const name = argAfter(args, '-t');
-      const windows = windowsOf(name);
+      const s = sessionBy(argAfter(args, '-t'));
+      const windows = s ? (s.windows || []) : [];
       if (!windows.length) throw Object.assign(new Error('no such session'), { code: 1 });
-      return windows.map((w, i) => `${i}|${w.name}|${w.active ? 1 : 0}|${w.command || 'bash'}`).join('\n') + '\n';
+      const fmt = argAfter(args, '-F') || '#{window_name}';
+      return windows.map((w, i) => render(fmt, {
+        window_index: i, window_id: idFor(s.sessionId, w.name), window_name: w.name,
+        window_active: w.active ? 1 : 0, pane_current_command: w.command || 'bash', pane_id: `%${i}`,
+      })).join('\n') + '\n';
     }
     if (cmd === 'display-message') {
       const text = paneTextForTarget(argAfter(args, '-t'));
       if (text === null) throw Object.assign(new Error('no such pane'), { code: 1 });
-      return `${text.split('\n').length}\n`;
+      return render(args[args.length - 1], {
+        history_size: text.split('\n').length, pane_width: 80, pane_height: 24,
+      }) + '\n';
     }
     if (cmd === 'capture-pane') {
       const text = paneTextForTarget(argAfter(args, '-t'));
@@ -142,6 +164,11 @@ export function fakeTmuxProcess(initial = {}) {
     set(name, data) { sessions.set(name, data); },
     kill(name) { sessions.delete(name); },
     callsFor(cmd) { return calls.filter(c => c.args[0] === cmd); },
+    // The identifiers a test must compare against: a resolved target is one of these, never
+    // a string a test could have spelled out of the session and window names.
+    sessionIdOf(name) { const s = sessionBy(name); return s ? s.sessionId : null; },
+    windowId(name, windowName) { const s = sessionBy(name); return s ? idFor(s.sessionId, windowName) : null; },
+    targetsFor(cmd) { return this.callsFor(cmd).map(c => c.args[c.args.indexOf('-t') + 1]); },
     reset() { calls.length = 0; },
   };
 }
@@ -150,8 +177,7 @@ export function fakeTmuxProcess(initial = {}) {
 export function claudeSession(id, pane, extra = {}) {
   return {
     sessionId: `$${id}`, createdAt: 1_600_000_000,
-    windows: [{ name: 'claude', command: 'claude', active: true, pane }],
-    ...extra,
+    windows: [{ name: 'claude', command: 'claude', active: true, pane }], ...extra,
   };
 }
 
@@ -181,10 +207,9 @@ export function paneFor(record, { padLines = 0 } = {}) {
   return lines.join('\n');
 }
 
-// Builds the delivered resolver/capture stack on top of the fake process.
-// Builds the delivered stack with the SHIPPED resolver defaults. Nothing here may relax
-// caching or identity validation: a helper that quietly disabled a cache would hide exactly
-// the class of staleness these cases exist to catch.
+// The delivered resolver/capture stack on the fake process, with the SHIPPED defaults.
+// Nothing here may relax caching or identity validation: a helper that quietly disabled a
+// cache would hide exactly the class of staleness these cases exist to catch.
 export function tmuxStack(fake, { timeoutMs = 5000, recentLines = 400, earlyLines = 120 } = {}) {
   const tmux = briefTmux.createTmux({ execFileImpl: fake.execFileImpl, timeoutMs });
   const resolver = briefTmux.createSessionResolver({ tmux });
@@ -193,10 +218,8 @@ export function tmuxStack(fake, { timeoutMs = 5000, recentLines = 400, earlyLine
 }
 
 export function makeService(opts) {
-  const {
-    stack, clock, generator, storeFile, evidenceIntervalMs = 30000,
-    literalRequired = true, generationTimeoutMs = 30000, fsImpl,
-  } = opts;
+  const { stack, clock, generator, storeFile, evidenceIntervalMs = 30000,
+    literalRequired = true, generationTimeoutMs = 30000, fsImpl } = opts;
   return new briefServiceMod.BriefService({
     storeFile,
     resolveSession: (name, windowName, options) => stack.resolver.resolve(name, windowName, options),
@@ -233,9 +256,7 @@ export function countingGenerator(inner) {
       try {
         if (gate) await gate;
         return await inner.generate(input);
-      } finally {
-        live -= 1;
-      }
+      } finally { live -= 1; }
     },
   };
 }
@@ -257,9 +278,7 @@ process.stdin.on('end', () => {
   }));
   // Exit only once stdout has actually flushed, so an oversized payload really reaches the
   // parent's maxBuffer instead of being cut short by an early exit.
-  setTimeout(() => {
-    process.stdout.write(${JSON.stringify(stdout)}, () => process.exit(${exitCode}));
-  }, ${delayMs});
+  setTimeout(() => process.stdout.write(${JSON.stringify(stdout)}, () => process.exit(${exitCode})), ${delayMs});
 });
 `;
   fs.writeFileSync(bin, script, { mode: 0o755 });
@@ -268,23 +287,44 @@ process.stdin.on('end', () => {
 
 // Runs the delivered pane-stream module against a throwaway `tmux` on PATH and a fake
 // WebSocket, and records exactly what a connecting client is told. The stream fixes its
-// target when the connection opens, so what it announces at that moment is what anything
-// else describing "this session" has to bind to. No real tmux, HOME or server is involved.
-export function paneStreamProbe({ session = 'A', windows = [], query = null } = {}) {
-  const dir = tempDir('matrix-panestream-');
-  const windowFile = path.join(dir, 'windows.txt');
-  fs.writeFileSync(windowFile, `${windows.map(([name, cmd]) => `${name}|${cmd}`).join('\n')}\n`);
+// target when the connection opens, so what it announces then is what anything else
+// describing "this session" must bind to. No live tmux, HOME or server is involved —
+// except via `binDir`, which supplies a directory already holding a `tmux` executable, used
+// by the real-tmux regression to point this same probe at its own private socket.
+export function paneStreamProbe({ session = 'A', windows = [], query = null, sessionId = '$9', binDir = null } = {}) {
+  const dir = binDir || tempDir('matrix-panestream-');
+  const dataFile = path.join(dir, 'tmux-data.json');
   const argvLog = path.join(dir, 'argv.log');
   const marker = path.join(dir, 'executed');
-  fs.writeFileSync(path.join(dir, 'tmux'), `#!/bin/sh
-printf '%s\\n' "$*" >> ${JSON.stringify(argvLog)}
-case "$1" in
-  list-panes) cat ${JSON.stringify(windowFile)} ;;
-  display-message) echo "80|24" ;;
-  capture-pane) echo "fixture pane line" ;;
-esac
-`, { mode: 0o755 });
+  if (binDir) return runPaneStream(dir, { session, query, argvLog, marker });
+  fs.writeFileSync(dataFile, JSON.stringify({ session, sessionId, windows }));
+  // Renders whatever `-F` format it is handed and answers a session by name OR id, the way
+  // tmux does, so the same probe serves code that asks for different fields.
+  fs.writeFileSync(path.join(dir, 'tmux'), [
+    '#!/usr/bin/env node',
+    "const fs = require('fs');",
+    'const args = process.argv.slice(2);',
+    `fs.appendFileSync(${JSON.stringify(argvLog)}, args.join(' ') + '\\n');`,
+    `const d = JSON.parse(fs.readFileSync(${JSON.stringify(dataFile)}, 'utf8'));`,
+    'const at = f => { const i = args.indexOf(f); return i < 0 ? undefined : args[i + 1]; };',
+    'const render = (f, v) => String(f).replace(/#\\{([a-z_]+)\\}/g, (m, k) => (k in v ? String(v[k]) : m));',
+    "const out = s => process.stdout.write(s + '\\n');",
+    "if (args[0] === 'list-sessions') {",
+    "  out(render(at('-F') || '#{session_name}', { session_name: d.session, session_id: d.sessionId, session_created: 1 }));",
+    "} else if (args[0] === 'list-panes') {",
+    "  if (at('-t') !== d.session && at('-t') !== d.sessionId) process.exit(1);",
+    "  out(d.windows.map((w, i) => render(at('-F') || '#{window_name}', {",
+    "    window_index: i, window_id: '@' + i, window_name: w[0], window_active: i === 0 ? 1 : 0,",
+    "    pane_current_command: w[1], pane_id: '%' + i,",
+    "  })).join('\\n'));",
+    "} else if (args[0] === 'display-message') {",
+    '  out(render(args[args.length - 1], { pane_width: 80, pane_height: 24, history_size: 1 }));',
+    "} else if (args[0] === 'capture-pane') { out('fixture pane line'); }",
+  ].join('\n') + '\n', { mode: 0o755 });
+  return runPaneStream(dir, { session, query, argvLog, marker });
+}
 
+function runPaneStream(dir, { session, query, argvLog, marker }) {
   const previousPath = process.env.PATH;
   process.env.PATH = `${dir}:${previousPath}`;
   const paneStream = require(path.join(LIB, 'pane-stream.js'));
@@ -295,8 +335,7 @@ esac
     readyState: 1,
     send: raw => sent.push(JSON.parse(raw)),
     on: (evt, cb) => wsHandlers.set(evt, cb),
-    close: (code, reason) => { closed = { code, reason }; ws.readyState = 3; },
-    ping: () => {},
+    close: (code, reason) => { closed = { code, reason }; ws.readyState = 3; }, ping: () => {},
   };
   let connect = null;
   paneStream.attach({ on: (evt, cb) => { if (evt === 'connection') connect = cb; } }, { port: 0 });
@@ -322,10 +361,12 @@ esac
 // another window, and only a reconnect may move it.
 export async function streamBindingChecks({ clock, generator, storeFile, activePane, otherPane, expect }) {
   const checks = [];
+  // The probe's tmux issues `@<index>` for window <index> and `$9` for the session, so the
+  // expected target is an identifier tmux reported, never one spelled out of the names.
   for (const [label, windows, window, target] of [
-    ['Claude in window one', [['one', 'claude'], ['two', 'bash']], 'one', 'A:one'],
-    ['Claude moved to window two', [['one', 'bash'], ['two', 'claude']], 'two', 'A:two'],
-    ['no Claude anywhere', [['one', 'bash'], ['two', 'bash']], '', 'A'],
+    ['Claude in window one', [['one', 'claude'], ['two', 'bash']], 'one', '@0'],
+    ['Claude moved to window two', [['one', 'bash'], ['two', 'claude']], 'two', '@1'],
+    ['no Claude anywhere', [['one', 'bash'], ['two', 'bash']], '', '$9'],
   ]) {
     const probe = paneStreamProbe({ session: 'A', windows });
     checks.push([probe.first && probe.first.type, 'stream-target', `${label}: the connection announces its target first`]);
@@ -344,15 +385,20 @@ export async function streamBindingChecks({ clock, generator, storeFile, activeP
     [report.briefAtReconnect, report.streamAtReconnect, 'a reconnect re-binds to the window it discovered'],
     [report.goalAfterReconnect, expect.otherGoal, 'and the brief then describes that window'],
     [report.overrideAfterReconnect, null, 'the edit stayed with the pane it was made against'],
-    [report.unboundTarget, 'C:two', 'a client that has not been told yet still gets discovery'],
+    [report.unboundTarget, report.discoveredTarget, 'a client that has not been told yet still gets discovery'],
   );
   return { checks, report };
 }
 
 async function emptyBindingScenario({ clock, generator, storeFile, activePane, otherPane }) {
-  const streamBinding = session => {
+  // What a connection opening right now would resolve: the Claude window's id, or — with no
+  // Claude running — the session's own id, which is the unambiguous form of the old bare
+  // session target.
+  const streamBinding = (session, fake) => {
     const claude = (session.windows || []).find(w => briefTmux.isClaudeCmd(w.command));
-    return claude ? { window: claude.name, target: `C:${claude.name}` } : { window: '', target: 'C' };
+    return claude
+      ? { window: claude.name, target: fake.windowId('C', claude.name) }
+      : { window: '', target: fake.sessionIdOf('C') };
   };
   const noClaude = {
     sessionId: '$C', createdAt: 1_600_000_000,
@@ -364,7 +410,7 @@ async function emptyBindingScenario({ clock, generator, storeFile, activePane, o
   const fake = fakeTmuxProcess({ C: noClaude });
   const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
 
-  const atOpen = streamBinding(noClaude);
+  const atOpen = streamBinding(noClaude, fake);
   let binding = { window: atOpen.window, authoritative: true };
   await service.read('C', binding);
   await service.settle();
@@ -384,7 +430,7 @@ async function emptyBindingScenario({ clock, generator, storeFile, activePane, o
   const edited = await service.patch('C', { goal: 'edit against the streamed pane', revision: held.revision }, binding);
 
   // Reconnect: a new connection discovers Claude and announces the window it found.
-  const atReconnect = streamBinding(claudeElsewhere);
+  const atReconnect = streamBinding(claudeElsewhere, fake);
   binding = { window: atReconnect.window, authoritative: true };
   const reconnected = await service.read('C', binding);
   clock.advance(31000);
@@ -400,7 +446,7 @@ async function emptyBindingScenario({ clock, generator, storeFile, activePane, o
     editTarget: edited.session.target,
     streamAtReconnect: atReconnect.target, briefAtReconnect: reconnected.session.target,
     goalAfterReconnect: rebound.goal, overrideAfterReconnect: rebound.overrides.goal,
-    unboundTarget: unbound.session.target,
+    unboundTarget: unbound.session.target, discoveredTarget: fake.windowId('C', 'two'),
   };
 }
 

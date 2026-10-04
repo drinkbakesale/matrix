@@ -8,7 +8,6 @@
 
 const { BriefStore, BriefStoreError, sessionKey, FIELDS, MAX_FIELD_CHARS } = require('./brief-store');
 const { validateBriefOutput, BriefGenerationError } = require('./brief-generator');
-const { SAFE_COMPONENT } = require('./brief-tmux');
 
 const DEFAULT_EVIDENCE_INTERVAL_MS = 30000;
 // A ceiling, not a default. Sentence two is supposed to track the work as it changes, so an
@@ -18,6 +17,15 @@ const MAX_EVIDENCE_INTERVAL_MS = 30000;
 const DEFAULT_GENERATION_TIMEOUT_MS = 30000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 const OPEN_SESSION_TTL_MS = 2 * 60 * 1000;
+
+// A tmux name is bounded, not pattern-restricted. It is matched by exact equality against
+// the live listing and never becomes part of a tmux target, so the characters tmux allows in
+// one — `.`, `:`, `/`, `|`, spaces — are all simply names here. What is still refused is what
+// no live name can be: a control character (which cannot survive argv or JSON cleanly) and
+// an unbounded string.
+const MAX_NAME_CHARS = 200;
+const nameInRange = value => typeof value === 'string' && value.length > 0
+  && value.length <= MAX_NAME_CHARS && !/[\u0000-\u001f]/.test(value);
 
 class BriefRequestError extends Error {
   constructor(status, code, message) {
@@ -110,15 +118,18 @@ class BriefService {
   // resolves to nothing and is rejected. Resolution is asynchronous and cached at the
   // process boundary, so a request never blocks the event loop on tmux.
   async identityFor(name, binding) {
-    // Rejected here, before any targeted tmux call: forged paths as before, and now also
-    // the `:` / `.` that tmux reads as target separators. Checked again in the resolver,
-    // which sees names tmux itself reported.
-    if (typeof name !== 'string' || !name || /[/\\]/.test(name) || !SAFE_COMPONENT.test(name)) {
+    // A session name is also the URL path segment this endpoint is addressed by, so a
+    // separator that the route could never carry is refused here rather than silently
+    // 404ing later. (tmux rewrites `.` and `:` out of session names itself, and a session
+    // name holding a slash is unreachable through `/api/sessions/:name/brief` either way.)
+    if (!nameInRange(name) || /[/\\]/.test(name)) {
       throw new BriefRequestError(400, 'invalid_session', 'session name is not a valid tmux session name');
     }
     const bound = normalizeBinding(binding);
     if (!bound) throw new BriefRequestError(400, 'invalid_window', 'window binding is not valid');
-    if (bound.window !== '' && (/[/\\]/.test(bound.window) || !SAFE_COMPONENT.test(bound.window))) {
+    // A window name is never part of a URL or a target, only of an equality test, so the
+    // only bound it needs is the bound every tmux window name already satisfies.
+    if (bound.window !== '' && !nameInRange(bound.window)) {
       throw new BriefRequestError(400, 'invalid_window', 'window is not a valid tmux window name');
     }
     // Only a session name, a window name and a boolean cross this line. The client never
@@ -127,11 +138,13 @@ class BriefService {
     if (!identity || identity.name !== name) {
       throw new BriefRequestError(404, 'unknown_session', 'no live session with that name');
     }
-    if (identity.targetSafe === false) {
-      throw new BriefRequestError(404, 'unsafe_target', 'that window name contains a tmux target separator');
-    }
     if (identity.windowKnown === false) {
       throw new BriefRequestError(404, 'unknown_window', 'that window is not open in this session');
+    }
+    // Resolution produced no tmux identifier for this pane, so there is nothing that can be
+    // addressed without guessing. Fail closed rather than fall back to a name.
+    if (!identity.target) {
+      throw new BriefRequestError(404, 'unresolved_target', 'that pane has no resolved tmux identifier');
     }
     return identity;
   }

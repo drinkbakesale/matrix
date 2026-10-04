@@ -8,6 +8,11 @@
 //      enormous tmux can never block the event loop or the HTTP response.
 //   3. Explicit about failure. A failed capture throws; it is never flattened into an
 //      empty string that would read as "this session has nothing to say".
+//   4. Unambiguous about WHICH pane. A display name is only ever compared, by exact
+//      equality, against the names tmux itself reported; what is then targeted is the
+//      `$id`/`@id` tmux issued for the match. tmux target syntax is `session:window.pane`,
+//      so a target built out of names makes a window legitimately called `v2.1` mean
+//      "window v2, pane 1" — a different pane, belonging to different work.
 //
 // Window selection deliberately mirrors server/lib/pane-stream.js exactly: an explicitly
 // requested window wins, otherwise the window running Claude, otherwise the session with no
@@ -28,12 +33,27 @@ class TmuxError extends Error {
 
 // Claude shows up as `claude` or as a bare version number like `2.1.85` — the same
 // predicate pane-stream uses to pick a window.
-// tmux target syntax is `session:window.pane`. A component carrying one of those
-// separators makes any target built from it ambiguous, so it is refused outright rather
-// than escaped or reasoned about. Same rule as server/lib/pane-stream.js.
-const SAFE_COMPONENT = /^[^\u0000-\u001f:.]{1,200}$/;
-
 const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
+
+// Every listing puts the NAME last, because a name is the one field that can contain the
+// separator: tmux happily holds a window called `a|b`, and splitting such a row on `|`
+// would silently mis-read it. Everything before the name is an id, an index or a flag.
+const SESSION_FORMAT = '#{session_id}|#{session_created}|#{session_name}';
+const PANE_FORMAT = '#{window_index}|#{window_id}|#{window_active}|#{pane_current_command}|#{window_name}';
+
+// Splits a listing row into `fields` fixed leading columns plus the trailing name.
+function splitRow(line, fields) {
+  const parts = [];
+  let rest = line;
+  for (let i = 0; i < fields; i += 1) {
+    const at = rest.indexOf('|');
+    if (at === -1) { parts.push(rest); rest = ''; continue; }
+    parts.push(rest.slice(0, at));
+    rest = rest.slice(at + 1);
+  }
+  parts.push(rest);
+  return parts;
+}
 
 function createTmux({ execFileImpl = execFile, timeoutMs = DEFAULT_TIMEOUT_MS, maxBuffer = DEFAULT_MAX_BUFFER, binary = 'tmux' } = {}) {
   return {
@@ -57,17 +77,18 @@ function createTmux({ execFileImpl = execFile, timeoutMs = DEFAULT_TIMEOUT_MS, m
 
 function parseSessions(raw) {
   return raw.split('\n').filter(Boolean).map(line => {
-    const [name, sessionId, createdAt] = line.split('|');
+    const [sessionId, createdAt, name] = splitRow(line, 2);
     return { name, sessionId: sessionId || '', createdAt: parseInt(createdAt, 10) || null };
   });
 }
 
 function parseWindows(raw) {
   return raw.split('\n').filter(Boolean).map(line => {
-    const [index, windowName, active, command] = line.split('|');
+    const [index, windowId, active, command, name] = splitRow(line, 4);
     return {
       index: parseInt(index, 10),
-      name: windowName || '',
+      windowId: windowId || '',
+      name: name || '',
       active: active === '1',
       command: command || '',
     };
@@ -101,14 +122,17 @@ function createSessionResolver({ tmux } = {}) {
 
   function liveSessions() {
     return coalesce('sessions', () => tmux
-      .run(['list-sessions', '-F', '#{session_name}|#{session_id}|#{session_created}'])
+      .run(['list-sessions', '-F', SESSION_FORMAT])
       .then(parseSessions)
       .catch(() => []));
   }
 
-  function liveWindows(name) {
-    return coalesce(`windows\u0000${name}`, () => tmux
-      .run(['list-panes', '-s', '-t', name, '-F', '#{window_index}|#{window_name}|#{window_active}|#{pane_current_command}'])
+  // Enumerated through the session's own tmux id, never through the display name the client
+  // sent. The name has already done its only job by this point — matching a live session —
+  // and a name is not a safe target: tmux reads `:` and `.` in one as target syntax.
+  function liveWindows(sessionId) {
+    return coalesce(`windows\u0000${sessionId}`, () => tmux
+      .run(['list-panes', '-s', '-t', sessionId, '-F', PANE_FORMAT])
       .then(parseWindows)
       .catch(() => []));
   }
@@ -122,10 +146,13 @@ function createSessionResolver({ tmux } = {}) {
     // window the transcript is not showing the moment Claude starts somewhere else.
     async resolve(name, windowName, options) {
       const authoritative = !!(options && options.authoritative);
-      if (!SAFE_COMPONENT.test(String(name))) return null;
+      if (typeof name !== 'string' || name === '') return null;
+      // Exact equality against the names tmux itself reported. Nothing is pattern-matched,
+      // escaped or sanitised: a name that is not live simply has nowhere to resolve to, and
+      // a session with no id cannot be addressed unambiguously, so neither resolves.
       const hit = (await liveSessions()).find(s => s.name === name);
-      if (!hit) return null;
-      const windows = await liveWindows(name);
+      if (!hit || !hit.sessionId) return null;
+      const windows = await liveWindows(hit.sessionId);
 
       // Identical to pane-stream: requested window, else the Claude window, else no window
       // — except that an authoritative empty window skips the discovery step, exactly as
@@ -137,29 +164,29 @@ function createSessionResolver({ tmux } = {}) {
         const claude = windows.find(w => isClaudeCmd(w.command));
         if (claude) window = claude.name;
       }
-      const chosen = windows.find(w => w.name === window);
-      // The separator check applies to a DISCOVERED name as much as a requested one. tmux
-      // reporting a window called `v2.1` does not make `A:v2.1` unambiguous — it addresses
-      // window `v2`, pane 1, which is somebody else's work. There is no safe fallback here
-      // either: dropping back to the bare session would capture whatever window happens to
-      // be active, which is the same leak by another route. So we fail closed and the
-      // service reports it, before any targeted capture runs.
-      const targetSafe = window === '' ? true : SAFE_COMPONENT.test(window);
+      const chosen = window === '' ? null : windows.find(w => w.name === window);
+      // The target is a tmux IDENTIFIER, never a name. `A:v2.1` is not an unusual name that
+      // needs escaping — tmux reads it as window `v2`, pane 1, which is somebody else's
+      // work — whereas `@7` and `$3` mean exactly one thing and are what tmux just told us
+      // this window and session are. The session id is the no-window fallback, matching the
+      // old bare-session target. A window we could not resolve an id for yields no target
+      // at all; the service reports that rather than guessing a readable one.
+      const target = chosen ? (chosen.windowId || null) : (window === '' ? hit.sessionId : null);
       return {
         name: hit.name,
         sessionId: hit.sessionId,
         createdAt: hit.createdAt,
         window,
-        targetSafe,
+        windowId: chosen ? chosen.windowId : '',
         windowIndex: chosen ? chosen.index : null,
         // A client streaming a window that has since been closed or renamed is asking about
-        // a pane that no longer exists. Saying so is better than capturing `name:gone` and
-        // reporting whatever tmux does with it.
+        // a pane that no longer exists. Saying so is better than capturing something else
+        // and reporting whatever tmux does with it.
         windowKnown: window === '' ? true : !!chosen,
         // Carried so a later re-resolve for the same open stream repeats this decision
         // rather than falling back to discovery.
         bound: authoritative,
-        target: window ? `${hit.name}:${window}` : hit.name,
+        target,
       };
     },
     // Nothing persists between resolves, so there is nothing to invalidate. Kept as a no-op
@@ -175,7 +202,10 @@ function createSessionResolver({ tmux } = {}) {
 function createPaneCapture({ tmux, recentLines = 400, earlyLines = 120 }) {
   return {
     async capture(identity) {
-      const target = identity.target || identity.name;
+      // No fallback to the session name: the only thing this may capture is the identifier
+      // the resolver produced from the live listing.
+      const target = identity.target;
+      if (!target) throw new TmuxError('unresolved_target', 'that pane has no resolved tmux identifier');
       const recent = await tmux.run(['capture-pane', '-t', target, '-p', '-S', `-${recentLines}`]);
       let early = '';
       let historySize = 0;
@@ -194,7 +224,7 @@ function createPaneCapture({ tmux, recentLines = 400, earlyLines = 120 }) {
 }
 
 module.exports = {
-  TmuxError, createTmux, createSessionResolver, createPaneCapture, SAFE_COMPONENT,
-  parseSessions, parseWindows, isClaudeCmd,
-  DEFAULT_TIMEOUT_MS,
+  TmuxError, createTmux, createSessionResolver, createPaneCapture,
+  parseSessions, parseWindows, isClaudeCmd, splitRow,
+  SESSION_FORMAT, PANE_FORMAT, DEFAULT_TIMEOUT_MS,
 };

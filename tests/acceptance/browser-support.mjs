@@ -360,7 +360,7 @@ export async function emptyWindowBindingCases(ctx, t, deps) {
 
     const atOpen = await announceC();
     t.eq(atOpen.window, '', `${kind}: a session with no Claude announces no window`);
-    t.eq(atOpen.target, 'C', `${kind}: the stream target is the session itself`);
+    t.eq(atOpen.target, atOpen.sessionId, `${kind}: the stream target is the session's own tmux id, not its name`);
     t.eq(await c.evaluate(() => briefView.bound()), true, `${kind}: an announced empty window is still a binding`);
     await control(c, 'advance', { ms: 31000 });
     await settleAndRefresh(c);

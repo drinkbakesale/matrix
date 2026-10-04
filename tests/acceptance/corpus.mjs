@@ -9,9 +9,20 @@
 // cannot be measured offline and is reported as unmeasured, never scored from a stub.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
-  briefGenerator, briefRoutes, fakeTmuxProcess, claudeSession, makeService, tmuxStack, paneStreamProbe,
+  briefGenerator, briefRoutes, briefTmux, fakeTmuxProcess, claudeSession, makeService, tmuxStack,
+  paneStreamProbe, tempDir,
 } from './service-support.mjs';
+
+// The two panes every target case discriminates between: the window the client is streaming,
+// and a pane belonging to somebody else that an ambiguous target would reach instead.
+const VICTIM = '> The broad goal is the payroll rewrite. We are currently rotating the signing keys.';
+const STREAMED = '> The broad goal is reliable inventory tracking. We are currently repairing barcode import.';
+const COLON = '> The broad goal is the invoicing service. We are currently fixing the VAT rounding.';
+const leaks = v => /payroll|signing keys/.test(JSON.stringify(v || ''));
+const paneOf = text => `${text}\n\n⏺ working…\n`;
 
 // A clause is supported when the text the generator emitted is literally present in the
 // evidence item it cited. That is a strong check for an extractive generator and a weak one
@@ -104,12 +115,14 @@ export async function evaluateCorpus(corpus, generator = briefGenerator.createEx
   };
 }
 
-// Two untrusted-input boundaries, end to end on the delivered modules. First: a pane holding
-// a real user turn AND a tool block that quotes a "> " line — only the real turn is intent,
-// driven through collector -> service -> generator, not just the collector. Second: the
-// `session`/`window` query parameters — quotes and metacharacters must not execute anything,
-// and tmux target separators must not address another pane.
-export async function untrustedInputChecks({ clock, generator, storeFile }) {
+// Untrusted input and tmux target resolution, end to end on the delivered modules.
+//
+// First: a pane holding a real user turn AND a tool block that quotes a "> " line — only the
+// real turn is intent, driven through collector -> service -> generator. Then the
+// `session`/`window` query parameters, and then the two halves that have to hold together:
+// a live name carrying `.` or `:` must stay fully usable (compatibility), while no target
+// the delivered code builds may ever be reinterpretable (isolation).
+export async function targetAndInputChecks({ clock, generator, storeFile }) {
   const checks = [];
   const pane = [
     '> The project goal is reliable meeting scheduling. Right now we are adding timezone reminders.',
@@ -132,15 +145,16 @@ export async function untrustedInputChecks({ clock, generator, storeFile }) {
   );
 
   // The pane-stream boundary, through the delivered module and the same fake-tmux probe the
-  // announcement checks use — it records every argv tmux was handed and offers the injected
+  // announcement checks use — it records every argv tmux was handed and offers an injected
   // command a file to create if a shell ever evaluates it.
-  const windows = [['claude', 'claude'], ['two', 'bash']];
+  const windows = [['claude', 'claude'], ['two', 'bash'], ['v2.1', 'bash']];
   const attempts = [];
-  // A name carrying a tmux target separator is refused outright: even as a single argument
-  // it could address a pane the client never asked for.
+  // A name that no live session or window answers to is refused. Nothing is "sanitised":
+  // resolution is exact equality against what tmux itself reported, so an unmatched name
+  // simply has nowhere to go.
   for (const [label, query] of [
-    ['target confusion', 'session=claude%3Atwo'],
-    ['pane confusion', 'session=A&window=claude.1'],
+    ['unknown session', 'session=claude%3Atwo'],
+    ['unknown window', 'session=A&window=claude.1'],
     ['control character', `session=${encodeURIComponent('A\u0000evil')}`],
   ]) {
     const run = paneStreamProbe({ windows, query });
@@ -150,127 +164,298 @@ export async function untrustedInputChecks({ clock, generator, storeFile }) {
       [run.types.length, 0, `${label}: nothing is streamed from a target that was never resolved`],
     );
   }
-  // Quotes and semicolons are not refused — they are simply inert, because the name is one
-  // argument and never a command. The marker file is what proves it: a shell evaluating
-  // that name would create it.
-  const seed = paneStreamProbe({ windows, query: 'session=claude' });
-  const injected = paneStreamProbe({ windows, query: `session=${encodeURIComponent(`claude'; touch ${seed.marker}; echo '`)}` });
-  attempts.push({ label: 'shell injection', closed: injected.closed, argv: injected.argv.split('\n').filter(Boolean) });
+  // ...while a window that really exists under a separator-bearing name streams normally and
+  // is announced by its resolved identifier, not by a name the client could re-point.
+  const dotted = paneStreamProbe({ windows, query: 'session=A&window=v2.1' });
+  attempts.push({ label: 'separator-bearing window', first: dotted.first });
   checks.push(
-    [fs.existsSync(seed.marker), false, 'shell injection: no injected command ran'],
-    [injected.argv.includes(`; touch ${seed.marker}; echo`), true,
-      'shell injection: the hostile text reached tmux as argument data, not as a command'],
+    [dotted.closed, null, 'a live window called v2.1 is streamed, not refused'],
+    [dotted.first && dotted.first.window, 'v2.1', 'the announcement names the window the client asked for'],
+    [dotted.first && dotted.first.target, '@2', 'the announced target is the resolved window id'],
+    [/A:v2\.1/.test(dotted.argv), false, 'no tmux call was addressed to a name-built target'],
   );
-  checks.push(...(await targetSeparatorChecks({ clock, generator, storeFile })));
-  return { checks, report: { attempts } };
+  // Quotes and semicolons are inert: the name is matched against tmux's own output and the
+  // target is an id, so the hostile text is never a command and never even a target. The
+  // marker file is the proof — a shell evaluating that name would create it.
+  const probeDir = tempDir('matrix-marker-');
+  const marker = path.join(probeDir, 'executed');
+  const hostile = `claude'; touch ${marker}; echo '`;
+  const injected = paneStreamProbe({ session: hostile, windows, query: `session=${encodeURIComponent(hostile)}` });
+  attempts.push({ label: 'shell metacharacters', closed: injected.closed, streamed: injected.types });
+  checks.push(
+    [fs.existsSync(marker), false, 'shell metacharacters: no injected command ran'],
+    [injected.closed, null, 'shell metacharacters: a session really named that is still streamable'],
+    [injected.first && injected.first.target, '@0', 'shell metacharacters: it is streamed through a resolved id'],
+    [injected.argv.includes(`touch ${marker}`), false,
+      'shell metacharacters: the hostile text never reached tmux as an argument at all'],
+  );
+  const resolution = await targetResolutionChecks({ clock, generator, storeFile });
+  const real = await realTmuxChecks({ clock, generator, storeFile: `${storeFile}.real` });
+  checks.push(...resolution.checks, ...real.checks);
+  return { checks, report: { attempts, resolution: resolution.report, realTmux: real.report } };
 }
 
-// A tmux target separator in a name component makes `session:window` ambiguous, so the
-// brief can capture a pane nobody asked for. The fake models tmux target parsing (a
-// trailing `.<digits>` is a pane index), so `A:v2.1` really does reach window `v2` pane 1 —
-// which here holds another project's work. Covers discovered and explicit names, colon and
-// dot, HTTP read and edit, and the background re-resolution in tick().
-async function targetSeparatorChecks({ clock, generator, storeFile }) {
-  const VICTIM = '> The broad goal is the payroll rewrite. We are currently rotating the signing keys.';
-  const STREAMED = '> The broad goal is reliable inventory tracking. We are currently repairing barcode import.';
-  const leaks = v => /payroll|signing keys/.test(`${(v && v.goal) || ''} ${(v && v.current) || ''}`);
+// Compatibility and isolation, which only mean anything together.
+//
+// tmux window names legitimately contain `.` and `:` (verified on tmux 3.6a; session names
+// cannot — tmux rewrites both to `_`). `A:v2.1` is read as window `v2`, pane 1, so a target
+// built out of names reaches somebody else's pane. The fix is not to refuse the name: it is
+// to resolve the name against the live list and then address the resolved window id. So both
+// halves are asserted on one fixture — the dotted window stays fully usable, AND no target
+// the delivered code ever hands tmux is one that could be reinterpreted.
+async function targetResolutionChecks({ clock, generator, storeFile }) {
+  const out = [];
   const fake = fakeTmuxProcess({
     A: { sessionId: '$A', createdAt: 1_600_000_000, windows: [
-      { name: 'v2', command: 'bash', active: true, pane: 'innocent\n', panes: ['innocent\n', `${VICTIM}\n\n⏺ working…\n`] },
-      { name: 'v2.1', command: 'claude', active: false, pane: `${STREAMED}\n\n⏺ working…\n` },
-      { name: 'ok', command: 'bash', active: false, pane: `${STREAMED}\n\n⏺ working…\n` },
+      { name: 'v2', command: 'bash', active: true, pane: 'innocent\n', panes: ['innocent\n', paneOf(VICTIM)] },
+      { name: 'v2.1', command: 'claude', active: false, pane: paneOf(STREAMED) },
+      { name: 'c:d', command: 'bash', active: false, pane: paneOf(COLON) },
     ] },
   });
   const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
-  const out = [];
-  const attempt = async (label, fn) => {
-    let err = null; let value = null;
-    try { value = await fn(); } catch (e) { err = e; }
-    out.push([err ? err.code : `served ${JSON.stringify(value && value.session && value.session.target)}`,
-      'unsafe_target', `${label}: refused before any capture`]);
-    out.push([leaks(value), false, `${label}: the victim pane is never served`]);
-  };
-  // Discovered: Claude runs in the dotted window, so resolution finds it on its own.
-  await attempt('discovered dotted window', () => service.read('A'));
-  await attempt('discovered dotted window, edit', () =>
-    service.patch('A', { goal: 'should not be stored', revision: 0 }));
-  // Let generation actually run before checking for leakage: a brief still in `generating`
-  // has no text to leak, so asserting on it would pass for the wrong reason.
-  try { await service.read('A'); await service.settle(); } catch { /* refused is the point */ }
-  let settled = null;
-  try { settled = await service.read('A'); } catch { settled = null; }
-  out.push([leaks(settled), false, 'with generation run, the victim pane text is still never served']);
-  // Explicit, both separators, through the same validation the HTTP route uses.
-  for (const [label, window] of [['explicit dot', 'v2.1'], ['explicit colon', 'v2:1']]) {
+
+  // Discovery lands on the dotted window because that is where Claude runs.
+  await service.read('A');
+  await service.settle();
+  const discovered = await service.read('A');
+  out.push(
+    [discovered.session.window, 'v2.1', 'a discovered window called v2.1 is usable, not refused'],
+    [discovered.session.target, fake.windowId('A', 'v2.1'), 'and it is addressed by its resolved window id'],
+    [discovered.current, 'repair barcode import', 'the brief describes that window\'s own pane'],
+    [leaks(discovered), false, 'the pane an ambiguous target would have reached never appears'],
+  );
+  // An edit against it is accepted and really persists.
+  const edited = await service.patch('A', { goal: 'inventory tracking, as edited', revision: discovered.revision });
+  out.push(
+    [edited.goal, 'inventory tracking, as edited', 'an edit against a dotted window is accepted'],
+    [fs.readFileSync(storeFile, 'utf8').includes('inventory tracking, as edited'), true, 'and reaches storage'],
+  );
+  // Explicit bindings, both separators, through the same validation the HTTP route uses.
+  for (const [label, window, want] of [['dot', 'v2.1', 'repair barcode import'], ['colon', 'c:d', 'fix the VAT rounding']]) {
     const res = await briefRoutes.respond(service, 'GET', 'A', null, { window, authoritative: true });
-    out.push([res.status >= 400, true, `${label}: HTTP refuses it (${res.status} ${res.body.code})`]);
-    out.push([leaks(res.body.brief), false, `${label}: no victim text in the response`]);
+    out.push([res.status, 200, `explicit ${label} window: HTTP serves it`]);
+    await service.settle();
+    const after = await briefRoutes.respond(service, 'GET', 'A', null, { window, authoritative: true });
+    out.push(
+      [after.body.brief.session.target, fake.windowId('A', window), `explicit ${label} window: bound to its own id`],
+      [after.body.brief.current, want, `explicit ${label} window: describes its own pane`],
+      [leaks(after.body), false, `explicit ${label} window: no victim text`],
+    );
   }
-  const colonSession = await briefRoutes.respond(service, 'GET', 'A:v2', null, '');
-  out.push([colonSession.body.code, 'invalid_session', 'a colon in the session name is rejected outright']);
-  // The refused edit is checked against the file, not against a response.
-  const written = fs.existsSync(storeFile) ? fs.readFileSync(storeFile, 'utf8') : '';
-  out.push([written.includes('should not be stored'), false, 'the refused edit never reached storage']);
-  out.push(...(await backgroundSeparatorChecks({ clock, generator, storeFile: `${storeFile}.bg`, VICTIM, STREAMED })));
-  return out;
+  // Isolation, read off the recorded argv rather than inferred from an error.
+  const targets = [...fake.targetsFor('capture-pane'), ...fake.targetsFor('display-message')].map(String);
+  const ids = new Set([fake.windowId('A', 'v2.1'), fake.windowId('A', 'c:d'), '$A']);
+  out.push(
+    [targets.length > 0, true, 'the pane really was captured through the process boundary'],
+    [targets.every(t => ids.has(t)), true,
+      `every target was a resolved identifier (saw ${JSON.stringify([...new Set(targets)])})`],
+    [targets.some(t => /[.:]/.test(t.slice(1))), false, 'no target carried a tmux separator at all'],
+  );
+  // ...and the hazard the ids avoid is real on this fixture: the name-built target that the
+  // delivered code no longer constructs does reach the victim pane.
+  const unsafe = await tmuxStack(fake).tmux.run(['capture-pane', '-t', 'A:v2.1', '-p', '-S', '-400']);
+  out.push([/signing keys/.test(unsafe), true,
+    'control: the name-built target `A:v2.1` really does reach window v2 pane 1']);
+  // A name no live session answers to is still refused, so exact resolution is the gate.
+  for (const [label, name, code] of [
+    ['a colon-bearing session name', 'A:v2', 'unknown_session'],
+    ['a forged path', '../../etc/passwd', 'invalid_session'],
+  ]) {
+    const res = await briefRoutes.respond(service, 'GET', name, null, '');
+    out.push([res.body.code, code, `${label} is rejected (${res.status})`]);
+  }
+  out.push(...(await backgroundTargetChecks({ clock, generator, storeFile: `${storeFile}.bg` })));
+  return { checks: out, report: { targets: [...new Set(targets)] } };
 }
 
 // The background path, sequenced so it actually exercises tick().
 //
-// A session only gets a runtime entry once a read succeeds, so a fixture that is unsafe
-// from the start leaves tick() with nothing to iterate — the earlier version of this check
-// asserted on an empty poll and proved nothing. Here the session is registered and settled
-// while every name is safe, and only then does Claude move to a separator-bearing window.
-// Safety is read off the recorded capture argv and the persisted record, not inferred from
-// an error or from a sibling window's empty brief.
-async function backgroundSeparatorChecks({ clock, generator, storeFile, VICTIM, STREAMED }) {
+// A session only gets a runtime entry once a read succeeds, so the session is registered and
+// settled on a plain window first; only then does Claude move to a separator-bearing one.
+// The poll must FOLLOW it — re-resolving to the new window's id — and must still never
+// address a pane by name.
+async function backgroundTargetChecks({ clock, generator, storeFile }) {
   const out = [];
-  const safeStart = { sessionId: '$B', createdAt: 1_600_000_500, windows: [
-    { name: 'notes', command: 'bash', active: true, pane: `${STREAMED}\n\n⏺ working…\n` },
-    { name: 'v2', command: 'bash', active: false, pane: 'innocent\n', panes: ['innocent\n', `${VICTIM}\n\n⏺ working…\n`] },
+  const start = { sessionId: '$B', createdAt: 1_600_000_500, windows: [
+    { name: 'notes', command: 'claude', active: true, pane: paneOf(COLON) },
+    { name: 'v2', command: 'bash', active: false, pane: 'innocent\n', panes: ['innocent\n', paneOf(VICTIM)] },
   ] };
-  const fake = fakeTmuxProcess({ B: safeStart });
+  const fake = fakeTmuxProcess({ B: start });
   const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
   await service.read('B');
   await service.settle();
-  const settledFirst = await service.read('B');
-  out.push([settledFirst.session.target, 'B', 'the session registers and settles while every name is safe']);
-  out.push([!!settledFirst.current, true, 'it really generated a brief, so tick() has something to re-resolve']);
+  const first = await service.read('B');
+  out.push(
+    [first.session.target, fake.windowId('B', 'notes'), 'the session registers and settles on its plain window'],
+    [first.current, 'fix the VAT rounding', 'it really generated a brief, so tick() has something to re-resolve'],
+  );
 
-  // Claude now starts in a window whose name carries a separator.
-  fake.set('B', { ...safeStart, windows: [
-    safeStart.windows[0],
-    safeStart.windows[1],
-    { name: 'v2.1', command: 'claude', active: false, pane: `${STREAMED}\n\n⏺ working…\n` },
+  // Claude quits `notes` and starts in a window whose name carries a separator.
+  fake.set('B', { ...start, windows: [
+    { ...start.windows[0], command: 'bash' },
+    start.windows[1],
+    { name: 'v2.1', command: 'claude', active: false, pane: paneOf(STREAMED) },
   ] });
-  // A foreground read comes first, as it would in life: without the fix it SUCCEEDS on the
-  // dotted window and re-registers the session under that binding, which is what gives the
-  // background poll an unsafe target to capture. With the fix it throws, nothing is
-  // re-registered, and the poll has nothing unsafe to do. Ordering matters here — checking
-  // the poll in isolation lets tick() skip on a changed key and look safe for free.
-  let moved = null; let movedErr = null;
-  try { moved = await service.read('B'); } catch (e) { movedErr = e; }
-  out.push([movedErr ? movedErr.code : `served ${moved && moved.session.target}`, 'unsafe_target',
-    'the read that would re-register the dotted window is refused']);
+  const moved = await service.read('B');
+  out.push([moved.session.target, fake.windowId('B', 'v2.1'), 'a reopened read follows Claude to the dotted window']);
   const listsBefore = fake.callsFor('list-panes').length;
   clock.advance(31000);
   await service.tick();
   await service.settle();
   out.push([fake.callsFor('list-panes').length > listsBefore, true,
     'the poll really re-resolved the session rather than skipping it']);
-
-  // Read the actual tmux argv rather than trusting an error code.
-  const targets = fake.callsFor('capture-pane').map(c => c.args[c.args.indexOf('-t') + 1]);
-  out.push([targets.filter(t => /v2/.test(String(t))).length, 0,
-    `no capture ever targeted a separator-bearing or victim window (saw ${JSON.stringify([...new Set(targets)])})`]);
-  // ...and the persisted record directly.
-  const stored = fs.existsSync(storeFile) ? fs.readFileSync(storeFile, 'utf8') : '';
-  out.push([/payroll|signing keys/.test(stored), false, 'the persisted brief record holds no victim text']);
-  let after = null; let afterErr = null;
-  try { after = await service.read('B'); } catch (e) { afterErr = e; }
-  out.push([afterErr ? afterErr.code : 'served', 'unsafe_target',
-    'once discovery lands on the separator-bearing window the session fails closed']);
-  out.push([/payroll|signing keys/.test(JSON.stringify(after || '')), false,
-    'and still serves no victim text']);
+  const after = await service.read('B');
+  out.push(
+    [after.session.target, fake.windowId('B', 'v2.1'), 'the background poll holds the same resolved id'],
+    [after.current, 'repair barcode import', 'and generates from the dotted window\'s own pane'],
+    [leaks(after), false, 'the victim pane is never served'],
+  );
+  const targets = fake.targetsFor('capture-pane').map(String);
+  out.push([targets.some(t => /^[^@$]/.test(t) || /[.:]/.test(t.slice(1))), false,
+    `no background capture used a name-built target (saw ${JSON.stringify([...new Set(targets)])})`]);
+  out.push([/payroll|signing keys/.test(fs.readFileSync(storeFile, 'utf8')), false,
+    'the persisted brief record holds no victim text']);
   return out;
 }
+
+// Real tmux, on a PRIVATE socket with disposable sessions, killed on the way out.
+//
+// Everything above runs against a fake process that models tmux target parsing. This proves
+// the model: the installed tmux really does read `S:v2.1` as window `v2` pane 1, really does
+// accept `@id`/`$id`, and really does let the delivered resolver, capture, brief, edit and
+// pane-stream work on names carrying `.` and `:`. The user's own tmux server is never
+// contacted — a `-L` socket is a separate server, and nothing here runs without one.
+export async function realTmuxChecks({ clock, generator, storeFile }) {
+  const out = [];
+  let tmuxBin = '';
+  try { tmuxBin = execFileSync('/usr/bin/which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { tmuxBin = ''; }
+  out.push([!!tmuxBin, true, 'tmux is installed, so the real-tmux regression can run (a missing engine is a failure, not a skip)']);
+  if (!tmuxBin) return { checks: out, report: { ran: false, reason: 'tmux not on PATH' } };
+
+  const dir = tempDir('matrix-realtmux-');
+  // A socket PATH inside this test's own temp directory, not a named socket in the shared
+  // tmux socket directory: a separate server that goes away with the directory.
+  const socket = path.join(dir, 'tmux.sock');
+  const S = `mx-acc-${process.pid}`;
+  const tm = (...a) => execFileSync(tmuxBin, ['-S', socket, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  // A copy of the tmux binary under another name is a pane process that blocks forever
+  // (`wait-for` on a channel nothing signals) and whose `pane_current_command` is whatever we
+  // called the copy — the only way to make a pane look like a real Claude pane offline.
+  const procNamed = name => {
+    const p = path.join(dir, name);
+    fs.copyFileSync(tmuxBin, p);
+    fs.chmodSync(p, 0o755);
+    return p;
+  };
+  const claudeBin = procNamed('claude');
+  const holdBin = procNamed('holdproc');
+  const seed = (bin, text) => ['/bin/sh', '-c',
+    `printf %b ${JSON.stringify(text)}; exec ${JSON.stringify(bin)} -S ${JSON.stringify(socket)} wait-for mx-hold`];
+  const shimDir = path.join(dir, 'bin');
+  fs.mkdirSync(shimDir, { recursive: true });
+  const shim = path.join(shimDir, 'tmux');
+  fs.writeFileSync(shim, `#!/bin/sh\nexec ${JSON.stringify(tmuxBin)} -S ${JSON.stringify(socket)} "$@"\n`, { mode: 0o755 });
+
+  const report = { ran: true, socket, normalization: null, windows: null };
+  try {
+    // Wide panes: an 80-column pane wraps a long user turn mid-word and the evidence parser
+    // would see a truncated sentence, which would be a fixture artefact, not a finding.
+    tm('new-session', '-d', '-x', '240', '-y', '50', '-s', S, '-n', 'main', ...seed(holdBin, 'main window\\n'));
+    tm('new-window', '-t', S, '-n', 'v2', ...seed(holdBin, 'innocent pane zero\\n'));
+    const wins = () => tm('list-windows', '-t', S, '-F', '#{window_id}|#{window_name}').split('\n').filter(Boolean);
+    const idOf = n => { const r = wins().find(x => x.slice(x.indexOf('|') + 1) === n); return r ? r.split('|')[0] : null; };
+    tm('split-window', '-t', idOf('v2'), ...seed(holdBin, `${VICTIM}\\n\\n`));
+    tm('new-window', '-t', S, '-n', 'v2.1', ...seed(claudeBin, `${STREAMED}\\n\\n`));
+    tm('new-window', '-t', S, '-n', 'c:d', ...seed(holdBin, `${COLON}\\n\\n`));
+    // tmux rewrites `.` and `:` out of a SESSION name but keeps them in a window name.
+    tm('new-session', '-d', '-s', 'mx.dot:name', ...seed(holdBin, 'x\\n'));
+    report.normalization = tm('list-sessions', '-F', '#{session_name}').split('\n').filter(Boolean);
+    // Each pane runs `sh -c 'printf …; exec <bin>'`, so wait for the exec to land rather
+    // than sleeping a guessed interval: until it does, tmux still reports the pane command
+    // as `sh` and this would be a fixture race rather than a finding.
+    const ready = () => tm('list-panes', '-s', '-t', S, '-F', '#{pane_current_command}|#{window_name}')
+      .includes('claude|v2.1');
+    for (let i = 0; i < 100 && !ready(); i += 1) await new Promise(r => setTimeout(r, 50));
+    out.push([ready(), true, 'real tmux: the fixture panes reached their final commands']);
+    report.windows = wins();
+    out.push([report.normalization.includes('mx_dot_name'), true,
+      `tmux normalises separators out of a session name (saw ${JSON.stringify(report.normalization)})`]);
+
+    // The delivered resolver/capture stack, pointed at the private socket through a shim
+    // that is `tmux -L <socket>` and nothing else.
+    const tmux = briefTmux.createTmux({ binary: shim });
+    const live = {
+      tmux,
+      resolver: briefTmux.createSessionResolver({ tmux }),
+      capture: briefTmux.createPaneCapture({ tmux }),
+    };
+    const service = makeService({ stack: live, clock, generator, storeFile });
+
+    // Discovery over real tmux, onto a window whose name carries a separator.
+    const resolved = await live.resolver.resolve(S, '', {});
+    out.push(
+      [resolved && resolved.window, 'v2.1', 'real tmux: discovery finds the Claude window called v2.1'],
+      [resolved && resolved.target, idOf('v2.1'), 'real tmux: it is targeted by the window id tmux issued'],
+    );
+    await service.read(S);
+    await service.settle();
+    const brief = await service.read(S);
+    out.push(
+      [brief.current, 'repair barcode import', 'real tmux: the brief comes from that window\'s own pane'],
+      [leaks(brief), false, 'real tmux: the neighbouring pane never leaks into it'],
+    );
+    // The hazard, on the installed tmux: the name-built target reaches window v2, pane 1.
+    const unsafe = tm('capture-pane', '-t', `${S}:v2.1`, '-p', '-S', '-50');
+    out.push([/signing keys/.test(unsafe), true,
+      'real tmux control: `S:v2.1` really does capture window v2 pane 1']);
+
+    // An explicit colon-bearing binding, an edit, and persistence.
+    const colon = { window: 'c:d', authoritative: true };
+    const res = await briefRoutes.respond(service, 'GET', S, null, colon);
+    await service.settle();
+    const colonBrief = (await briefRoutes.respond(service, 'GET', S, null, colon)).body.brief;
+    out.push(
+      [res.status, 200, 'real tmux: an explicit `c:d` binding is served'],
+      [colonBrief.session.target, idOf('c:d'), 'real tmux: bound to that window\'s id'],
+      [colonBrief.current, 'fix the VAT rounding', 'real tmux: and describes its own pane'],
+    );
+    const edit = await briefRoutes.respond(service, 'PATCH', S, { goal: 'edited over real tmux', revision: colonBrief.revision }, colon);
+    out.push(
+      [edit.status, 200, 'real tmux: an edit against a colon-bearing window is accepted'],
+      [fs.readFileSync(storeFile, 'utf8').includes('edited over real tmux'), true, 'real tmux: and it persists'],
+    );
+
+    // pane-stream over real tmux, and the binding it announces must be the one the brief uses.
+    const stream = paneStreamProbe({ binDir: shimDir, query: `session=${encodeURIComponent(S)}` });
+    out.push(
+      [stream.closed, null, 'real tmux: pane-stream streams the session'],
+      [stream.first && stream.first.window, 'v2.1', 'real tmux: it announces the separator-bearing window'],
+      [stream.first && stream.first.target, idOf('v2.1'), 'real tmux: announced as the resolved window id'],
+      [stream.first && stream.first.target, brief.session.target,
+        'real tmux: the transcript and the brief resolve to the same binding'],
+    );
+    const colonStream = paneStreamProbe({ binDir: shimDir, query: `session=${encodeURIComponent(S)}&window=${encodeURIComponent('c:d')}` });
+    out.push(
+      [colonStream.first && colonStream.first.window, 'c:d', 'real tmux: an explicit colon-bearing window streams too'],
+      [colonStream.first && colonStream.first.target, idOf('c:d'), 'real tmux: through its own id'],
+    );
+
+    // Reconnect: the streamed window closes, a retained binding to it fails loudly, and a
+    // fresh discovery moves to the next Claude window — also separator-bearing.
+    const goneId = idOf('v2.1');
+    tm('new-window', '-t', S, '-n', 'v3.2', ...seed(claudeBin, `${STREAMED}\\n\\n`));
+    tm('kill-window', '-t', goneId);
+    let gone = null;
+    try { await service.read(S, { window: 'v2.1', authoritative: true }); } catch (e) { gone = e; }
+    out.push([gone && gone.code, 'unknown_window', 'real tmux: a retained binding to a closed window fails loudly']);
+    const rediscovered = await service.read(S);
+    out.push(
+      [rediscovered.session.window, 'v3.2', 'real tmux: a reconnect rediscovers the next Claude window'],
+      [rediscovered.session.target, idOf('v3.2'), 'real tmux: and binds to its id'],
+    );
+  } finally {
+    try { tm('kill-server'); } catch { /* the server is gone either way */ }
+  }
+  return { checks: out, report };
+}
+

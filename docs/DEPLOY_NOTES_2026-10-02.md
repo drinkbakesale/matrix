@@ -31,14 +31,21 @@ touched, and no notification was sent. **You deploy.**
   Claude and is streaming the session itself", which is why starting Claude in another
   window no longer drags the brief away from the pane you are reading. Polling, input
   routing and the `output`/`screen` frames are unchanged.
-* **The WebSocket stream no longer builds shell commands.** `server/lib/pane-stream.js` used
-  to interpolate the `session` and `window` query parameters into `tmux …` shell strings; a
-  name containing a quote could run arbitrary commands. Every tmux call is now an argument
-  vector. Two behaviour changes come with it, both deliberate: a name containing a control
-  character or a tmux target separator (`:` or `.`) is refused with close code 1008, and a
-  connection whose session or window cannot be found in `tmux list-panes` is refused rather
-  than left streaming nothing. If a session of yours legitimately has a dot or colon in its
-  name, it will stop opening — tell me and the rule can resolve those names instead.
+* **The WebSocket stream no longer builds shell commands or name-based tmux targets.**
+  `server/lib/pane-stream.js` used to interpolate the `session` and `window` query parameters
+  into `tmux …` shell strings; a name containing a quote could run arbitrary commands. Every
+  tmux call is now an argument vector, and — separately — no name is ever used *as* a tmux
+  target. A name is matched by exact equality against what `tmux list-sessions` /
+  `tmux list-panes` reported, and what gets targeted afterwards is the `$id` / `@id` tmux
+  issued for the match. That matters because tmux target syntax is `session:window.pane`: a
+  window legitimately called `v2.1` makes `work:v2.1` mean *window `v2`, pane 1* — verified
+  on tmux 3.6a, where that target really does return the neighbouring pane's text. Window
+  names containing `.` or `:` therefore keep working normally; you do not need to rename
+  anything. (tmux rewrites both characters out of *session* names itself, to `_`.) One
+  deliberate behaviour change remains: a connection whose session or window is not in the
+  live listing is refused with close code 1008 rather than left streaming nothing.
+  `server/lib/brief-tmux.js` resolves and targets the same way, so the transcript, the brief,
+  its generation and its edits all address one identical, unambiguous pane.
 * **File split.** `server/server.js`, `server/public/app.js` and `server/public/desktop.js`
   were split into cohesive modules so every touched file stays under 500 lines. Behaviour was
   preserved; the existing 62 tests still pass (63 now — one was added).

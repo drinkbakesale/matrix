@@ -13,7 +13,7 @@ import {
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
   countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks,
 } from './service-support.mjs';
-import { evaluateCorpus, untrustedInputChecks } from './corpus.mjs';
+import { evaluateCorpus, targetAndInputChecks } from './corpus.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 const oracleDir = args.oracle;
@@ -56,22 +56,22 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   // Exact-pane evidence only: every capture names session A's own Claude window.
   const captures = fake.callsFor('capture-pane');
   t.ok(captures.length > 0, 'the pane was actually captured through the process boundary');
-  t.ok(captures.every(c => c.args[c.args.indexOf('-t') + 1] === 'A:claude'), 'only session A\'s streamed pane was captured');
+  t.ok(captures.every(c => c.args[c.args.indexOf('-t') + 1] === fake.windowId('A', 'claude')), 'only session A\'s streamed pane was captured');
   const a1 = await service.read('A');
   t.eq(a1.goal, byId.f1.expectedGoal, 'goal comes from A\'s pane');
   t.eq(a1.current, byId.f1.expectedCurrent, 'current work comes from A\'s pane');
-  t.eq(a1.session.target, 'A:claude', 'the brief names the pane it describes');
+  t.eq(a1.session.target, fake.windowId('A', 'claude'), 'the brief is bound to that pane\'s resolved window id');
   t.ok(!JSON.stringify(a1).includes('misleading-payments'), 'the project label never leaks into the brief');
 
   // The streamed window wins over the tmux-active window.
   await service.read('S');
   await service.settle();
   const s1 = await service.read('S');
-  t.eq(s1.session.target, 'S:claude', 'resolution picks the Claude window, matching the stream');
+  t.eq(s1.session.target, fake.windowId('S', 'claude'), 'resolution picks the Claude window, matching the stream');
   t.eq(s1.current, byId.f2.expectedCurrent, 'the brief describes the Claude window, not the active shell');
   // ...and an explicit window override is honoured, with its own cache entry.
   const sShell = await service.read('S', 'shell');
-  t.eq(sShell.session.target, 'S:shell', 'an explicitly streamed window is resolved as asked');
+  t.eq(sShell.session.target, fake.windowId('S', 'shell'), 'an explicitly streamed window is resolved as asked');
   t.eq(sShell.goal, null, 'the shell window has its own (empty) brief, not the Claude window\'s');
   await service.settle();
   t.eq((await service.read('S')).current, byId.f2.expectedCurrent, 'the Claude window brief is untouched by the shell window');
@@ -81,7 +81,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   // own, because window names and the commands running in them are mutable.
   const streamTargetFor = session => {
     const claude = (session.windows || []).find(w => briefTmux.isClaudeCmd(w.command));
-    return claude ? `S:${claude.name}` : 'S';
+    return claude ? fake.windowId('S', claude.name) : fake.sessionIdOf('S');
   };
   const movedSession = {
     sessionId: '$S', createdAt: 1_600_000_000,
@@ -104,16 +104,16 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   await service.settle();
   const settledAfterMove = await service.read('S');
   t.eq(settledAfterMove.goal, byId.f3.expectedGoal, 'the moved-to window generates from its own pane');
-  t.eq(settledAfterMove.session.target, 'S:shell', 'generation stays bound to the moved-to window');
+  t.eq(settledAfterMove.session.target, fake.windowId('S', 'shell'), 'generation stays bound to the moved-to window');
 
   // The reopen path above follows the move. A client whose connection is ALREADY open does
   // not: pane-stream fixed its target when that connection was made, so its transcript is
   // still showing S:claude. Its brief and its edits have to stay on that pane too.
   const retained = await service.read('S', 'claude');
-  t.eq(retained.session.target, 'S:claude', 'a retained stream binding holds through the move');
+  t.eq(retained.session.target, fake.windowId('S', 'claude'), 'a retained stream binding holds through the move');
   t.eq(retained.current, byId.f2.expectedCurrent, 'the retained window still describes its own pane');
   const retainedEdit = await service.patch('S', { goal: 'edit against the pane on screen', revision: retained.revision }, 'claude');
-  t.eq(retainedEdit.session.target, 'S:claude', 'an edit is addressed to the pane the user can see');
+  t.eq(retainedEdit.session.target, fake.windowId('S', 'claude'), 'an edit is addressed to the pane the user can see');
   t.eq((await service.read('S', 'shell')).overrides.goal, null, 'the moved-to window never received that edit');
   // And a binding whose window has since gone fails loudly instead of capturing a ghost.
   let goneWindow = null;
@@ -126,9 +126,9 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
     activePane: paneFor(byId.f1), otherPane: paneFor(byId.f3),
     expect: { activeGoal: byId.f1.expectedGoal, otherGoal: byId.f3.expectedGoal },
   });
-  const untrusted = await untrustedInputChecks({ clock: fakeClock(), generator: extractive(), storeFile: store() });
-  for (const [actual, expected, detail] of [...binding.checks, ...untrusted.checks]) t.eq(actual, expected, detail);
-  t.note('streamBinding', { ...binding.report, untrustedInput: untrusted.report });
+  const targets = await targetAndInputChecks({ clock: fakeClock(), generator: extractive(), storeFile: store() });
+  for (const [actual, expected, detail] of [...binding.checks, ...targets.checks]) t.eq(actual, expected, detail);
+  t.note('streamBinding', { ...binding.report, targetsAndInput: targets.report });
 
   // Same project, different session: no cross-contamination.
   await service.read('B');
@@ -256,10 +256,10 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
   const resolved = await stack.resolver.resolve(hostile, '');
   t.ok(resolved !== null, 'a session whose name contains shell metacharacters still resolves');
   const listCall = fake.callsFor('list-panes')[0];
-  t.eq(listCall.bin, 'tmux', 'tmux is invoked as a fixed executable');
-  t.eq(listCall.args[listCall.args.indexOf('-t') + 1], hostile, 'the session name is one argv element, never a command fragment');
+  t.ok(listCall.bin === 'tmux' && listCall.opts.shell === undefined, 'tmux is a fixed executable invoked with no shell');
+  t.eq(listCall.args[listCall.args.indexOf('-t') + 1], '$H', 'windows are enumerated through the resolved session id');
+  t.ok(!fake.calls.some(c => c.args.includes(hostile)), 'the hostile name never reaches tmux as an argument at all');
   t.ok(!listCall.args.some(a => a.includes('tmux ') || a.includes('2>/dev/null')), 'no argument carries an embedded shell command');
-  t.ok(listCall.opts && listCall.opts.shell === undefined, 'no shell is requested');
   t.ok(listCall.opts.timeout > 0 && listCall.opts.maxBuffer > 0, 'every tmux call is time- and size-bounded');
   await stack.capture.capture(resolved);
   t.ok(fake.callsFor('capture-pane').every(c => c.opts.timeout > 0), 'captures are time-bounded too');

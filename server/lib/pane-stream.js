@@ -18,16 +18,35 @@ const MAX_CAPTURE_ERRORS = 20;
 // input. Two separate protections, because they stop two different things:
 //   1. Every tmux call below is an argument vector, never a shell string. A name containing
 //      a quote or a semicolon is one argument, not a command.
-//   2. tmux's own target syntax is `session:window.pane`, so a name carrying `:` or `.`
-//      could still address a pane the client never asked for even through argv. Names that
-//      could do that are refused outright rather than sanitised.
-const SAFE_NAME = /^[^\u0000-\u001f:.]{1,200}$/;
+//   2. A name is never used AS a tmux target. tmux's target syntax is `session:window.pane`,
+//      so `A:v2.1` addresses window `v2`, pane 1 — a pane the client never asked for. Names
+//      are therefore only ever compared, by exact equality, against the names tmux itself
+//      reported; what gets targeted is the `$id`/`@id` tmux issued for the match. Refusing
+//      names containing `.` or `:` is NOT the protection — tmux allows both in a window
+//      name, and refusing them would make real windows unreachable.
+// So the only bound left is the one argv itself imposes, plus a sane length.
+const SAFE_NAME = /^[^\u0000-\u001f]{1,200}$/;
 
 function tmux(args, extra) {
   return execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], ...extra });
 }
 
 const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
+
+// Listing rows put the NAME last, so a name containing `|` cannot shift the other columns.
+function rows(out, fields) {
+  return out.trim().split('\n').filter(Boolean).map(line => {
+    const parts = [];
+    let rest = line;
+    for (let i = 0; i < fields; i += 1) {
+      const at = rest.indexOf('|');
+      if (at === -1) { parts.push(rest); rest = ''; continue; }
+      parts.push(rest.slice(0, at));
+      rest = rest.slice(at + 1);
+    }
+    return [...parts, rest];
+  });
+}
 
 function attach(wss, { port }) {
   wss.on('connection', (ws, req) => {
@@ -44,31 +63,45 @@ function attach(wss, { port }) {
       return;
     }
 
-    // Resolve the target before using it. This enumeration already had to happen to find the
-    // Claude window; doing it unconditionally also answers "does this session exist" and
-    // "is the requested window real" from data we were fetching anyway, so a client cannot
-    // name a pane into existence. An empty or failed listing means we cannot resolve
-    // anything, and the connection is refused rather than pointed somewhere arbitrary.
+    // Resolve before using. The session name is matched by exact equality against the live
+    // list, which answers "does this session exist" and yields the id everything below is
+    // addressed by; the pane enumeration — which already had to happen to find the Claude
+    // window — answers "is the requested window real" and yields its id. A client therefore
+    // cannot name a pane into existence, and cannot name one it did not ask for either.
+    let sessionId = '';
+    try {
+      const hit = rows(tmux(['list-sessions', '-F', '#{session_id}|#{session_name}']), 1)
+        .find(([, name]) => name === session);
+      if (hit) sessionId = hit[0];
+    } catch { sessionId = ''; }
+    if (!sessionId) {
+      ws.close(1008, 'no such tmux session');
+      return;
+    }
     let panes = [];
     try {
-      panes = tmux(['list-panes', '-s', '-t', session, '-F', '#{window_name}|#{pane_current_command}'])
-        .trim().split('\n').filter(Boolean);
+      panes = rows(tmux(['list-panes', '-s', '-t', sessionId, '-F', '#{window_id}|#{pane_current_command}|#{window_name}']), 2);
     } catch { panes = []; }
     if (!panes.length) {
       ws.close(1008, 'no such tmux session');
       return;
     }
-    const names = panes.map(p => p.split('|')[0]);
-    if (window && !names.includes(window)) {
-      ws.close(1008, 'no such tmux window in that session');
-      return;
-    }
-    if (!window) {
-      const claudePane = panes.find(p => isClaudeCmd(p.split('|')[1] || ''));
-      if (claudePane) window = claudePane.split('|')[0];
+    let windowId = '';
+    if (window) {
+      const hit = panes.find(([, , name]) => name === window);
+      if (!hit) {
+        ws.close(1008, 'no such tmux window in that session');
+        return;
+      }
+      windowId = hit[0];
+    } else {
+      const claudePane = panes.find(([, cmd]) => isClaudeCmd(cmd || ''));
+      if (claudePane) { window = claudePane[2]; windowId = claudePane[0]; }
     }
 
-    const target = window ? `${session}:${window}` : session;
+    // The tmux identifier for the resolved window, or for the session when no window was
+    // resolved — the same fallback as before, expressed unambiguously.
+    const target = windowId || sessionId;
     console.log(`[ws] streaming tmux target: ${target}`);
 
     // This connection's target is now fixed for its lifetime, but the window Claude runs in

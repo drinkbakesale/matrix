@@ -38,8 +38,7 @@ are D2 (mobile copy) and D3 (session brief).
   *[now `server/lib/attention.js`]*
 * **[observed] 2026-10-02**, running the delivered listing code against this machine's real
   tmux server (read-only; `node -e "require('./server/lib/sessions.js').listLiveSessions()"`):
-  **70 live sessions**, 27 with Claude running, 18 of 70 with any description — from tmux
-  itself, so real.
+  **70 live sessions**, 27 with Claude running, 18 of 70 with any description — from tmux itself, so real.
 * **Attention state in that run is NOT a measurement.** `needsAttention` reads
   `pendingAttention` in `attention.js` (per-process memory only `/api/notify` writes), and
   that command is a fresh node process whose map starts empty regardless of what the running
@@ -49,8 +48,7 @@ are D2 (mobile copy) and D3 (session brief).
 
 * `server/lib/session-identity.js:54-74 @27534cd` **[code]** Evidence chain, strongest first:
   explicit `@matrix_project` tag → registry path match → non-home cwd basename → tmux session
-  name. Pane titles are never identity (`:52-53`); they only feed a description
-  (`:80-94`).
+  name. Pane titles are never identity (`:52-53`); they only feed a description (`:80-94`).
 * `server/lib/session-identity.js:100-113 @27534cd` **[code]** `assignInstanceLabels()` keeps
   *every* live session and disambiguates shared projects with an instance suffix. Nothing is
   deduplicated away. This is the current, deliberate policy.
@@ -88,8 +86,14 @@ are D2 (mobile copy) and D3 (session brief).
   re-synchronises on reconnect. The announced window is empty when no Claude was found —
   the connection then streams the session itself, i.e. whichever window tmux has active —
   and the brief API distinguishes that announced empty window (`?bound=1`) from a client
-  that has not been told yet, which still gets discovery. The stream's own polling, input
-  routing and `output`/`screen` behaviour are unchanged.]*
+  that has not been told yet, which still gets discovery. Polling, input routing and the
+  `output`/`screen` frames are unchanged. The announced `target` is now the tmux identifier
+  (`@id`, or `$id` with no window), not `session:window`: tmux target syntax is
+  `session:window.pane`, so the base's name-built target made a window legitimately called
+  `v2.1` address window `v2`, pane 1 — observed on tmux 3.6a against a disposable
+  private-socket server, where it returns the neighbouring pane's text while `@id` returns
+  the right one. Names are now only ever matched by exact equality against the live listing,
+  so such windows keep working and none is refused for containing `.` or `:`.]*
 * `server/server.js:1054-1096 @27534cd` **[code]** The 100 ms poll sends `output` when the
   capture grew, and `screen` (the last `rows` lines) when the length is unchanged but the
   content differs. The comment at `:1029-1031` ("We NEVER clear the screen. We only APPEND")
@@ -101,8 +105,7 @@ are D2 (mobile copy) and D3 (session brief).
 ### 1.4 Input path
 
 * `server/server.js:1102-1120 @27534cd` **[code]** WebSocket `input` is hex-encoded and sent
-  with `tmux send-keys -H`, then attention is cleared for the session and its display-name
-  variants.
+  with `tmux send-keys -H`, then attention is cleared for the session and its display-name variants.
 * `server/server.js:613-633 @27534cd` **[code]** `POST /api/send` is the non-WebSocket path
   (`tmux send-keys … Enter`).
 * `server/public/app.js:757-772, 889-908 @27534cd` **[code]** Mobile text input plus
@@ -112,12 +115,10 @@ are D2 (mobile copy) and D3 (session brief).
 ### 1.5 Notifications
 
 * `bin/matrix-notify:9-12,69-73 @27534cd` **[code]** The notifier resolves its own tmux session
-  from `$TMUX_PANE`, reads `@matrix_project`, and POSTs
-  `{message, project, session, tmuxSession}` to `/api/notify`.
+  from `$TMUX_PANE`, reads `@matrix_project`, and POSTs `{message, project, session, tmuxSession}` to `/api/notify`.
 * `server/server.js:159-215 @27534cd` **[code]** `/api/notify` resolves one live tmux target,
   suppresses a repeat of a dismissed message (`:179-184`), records a pending alert, sets
-  `pendingAttention`, fans out over SSE and calls `sendPush`. *[now
-  `server/lib/notify-routes.js`]*
+  `pendingAttention`, fans out over SSE and calls `sendPush`. *[now `server/lib/notify-routes.js`]*
 * `server/server.js:86-104 @27534cd` **[code]** `sendPush` embeds the resolved
   `targetSession` in the push payload and prunes 404/410 subscriptions.
 * `server/public/sw.js:19-36 @27534cd` **[code]** The service worker shows the notification
@@ -162,8 +163,7 @@ are D2 (mobile copy) and D3 (session brief).
 ### 1.8 Services
 
 * **[observed] 2026-10-02**, `launchctl list` and
-  `launchctl print gui/501/com.claude-remote.app`: `com.claude-remote.app` is **loaded and
-  running** (PID 48246) as
+  `launchctl print gui/501/com.claude-remote.app`: `com.claude-remote.app` is **loaded and running** (PID 48246) as
   `/opt/homebrew/bin/node /Users/williamkehler/Projects/matrix/server/server.js` — the live
   server really is this checkout, as the request states. Also loaded: `com.matrix.console`
   (last exit 1, not running), `com.claude-remote.autostart` (last exit 1, not running),
@@ -175,8 +175,7 @@ are D2 (mobile copy) and D3 (session brief).
 * The repository tracks only `launchagents/com.matrix.ptt-daemon.plist` and
   `launchagents/com.matrix.whisper-server.plist`; **no `com.claude-remote.*` plist is in the
   repo** — the running configuration is untracked. **[code]**
-* `bin/matrix-app:1-20 @27534cd` **[code]** A PID-file start/stop wrapper, independent of all
-  of the above.
+* `bin/matrix-app:1-20 @27534cd` **[code]** A PID-file start/stop wrapper, independent of all of the above.
 
 ### 1.9 Tests (as of base)
 
@@ -257,6 +256,17 @@ Effort: **S** ≲ half a day, **M** ≈ 1–3 days, **L** > 3 days.
    often a stale `README` line. *Evidence:* **[observed]** §1.1; `server.js:683-715 @27534cd`.
    *Change:* prefer the new per-session brief (D3) over `detectDescription()` for live
    sessions. *Effort:* S. *Risk:* low. See §4.7.
+8. **Finish the tmux target discipline across the remaining routes.** *Problem:* the stream
+   and the brief now resolve a name against the live listing and target the `$id`/`@id` tmux
+   issued, but the other callers still interpolate a display name into a `tmux …` shell
+   string: `sessions.js:23,39,162 @candidate`, `notify-routes.js:168 @candidate`,
+   `project-routes.js:79,189 @candidate` — base behaviour this build deliberately preserved
+   when extracting. *Evidence:* those lines, plus **[observed] 2026-10-04** on tmux 3.6a
+   (private socket, disposable sessions): `capture-pane -t 'S:v2.1'` returns window `v2`
+   pane 1's text, and a single-quoted name is also a quoting hazard in a shell string.
+   *Change:* give those callers the same resolve-then-target-by-id helper and `execFile`.
+   *Effort:* M. *Risk:* medium — `notify-routes`/`project-routes` send keys to live panes, so
+   this needs its own behavioural evidence, not an incidental edit.
 
 ---
 
@@ -322,10 +332,8 @@ not be captured. **Do not claim the t-20260915 deep-link fix works live.** What 
 `~/.matrix/vapid.json` exists, so push is configured.
 
 *Safe verification procedure, at deploy time, with the user present:*
-1. On the phone, open the Home-Screen PWA and confirm the push-setup banner is gone
-   (`app.js:240-282 @27534cd`).
-2. On the Mac: `tmux list-sessions` and pick two sessions of the *same* project — the case
-   that used to misroute.
+1. On the phone, open the Home-Screen PWA and confirm the push-setup banner is gone (`app.js:240-282 @27534cd`).
+2. On the Mac: `tmux list-sessions` and pick two sessions of the *same* project — the case that used to misroute.
 3. For the first, run
    `TMUX_PANE=$(tmux list-panes -t <session> -F '#{pane_id}' | head -1) bin/matrix-notify "audit deep-link test 1"`.
    This is a real notification the user is expecting, addressed to themselves.
@@ -336,19 +344,14 @@ not be captured. **Do not claim the t-20260915 deep-link fix works live.** What 
    place `via` appears. `bin/matrix-notify:71-74 @27534cd` pipes curl's output away, and
    `/api/notify` (`server.js:208-214 @27534cd`, now `server/lib/notify-routes.js`) logs
    nothing, so **`via` is not in `~/.matrix/logs/matrix.log` and never was**. Post the same
-   body the hook posts and read the response:
-   ```sh
-   S=<session>
-   curl -s -X POST http://localhost:7778/api/notify \
+   body the hook posts and read the response: ```sh S=<session> curl -s -X POST http://localhost:7778/api/notify \
      -H 'Content-Type: application/json' \
-     -d "{\"message\":\"audit deep-link test\",\"project\":\"$S\",\"session\":\"$S\",\"tmuxSession\":\"$S\"}"
-   ```
+     -d "{\"message\":\"audit deep-link test\",\"project\":\"$S\",\"session\":\"$S\",\"tmuxSession\":\"$S\"}" ```
    The JSON reply carries `targetSession` and `via`: `tmux-session` is the good path;
    `project`, `ambiguous-label` or `unresolved` each mean the hook is not passing
    `tmuxSession`. Note this sends a real notification, so do it only in the same sitting as
    steps 3-5. To learn `via` without any notification at all, add a one-line
-   `console.log` of `target.via` to the route first — that is a code change, not part of
-   this procedure.
+   `console.log` of `target.via` to the route first — that is a code change, not part of this procedure.
 
 *Effort to fix if it fails:* unknown until step 6 identifies `via`. *Dependencies:* none.
 
@@ -419,8 +422,7 @@ would mean a model-derived string influencing a triage view, which the contract 
     defect is that the disambiguator is a meaningless number — §4.7.
   * *identity policy undecided* — it is now decided in code and tested
     (`tests/session-identity.test.js`): explicit tag > registry > cwd > session name, pane
-    titles never identity. This audit does not reopen it; improvement 1 extends the chain
-    without changing its order.
+    titles never identity. This audit does not reopen it; improvement 1 extends the chain without changing its order.
 * **`docs/stabilization-slices.md`** is historical evidence and now **conflicts with the
   code**. `slice_001:9-14` describes dedup logic ("Dedup only merges sessions where BOTH have
   `projectConfirmed=true`") that no longer exists — there is no dedup in
@@ -437,8 +439,7 @@ would mean a model-derived string influencing a triage view, which the contract 
 * **[harness], not live:** every Copy, Brief and BriefService result in this build comes from
   Playwright WebKit/Chromium against a loopback fixture server with a stubbed WebSocket, a fake
   tmux and an injectable clock. Desktop WebKit has no SpringBoard, no native iOS selection
-  handles and no OS share sheet; a programmatic `display-mode: standalone` is **not** an
-  installed iOS PWA.
+  handles and no OS share sheet; a programmatic `display-mode: standalone` is **not** an installed iOS PWA.
 * **The touch attempt, precisely.** Three kinds of input are recorded separately in
   `browser-trace.json` and never conflated:
   * `webkitNativeLongPressAttempt` — WebKit **did** receive real engine-generated touch
@@ -459,8 +460,7 @@ would mean a model-derived string influencing a triage view, which the contract 
   *WebKit* long-press; neither is counted as one. Under the contract's unsupported-automation
   branch the mandatory attempt is discharged by this recorded evidence that the available
   automation cannot deliver sustained input — together with the visible fallback proven
-  stable in mobile WebKit and an exact clipboard round-trip on a capable browser, not by any
-  one of them alone.
+  stable in mobile WebKit and an exact clipboard round-trip on a capable browser, not by any one of them alone.
 * **Native iPhone long-press: unverified by automation, pending user on-device check.** After
   deploying, on the iPhone (Safari, and the installed PWA if used): open an actively
   streaming session; long-press transcript text and extend the selection; wait ≥ 3 s while
@@ -469,8 +469,7 @@ would mean a model-derived string influencing a triage view, which the contract 
   fallback, select and copy while updates continue, paste into Notes and compare exactly.
   Tap **Resume live** and check the current text appears once; switch sessions and check no
   old-session text appears. Record device, iOS version, browser, the native-selection
-  outcome, the fallback outcome and any mismatch. This is pending, not acceptance evidence;
-  deployment is the user's.
+  outcome, the fallback outcome and any mismatch. This is pending, not acceptance evidence; deployment is the user's.
 * **[observed], live:** the launchd/tmux facts in §1.8 and §1.1–§1.2 only.
 * **Unverified, and not claimed:** real APNs delivery, the installed-PWA deep link (§4.3),
   native iPhone long-press selection and copy (unverified by automation, pending the
