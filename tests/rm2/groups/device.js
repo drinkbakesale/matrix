@@ -56,7 +56,11 @@ module.exports = (L) => {
     }
     const home = path.join(top, 'machome');
     const reportDir = path.join(top, 'reports'); fs.mkdirSync(reportDir);
-    const env = { ...process.env, MATRIX_HOME: home, RM2_SSH: path.join(L.candidate, 'tests/rm2/fake-ssh'), RM2_SCP: path.join(L.candidate, 'tests/rm2/fake-scp'), FAKE_DEVICE_ROOT: root, FAKE_DEVICE_BIN: path.join(top, 'bin'), RM2_DEPS_MANIFEST: manifest, MATRIX_RM2_DEPS: deps };
+    // The ssh/scp doubles are copied and made executable here (like the tmux double): the
+    // controller installs oracle files without the executable bit.
+    const doubles = path.join(top, 'doubles'); fs.mkdirSync(doubles);
+    for (const f of ['fake-ssh', 'fake-scp']) { fs.copyFileSync(path.join(L.candidate, 'tests/rm2', f), path.join(doubles, f)); fs.chmodSync(path.join(doubles, f), 0o755); }
+    const env = { ...process.env, MATRIX_HOME: home, RM2_SSH: path.join(doubles, 'fake-ssh'), RM2_SCP: path.join(doubles, 'fake-scp'), FAKE_DEVICE_ROOT: root, FAKE_DEVICE_BIN: path.join(top, 'bin'), RM2_DEPS_MANIFEST: manifest, MATRIX_RM2_DEPS: deps };
     fs.mkdirSync(path.join(top, 'bin'));
     const install = (cmd, extra = [], more = {}) => L.spawnSync(process.execPath, [path.join(L.candidate, 'scripts', 'rm2-install'), cmd, '--host', 'tablet.sandbox', '--binary', L.hostBin(), '--report-dir', reportDir, ...(cmd === 'install' ? ['--url', 'https://192.168.68.63:7779'] : []), ...extra], { encoding: 'utf8', env: { ...env, ...more } });
     return { top, root, deps, home, env, install, reportDir, writeManifest, manifest, read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'), exists: (rel) => fs.existsSync(path.join(root, rel)), xoviState: () => (fs.existsSync(path.join(root, 'var/xovi-state')) ? fs.readFileSync(path.join(root, 'var/xovi-state'), 'utf8').trim().split('\n') : []) };
