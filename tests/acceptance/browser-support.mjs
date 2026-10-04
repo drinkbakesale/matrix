@@ -209,6 +209,11 @@ export async function sustainedTouch(page, context, box, holdMs = 900, { watch }
   const down = touches.find(e => e.type === 'touchstart');
   const up = touches.find(e => e.type === 'touchend');
   report.observedPressMs = down && up ? up.at - down.at : null;
+  // Labelled in the artifact itself, so neither a reader nor a reviewer can mistake a
+  // complete tap for a press-and-hold. Contract v3 is explicit that the mandatory native
+  // long-press attempt is never discharged by relabelling a tap.
+  report.kind = report.sustained ? 'sustained touch (press-and-hold)' : 'atomic tap — NOT a long-press';
+  report.nativeLongPressDelivered = !!report.sustained;
   return report;
 }
 
@@ -246,11 +251,31 @@ export async function sustainedTouchOnChromium(ctx, t, { target, unicodeLine }) 
     t.note('sustainedTouchSelection', {
       selectionDuringHold: held.selectionDuringHold,
       producedSelection: !!held.selectionDuringHold,
-      note: 'Neither pinned engine runs the iOS long-press selection gesture. Touch delivery is proven; native selection handles are not available in either, which is why the visible fallback is mandatory.',
+      note: 'Neither pinned engine runs the iOS long-press selection gesture. Touch delivery is proven; native selection handles are not available in either, which is why the visible fallback is mandatory. A Chromium hold is NOT a WebKit native long-press.',
     });
+    return held;
   } finally {
     await browser.close();
   }
+}
+
+// Contract v3 discharges the mandatory native long-press requirement only on ALL of these
+// together, never on any one of them: recorded WebKit capability evidence, the delivered
+// visible fallback proven stable in mobile WebKit, and sustained-touch evidence from the
+// engine that can hold one. The exact clipboard round-trip is the fourth leg and is
+// asserted in Copy::clipboard_and_failure.
+export function recordCapabilityBranch(t, { webkit, chromium }) {
+  t.note('v3CapabilityBranch', {
+    webkitDelivered: webkit.kind,
+    webkitSustainedTouch: webkit.sustained,
+    webkitLimitation: webkit.limitation,
+    chromiumSustainedTouch: chromium.sustained,
+    chromiumObservedPressMs: chromium.observedPressMs,
+    fallbackTestedInMobileWebKit: true,
+    nativeIosSelection: 'unverified by automation, pending user on-device check',
+  });
+  t.ok(webkit.touchEventsDelivered > 0 && (webkit.sustained || !!webkit.limitation) && chromium.sustained,
+    'WebKit capability evidence, its sustained-input verdict and capable-engine sustained touch are all recorded together');
 }
 
 // Replays a `stream-target` announcement on the page's current socket, exactly as the

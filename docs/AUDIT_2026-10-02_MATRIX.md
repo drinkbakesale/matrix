@@ -437,7 +437,7 @@ would mean a model-derived string influencing a triage view, which the contract 
   installed iOS PWA.
 * **The touch attempt, precisely.** Three kinds of input are recorded separately in
   `browser-trace.json` and never conflated:
-  * `webkitTouchAttempt` — WebKit **did** receive real engine-generated touch
+  * `webkitNativeLongPressAttempt` — WebKit **did** receive real engine-generated touch
     (`touchstart`/`touchend`, `isTrusted: true`), but as an **atomic tap**: both events land
     at the same millisecond, so the observed press is 0 ms. A press-and-hold **cannot be
     delivered to WebKit at all** under the pinned Playwright: `newCDPSession` is Chromium-only
@@ -451,13 +451,26 @@ would mean a model-derived string influencing a triage view, which the contract 
   * `syntheticLongPress` — scripted `dispatchEvent` (`isTrusted: false`). It proves the DOM
     race causally and is never offered as gesture proof.
   Neither engine runs the iOS long-press text-selection gesture, so neither produced a
-  selection from touch. That is exactly why the visible **Select / copy** fallback is
-  mandatory and is the path actually tested end to end. Whether a real iOS finger selects
-  text in the installed PWA remains **unverified** and is listed below.
+  selection from touch. An atomic WebKit tap is not a long-press and a Chromium hold is not a
+  *WebKit* long-press; neither is counted as one. Under the contract's unsupported-automation
+  branch the mandatory attempt is discharged by this recorded evidence that the available
+  automation cannot deliver sustained input — together with the visible fallback proven
+  stable in mobile WebKit and an exact clipboard round-trip on a capable browser, not by any
+  one of them alone.
+* **Native iPhone long-press: unverified by automation, pending user on-device check.** After
+  deploying, on the iPhone (Safari, and the installed PWA if used): open an actively
+  streaming session; long-press transcript text and extend the selection; wait ≥ 3 s while
+  output and screen updates continue; invoke the native **Copy** and paste into Notes,
+  comparing exactly including newlines and Unicode. Then open the visible **Select / copy**
+  fallback, select and copy while updates continue, paste into Notes and compare exactly.
+  Tap **Resume live** and check the current text appears once; switch sessions and check no
+  old-session text appears. Record device, iOS version, browser, the native-selection
+  outcome, the fallback outcome and any mismatch. This is pending, not acceptance evidence;
+  deployment is the user's.
 * **[observed], live:** the launchd/tmux facts in §1.8 and §1.1–§1.2 only.
 * **Unverified, and not claimed:** real APNs delivery, the installed-PWA deep link (§4.3),
-  whether a real iOS long press selects transcript text in the installed PWA (no pinned
-  engine can run that gesture; verify by hand on the phone after deploying), and
+  native iPhone long-press selection and copy (unverified by automation, pending the
+  user on-device check written out above), and
   the accuracy of the opt-in `claude`-CLI brief generator on real transcripts. The shipped
   default brief generator is extractive and was measured on the frozen eight-record corpus
   (6/6 useful, 2/2 abstentions, 0 unsupported clauses) — that is a fixed synthetic corpus, not

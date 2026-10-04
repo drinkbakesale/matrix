@@ -4,7 +4,7 @@
 import { diagnose, TARGET } from './browser-diagnosis.mjs';
 import {
   newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
-  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium,
+  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch,
 } from './browser-support.mjs';
 
 const UNICODE_LINE = 'café 日本語 — copy me exactly\twith a tab';
@@ -98,7 +98,13 @@ export async function mobileStreamSelection(ctx, t) {
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   });
   const wk = await sustainedTouch(page, context, targetBox, 900, { watch: '#terminal .msg-screen' });
-  t.note('webkitTouchAttempt', { engine: 'webkit', version: ctx.browser.version(), ...wk });
+  t.note('webkitNativeLongPressAttempt', {
+    engine: 'webkit', version: ctx.browser.version(), ...wk,
+    requirement: 'mandatory native WebKit long-press attempt',
+    dischargedBy: wk.sustained
+      ? 'sustained native input was delivered; the native-selection assertions apply'
+      : 'contract v3 unsupported-automation branch: the available automation cannot deliver sustained touch input',
+  });
   t.eq(wk.error, null, 'the WebKit touch attempt ran without an automation error');
   t.ok(wk.touchEventsDelivered > 0, `real touch input reached the page on WebKit (${wk.touchEventsDelivered} events)`);
   t.eq(wk.allTouchEventsTrusted, true, 'every touch event WebKit delivered was engine-generated (isTrusted)');
@@ -115,10 +121,13 @@ export async function mobileStreamSelection(ctx, t) {
     t.ok(wk.limitation && wk.limitation.includes('dispatchTapEvent'),
       'WebKit cannot hold a touch down, and the limitation names the exact missing protocol facility');
     t.eq(wk.observedPressMs, 0, 'what WebKit can deliver is an atomic tap: zero press duration, recorded as such');
+    t.eq(wk.kind, 'atomic tap — NOT a long-press', 'the delivered input is labelled a tap, never a long-press');
+    t.eq(wk.nativeLongPressDelivered, false, 'no native WebKit long-press is claimed from this attempt');
   }
 
-  // A SUSTAINED touch, on the engine whose automation can actually hold one.
-  await sustainedTouchOnChromium(ctx, t, { target: TARGET, unicodeLine: UNICODE_LINE });
+  // A SUSTAINED touch, on the engine whose automation can actually hold one. This is
+  // capability evidence about touch delivery; it is explicitly NOT a WebKit long-press.
+  const chromiumHold = await sustainedTouchOnChromium(ctx, t, { target: TARGET, unicodeLine: UNICODE_LINE });
 
   // 1b. SYNTHETIC gesture, recorded separately and never conflated with the above: it is
   // what proves the DOM race causally, and it completes with a release.
@@ -198,6 +207,8 @@ export async function mobileStreamSelection(ctx, t) {
   const switched = await page.evaluate(() => transcript.snapshotText());
   t.ok(!switched.includes('STALE SESSION A TEXT'), 'a stale callback from session A never lands on session B');
   t.includes(switched, 'session B history', 'session B shows its own stream');
+
+  recordCapabilityBranch(t, { webkit: wk, chromium: chromiumHold });
   await page.screenshot({ path: `${ctx.artifactDir}/mobile-copy.png` });
   await context.close();
 }

@@ -99,8 +99,29 @@ the repository root. Do not run any of this in the live `~/Projects/matrix` chec
   node under the finger is destroyed inside the 900 ms long-press window and on the candidate
   it is not; the snapshot and its selection survive ≥ 3 s of streaming, a reconnect and a
   brief refresh; and a real clipboard round-trip (paste into an independent destination in
-  WebKit, `navigator.clipboard.readText()` in Chromium) returns the exact text. **Please try a
-  real long-press on the phone after deploying** — if iOS still will not give you handles, the
+  WebKit, `navigator.clipboard.readText()` in Chromium) returns the exact text.
+
+  Native iPhone long-press selection and copy is
+  **unverified by automation, pending user on-device check**.
+  Playwright's WebKit input protocol sends complete taps only (no
+  press duration), and no iOS Simulator, Xcode or Appium is installed; installing them was
+  out of scope. An atomic WebKit tap is not a long-press, and the Chromium sustained hold is
+  not a WebKit long-press — neither is claimed as one.
+
+  **Please run this on your iPhone after deploying.** Open Matrix in Safari, and in the
+  installed PWA if you use it. Then:
+  1. Open a session that is actively streaming.
+  2. Long-press transcript text and extend the selection.
+  3. Wait at least three seconds while output and screen updates keep arriving.
+  4. Invoke the native **Copy** and paste into Notes. Compare against what you selected,
+     including newlines and any Unicode.
+  5. Open the visible **Select / copy** fallback, select and copy while updates continue,
+     paste into Notes and compare exactly.
+  6. Tap **Resume live** and check the current text appears once, not twice.
+  7. Switch to another session and check no text from the previous one appears.
+
+  Note the device, iOS version and browser, whether native selection worked, whether the
+  fallback worked, and any mismatch. If iOS still will not give you handles, the
   **Select / copy** control is the path that is tested end to end.
 * **The t-20260915 notification deep link is still unverified live.** See
   `docs/AUDIT_2026-10-02_MATRIX.md` §4.3 for the six-step procedure to check it safely. This
