@@ -382,9 +382,13 @@ export async function isolationAndFailures(ctx, t) {
     ['timeout', ctx.panes.f1, 'error'],
     ['fail', ctx.panes.f1, 'error'],
   ]) {
-    await control(page, 'reincarnate', { session: 'A' });
-    await control(page, 'mode', { mode });
+    // Pane and mode are set BEFORE the reincarnation. The client polls every 3s, and a poll
+    // landing between a reincarnation and the pane change would register the new identity
+    // while the pane still held the previous case's text — generating a real brief where
+    // this case expects none. Observed as an intermittent "ok" instead of "unavailable".
     await control(page, 'pane', { session: 'A', pane });
+    await control(page, 'mode', { mode });
+    await control(page, 'reincarnate', { session: 'A' });
     await page.evaluate(() => openTerminal('A'));
     await control(page, 'advance', { ms: 31000 });
     await settleAndRefresh(page);

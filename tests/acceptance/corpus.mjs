@@ -208,12 +208,69 @@ async function targetSeparatorChecks({ clock, generator, storeFile }) {
   }
   const colonSession = await briefRoutes.respond(service, 'GET', 'A:v2', null, '');
   out.push([colonSession.body.code, 'invalid_session', 'a colon in the session name is rejected outright']);
-  // Background resolution must not quietly capture it either.
+  // The refused edit is checked against the file, not against a response.
+  const written = fs.existsSync(storeFile) ? fs.readFileSync(storeFile, 'utf8') : '';
+  out.push([written.includes('should not be stored'), false, 'the refused edit never reached storage']);
+  out.push(...(await backgroundSeparatorChecks({ clock, generator, storeFile: `${storeFile}.bg`, VICTIM, STREAMED })));
+  return out;
+}
+
+// The background path, sequenced so it actually exercises tick().
+//
+// A session only gets a runtime entry once a read succeeds, so a fixture that is unsafe
+// from the start leaves tick() with nothing to iterate — the earlier version of this check
+// asserted on an empty poll and proved nothing. Here the session is registered and settled
+// while every name is safe, and only then does Claude move to a separator-bearing window.
+// Safety is read off the recorded capture argv and the persisted record, not inferred from
+// an error or from a sibling window's empty brief.
+async function backgroundSeparatorChecks({ clock, generator, storeFile, VICTIM, STREAMED }) {
+  const out = [];
+  const safeStart = { sessionId: '$B', createdAt: 1_600_000_500, windows: [
+    { name: 'notes', command: 'bash', active: true, pane: `${STREAMED}\n\n⏺ working…\n` },
+    { name: 'v2', command: 'bash', active: false, pane: 'innocent\n', panes: ['innocent\n', `${VICTIM}\n\n⏺ working…\n`] },
+  ] };
+  const fake = fakeTmuxProcess({ B: safeStart });
+  const service = makeService({ stack: tmuxStack(fake), clock, generator, storeFile });
+  await service.read('B');
+  await service.settle();
+  const settledFirst = await service.read('B');
+  out.push([settledFirst.session.target, 'B', 'the session registers and settles while every name is safe']);
+  out.push([!!settledFirst.current, true, 'it really generated a brief, so tick() has something to re-resolve']);
+
+  // Claude now starts in a window whose name carries a separator.
+  fake.set('B', { ...safeStart, windows: [
+    safeStart.windows[0],
+    safeStart.windows[1],
+    { name: 'v2.1', command: 'claude', active: false, pane: `${STREAMED}\n\n⏺ working…\n` },
+  ] });
+  // A foreground read comes first, as it would in life: without the fix it SUCCEEDS on the
+  // dotted window and re-registers the session under that binding, which is what gives the
+  // background poll an unsafe target to capture. With the fix it throws, nothing is
+  // re-registered, and the poll has nothing unsafe to do. Ordering matters here — checking
+  // the poll in isolation lets tick() skip on a changed key and look safe for free.
+  let moved = null; let movedErr = null;
+  try { moved = await service.read('B'); } catch (e) { movedErr = e; }
+  out.push([movedErr ? movedErr.code : `served ${moved && moved.session.target}`, 'unsafe_target',
+    'the read that would re-register the dotted window is refused']);
+  const listsBefore = fake.callsFor('list-panes').length;
   clock.advance(31000);
   await service.tick();
   await service.settle();
-  const safe = await service.read('A', { window: 'ok', authoritative: true });
-  out.push([leaks(safe), false, 'after a poll, a valid sibling window still shows no victim text']);
-  out.push([safe.overrides.goal, null, 'the refused edit never reached storage']);
+  out.push([fake.callsFor('list-panes').length > listsBefore, true,
+    'the poll really re-resolved the session rather than skipping it']);
+
+  // Read the actual tmux argv rather than trusting an error code.
+  const targets = fake.callsFor('capture-pane').map(c => c.args[c.args.indexOf('-t') + 1]);
+  out.push([targets.filter(t => /v2/.test(String(t))).length, 0,
+    `no capture ever targeted a separator-bearing or victim window (saw ${JSON.stringify([...new Set(targets)])})`]);
+  // ...and the persisted record directly.
+  const stored = fs.existsSync(storeFile) ? fs.readFileSync(storeFile, 'utf8') : '';
+  out.push([/payroll|signing keys/.test(stored), false, 'the persisted brief record holds no victim text']);
+  let after = null; let afterErr = null;
+  try { after = await service.read('B'); } catch (e) { afterErr = e; }
+  out.push([afterErr ? afterErr.code : 'served', 'unsafe_target',
+    'once discovery lands on the separator-bearing window the session fails closed']);
+  out.push([/payroll|signing keys/.test(JSON.stringify(after || '')), false,
+    'and still serves no victim text']);
   return out;
 }
