@@ -101,14 +101,14 @@ function mount(app) {
 
   // The hook sends a project/session label and (newer hooks) its own tmux session. Resolve
   // that to one live tmux session; when nothing resolves, deliver the alert with no target.
-  app.post('/api/notify', (req, res) => {
+  app.post('/api/notify', async (req, res) => {
     const body = req.body || {};
     const msg = typeof body.message === 'string' && body.message ? body.message : 'Claude needs input';
 
     // Ignore the "how is Claude doing" session check — not a real question
     if (/how is claude/i.test(msg)) return res.json({ ok: true, ignored: true });
 
-    const target = resolveLiveNotificationTarget({
+    const target = await resolveLiveNotificationTarget({
       tmuxSession: body.tmuxSession, session: body.session, project: body.project,
     });
     const targetSession = target.targetSession || '';

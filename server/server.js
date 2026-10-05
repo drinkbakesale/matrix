@@ -49,7 +49,10 @@ voiceRoutes.mount(app);
 projectRoutes.mount(app);
 
 app.get('/api/sessions', (req, res) => {
-  res.json({ sessions: listLiveSessions() });
+  listLiveSessions().then(sessions => res.json({ sessions }), err => {
+    console.error('[sessions] listing failed:', err.message);
+    res.status(500).json({ error: `tmux listing failed: ${err.message}` });
+  });
 });
 
 // ── Session briefs ──
