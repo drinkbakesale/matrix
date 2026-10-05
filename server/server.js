@@ -36,7 +36,12 @@ app.use((req, res, next) => {
 app.use(express.static(path.join(__dirname, 'public')));
 // E-ink workstation (RM2 display + iPad control): its own scoped API, mounted
 // before the legacy body parser so its limits and auth apply to its routes only.
-const eink = require('./lib/eink').mount(app, { home: MATRIX_HOME, webpush, vapid: () => vapid });
+const eink = require('./lib/eink').mount(app, {
+  home: config.MATRIX_HOME,
+  // web-push is a process-wide singleton, so the VAPID details notify-routes set apply here too.
+  webpush: require('web-push'),
+  vapid: notifyRoutes.hasVapid,
+});
 app.use(express.json());
 
 notifyRoutes.mount(app);
@@ -126,7 +131,7 @@ server.listen(config.PORT, '0.0.0.0', () => {
   }
   if (eink.router) {
     const tlsPort = parseInt(process.env.MATRIX_EINK_TLS_PORT, 10) || 7779;
-    const tls = require('./lib/eink').listenTls({ router: eink.router, home: MATRIX_HOME, port: tlsPort });
+    const tls = require('./lib/eink').listenTls({ router: eink.router, home: config.MATRIX_HOME, port: tlsPort });
     console.log(tls.started ? `E-ink LAN endpoint (TLS) on ${tls.address}:${tlsPort} only` : `E-ink LAN endpoint not started: ${tls.reason}`);
   }
 });
