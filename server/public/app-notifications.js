@@ -88,13 +88,27 @@ function showToast(data) {
       <div class="toast-project">${escapeHtml(data.project)}</div>
       <div class="toast-message">${escapeHtml(data.message)}</div>
     </div>
-    <div class="toast-action">Open</div>`;
+    <div class="toast-action">Open</div>
+    <button type="button" class="toast-close" aria-label="Dismiss">×</button>`;
+  toast.dataset.session = targetSession;
+  toast.querySelector('.toast-close').addEventListener('click', e => {
+    e.stopPropagation();
+    toast.remove();
+  });
   toast.addEventListener('click', () => {
     toast.remove();
     openNotificationTarget(targetSession);
   });
+  // No timer: it stays until the user opens the session, dismisses it, or answers it.
   document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 8000);
+}
+
+// Called with each fresh session list: a pop-up whose session no longer needs the user goes.
+function syncToastWithSessions(sessions) {
+  const toast = document.querySelector('.notification-toast');
+  if (!toast || !toast.dataset.session) return;
+  const s = (sessions || []).find(x => x.name === toast.dataset.session);
+  if (!s || !s.needsAttention) toast.remove();
 }
 
 // ── Notification Permission Banner ──

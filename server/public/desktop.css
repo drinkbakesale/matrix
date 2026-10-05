@@ -748,6 +748,19 @@ body {
   flex-shrink: 0;
 }
 
+.switch-toast-close {
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px 0 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.switch-toast-close:hover { color: var(--green); }
+
 @keyframes toastSlideIn {
   from { transform: translateX(100%); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }

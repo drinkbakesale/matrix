@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-// matrix-project-tag.js — PostToolUse hook (async)
-// Watches file paths in Edit/Write/Read tool calls and sets
-// @matrix_project on the tmux session so the Matrix app knows
-// which project this session is working on.
+// matrix-project-tag.js — Claude Code hook (PostToolUse, UserPromptSubmit, Stop; async)
+// Names the tmux session after the project Claude is working in and records which
+// transcript belongs to which pane, so Matrix can label the row and read the session's recap.
+//
+// - Project: the most specific registered project containing the file a tool touched, or
+//   else Claude's working directory; failing a registered match, the first folder under a
+//   workspace root (~/Projects/<name>, ~/Desktop/projects/<name>, ...). The latest wins, so a
+//   session that moves between projects is named after the one it is in now.
+// - Link: <MATRIX_HOME>/session-links/<tmux session>.json with the pane, its window, the
+//   transcript path and the cwd. tmux is always addressed through $TMUX_PANE — never "the
+//   current client" — and called with argument vectors, never a shell.
 
 const fs = require('fs');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const os = require('os');
 const path = require('path');
 
@@ -112,49 +119,102 @@ function buildRegistry() {
   return entries;
 }
 
-function run(input) {
-  const { tool_name, tool_input } = input;
-  if (!['Read', 'Edit', 'Write', 'Glob', 'Grep'].includes(tool_name)) return;
+// Workspace roots hold projects; they are never projects themselves. A path below one of
+// them is named after its first folder there, even if Claude was never launched in it.
+const WORKSPACE_ROOTS = [
+  path.join(homeDir, 'Desktop', 'projects'),
+  path.join(homeDir, 'Projects'),
+  path.join(homeDir, 'Desktop'),
+  path.join(homeDir, 'Documents'),
+  path.join(homeDir, 'Developer'),
+  path.join(homeDir, 'code'),
+];
+const slug = name => name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
-  const filePath = tool_input?.file_path || tool_input?.path || '';
-  if (!filePath) return;
-
-  const resolved = filePath.replace(/^~/, homeDir);
-  const registry = buildRegistry();
-
-  let project = null;
-  for (const entry of registry) {
-    if (resolved.startsWith(entry.prefix)) {
-      project = entry.name;
-      break;
-    }
+function projectFor(target, registry) {
+  if (!target) return null;
+  const resolved = path.resolve(String(target).replace(/^~(?=$|\/)/, homeDir));
+  const within = prefix => resolved === prefix || resolved.startsWith(prefix.endsWith('/') ? prefix : prefix + '/');
+  for (const entry of registry) if (within(entry.prefix)) return entry.name;
+  for (const root of WORKSPACE_ROOTS) {
+    if (!resolved.startsWith(root + '/')) continue;
+    const first = resolved.slice(root.length + 1).split('/')[0];
+    if (first && !first.startsWith('.') && !WORKSPACE_ROOTS.includes(path.join(root, first))) return slug(first);
   }
-  if (!project) return;
-
-  // Set @matrix_project on our tmux session
-  try {
-    const session = execSync("tmux display-message -p '#{session_name}' 2>/dev/null", {
-      encoding: 'utf8', timeout: 1000
-    }).trim();
-    if (!session) return;
-
-    let current = '';
-    try {
-      current = execSync(`tmux show-option -t '${session}' -v @matrix_project 2>/dev/null`, {
-        encoding: 'utf8', timeout: 1000
-      }).trim();
-    } catch {}
-
-    if (current !== project) {
-      execSync(`tmux set-option -t '${session}' @matrix_project '${project}'`, { timeout: 1000 });
-    }
-  } catch {}
+  return null;
 }
 
-// Read from stdin
-let raw = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', c => { raw += c; });
-process.stdin.on('end', () => {
-  try { run(JSON.parse(raw)); } catch {}
-});
+function tmux(args) {
+  return execFileSync('tmux', args, { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
+
+function writeLink(link) {
+  const dir = path.join(matrixHome, 'session-links');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, encodeURIComponent(link.tmuxSession) + '.json');
+  const tmp = file + '.' + process.pid + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(link));
+  fs.renameSync(tmp, file);
+}
+
+function run(input) {
+  const pane = process.env.TMUX_PANE || '';
+  if (!/^%\d+$/.test(pane) || !input || typeof input !== 'object') return;
+  const [session, windowId, paneId] = tmux(['display-message', '-p', '-t', pane,
+    '#{session_name}\t#{window_id}\t#{pane_id}']).split('\t');
+  if (!session) return;
+
+  const registry = buildRegistry();
+  const toolPath = input.tool_input && (input.tool_input.file_path || input.tool_input.path);
+  const project = projectFor(toolPath, registry) || projectFor(input.cwd, registry);
+  if (project) {
+    let current = '';
+    try { current = tmux(['show-option', '-t', '=' + session, '-v', '@matrix_project']); } catch {}
+    if (current !== project) tmux(['set-option', '-t', '=' + session, '@matrix_project', project]);
+  }
+
+  const transcriptPath = typeof input.transcript_path === 'string' ? input.transcript_path : '';
+  if (transcriptPath) {
+    writeLink({
+      tmuxSession: session, windowId, paneId, transcriptPath,
+      sessionId: typeof input.session_id === 'string' ? input.session_id : '',
+      cwd: typeof input.cwd === 'string' ? input.cwd : '', project: project || '', updatedAt: Date.now(),
+    });
+  }
+  return session;
+}
+
+// You typed to this session, or a tool ran (which is how an approved permission prompt
+// continues): it no longer needs you, so its Matrix row stops asking for attention.
+const CLEARS_ATTENTION = new Set(['UserPromptSubmit', 'PostToolUse']);
+
+function clearAttention(session) {
+  const http = require('http');
+  const body = JSON.stringify({ tmuxSession: session });
+  return new Promise(resolve => {
+    const req = http.request({
+      host: '127.0.0.1', port: parseInt(process.env.MATRIX_PORT, 10) || 7778, path: '/api/attention/clear',
+      method: 'POST', timeout: 1500, headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => { res.resume(); res.on('end', resolve); });
+    req.on('error', resolve);          // Matrix not running: nothing to clear
+    req.on('timeout', () => { req.destroy(); resolve(); });
+    req.end(body);
+  });
+}
+
+if (require.main === module) {
+  let raw = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', c => { raw += c; });
+  process.stdin.on('end', async () => {
+    try {
+      const input = JSON.parse(raw);
+      const session = run(input);
+      if (session && CLEARS_ATTENTION.has(input.hook_event_name)) await clearAttention(session);
+    } catch (err) {
+      process.stderr.write(`matrix-project-tag: ${err.message}\n`);
+    }
+  });
+}
+
+module.exports = { projectFor, buildRegistry, WORKSPACE_ROOTS, CLEARS_ATTENTION };

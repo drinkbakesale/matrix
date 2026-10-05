@@ -179,8 +179,11 @@ async function resolveLiveNotificationTarget(input) {
   return resolveNotificationTarget(input, await listLiveSessions({ maxAgeMs: 0 }));
 }
 
-// Periodically clear pendingAttention for sessions where Claude is no longer idle (the user
-// responded in iTerm, or Claude started a new task), and prune keys with no live session.
+// Prune attention for sessions that no longer exist. Attention is NOT cleared from what the
+// pane looks like: Claude's idle status bar always shows a context meter ("█████░░ 83%"),
+// which a screen check read as "busy again" and so wiped every alert within ten seconds.
+// It clears when the user acts — answers from Matrix (/api/send), dismisses it, or answers
+// in the terminal, which the Claude Code hook reports through /api/attention/clear.
 function sweepAttention() {
   if (Object.keys(attention.pendingAttention).length === 0) return;
   const sessData = attention.lastSessions();
@@ -197,18 +200,6 @@ function sweepAttention() {
       delete attention.dismissedUntilChange[key];
       delete attention.lastSeenQuestions[key];
     }
-  }
-  for (const s of sessData) {
-    const keys = [s.name];
-    if (s.displayName) keys.push(s.displayName, s.displayName.toLowerCase());
-    if (!keys.some(k => attention.pendingAttention[k])) continue;
-    // `=name` is an exact session match, so a name is never reinterpreted as a pattern.
-    runTmux(['capture-pane', '-t', `=${s.name}:0`, '-p', '-S', '-5']).then(tail => {
-      const lines = tail.split('\n').map(l => l.trim()).filter(Boolean);
-      const hasSpinner = lines.some(l => /^[✻✳⏺]\s/.test(l) || /Running…|Working/i.test(l));
-      const hasProgress = lines.some(l => /\d+%/.test(l) && (l.includes('░') || l.includes('█')));
-      if (hasSpinner || hasProgress) for (const k of keys) delete attention.pendingAttention[k];
-    }, () => { /* session gone between listing and capture: the next sweep prunes it */ });
   }
 }
 

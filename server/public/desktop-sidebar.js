@@ -45,6 +45,8 @@ async function loadSessions() {
       if (s.needsAttention && !dismissed[s.name]) sessionAttention[s.name] = true;
       else if (!s.needsAttention) delete sessionAttention[s.name];
     });
+    // The pop-up stays until the user acts; once the session no longer needs them, it goes.
+    if (switchToastSession && !sessionAttention[switchToastSession]) removeSwitchToast();
 
     // Filter recent projects: not already visible, active within 14 days
     const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
@@ -183,14 +185,18 @@ function showSwitchToast(session, projectLabel) {
     <span class="switch-toast-dot"></span>
     <span class="switch-toast-text"><strong>${escapeHtml(label)}</strong> needs your input</span>
     <span class="switch-toast-hint">Enter to switch</span>
+    <button type="button" class="switch-toast-close" aria-label="Dismiss">×</button>
   `;
+  toast.querySelector('.switch-toast-close').addEventListener('click', e => {
+    e.stopPropagation();
+    removeSwitchToast();
+  });
   toast.addEventListener('click', () => {
     selectProject(switchToastSession);
     removeSwitchToast();
   });
+  // No timer: it stays until the user opens the session, dismisses it, or answers it.
   document.body.appendChild(toast);
-
-  switchToastTimer = setTimeout(removeSwitchToast, 5000);
 }
 
 function removeSwitchToast() {

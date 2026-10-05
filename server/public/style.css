@@ -513,6 +513,17 @@ body {
   flex-shrink: 0;
 }
 
+.toast-close {
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-size: 22px;
+  line-height: 1;
+  min-width: 36px;
+  min-height: 36px;
+  flex-shrink: 0;
+}
+
 /* ── Terminal View ── */
 #term-view {
   height: 100dvh;

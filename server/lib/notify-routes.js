@@ -161,6 +161,18 @@ function mount(app) {
     res.json({ ok: true });
   });
 
+  // Claude Code hooks on this Mac report that the user answered a session in its own terminal
+  // (UserPromptSubmit) or a tool ran after an approval (PostToolUse). Only loopback callers:
+  // nothing off this machine may clear another session's attention.
+  app.post('/api/attention/clear', (req, res) => {
+    const from = req.socket.remoteAddress || '';
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(from)) return res.status(403).json({ error: 'local hooks only' });
+    const session = req.body && req.body.tmuxSession;
+    if (typeof session !== 'string' || !session) return res.status(400).json({ error: 'tmuxSession required' });
+    attention.clearForSession(session);
+    res.json({ ok: true });
+  });
+
   app.post('/api/send', (req, res) => {
     const { session, text } = req.body;
     if (!session || !text) return res.status(400).json({ error: 'session and text required' });

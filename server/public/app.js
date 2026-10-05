@@ -121,6 +121,7 @@ function undismissSession(name) {
 async function loadSessions() {
   try {
     const sessions = await fetchSessions();
+    syncToastWithSessions(sessions);
     const container = document.getElementById('sessions');
 
     if (!sessions || sessions.length === 0) {
