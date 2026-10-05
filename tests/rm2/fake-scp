@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test double for the scp BINARY: copies into the sandbox tablet filesystem.
+for dest; do :; done
+src=""; for a; do [ "$a" = "$dest" ] || src="$a"; done
+path="${dest#*:}"
+mkdir -p "$(dirname "$FAKE_DEVICE_ROOT$path")"
+case "${FAKE_SCP_MODE:-}" in
+  fail) echo "scp: connection lost" >&2; exit 1 ;;
+  truncate) head -c 20000 "$src" > "$FAKE_DEVICE_ROOT$path" ;;   # the transfer is cut off, scp did not notice
+  *) cp "$src" "$FAKE_DEVICE_ROOT$path" ;;
+esac

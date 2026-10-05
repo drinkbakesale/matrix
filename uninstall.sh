@@ -32,6 +32,12 @@ else
 fi
 echo ""
 
+# Step 1b: Remove the e-ink evidence hook (only the entries Matrix added) and revoke its token
+if [ -f "$REPO_DIR/scripts/matrix-eink" ] && command -v node >/dev/null 2>&1; then
+  node "$REPO_DIR/scripts/matrix-eink" uninstall-hook | sed 's/^/  /'
+  echo ""
+fi
+
 # Step 2: Remove ~/.matrix directory
 echo -e "${BOLD}Remove $MATRIX_HOME?${NC}"
 echo -e "  ${DIM}This contains your projects.conf, project-paths.conf, VAPID keys, and logs.${NC}"

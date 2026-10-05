@@ -1,0 +1,224 @@
+{
+ "finding": "A9-1",
+ "what": "RM2_display::quiet_boundaries held-touch script on the pre-repair scheduler (rm2/ui/app.go without the active-contact gate). The clean at step 4 runs at 3200ms while contact 0 is down (100ms..5000ms); the test fails there.",
+ "steps": [
+  {
+   "step": 0,
+   "op": "draft",
+   "at_ms": 0,
+   "refreshes": [
+    "partial@0"
+   ],
+   "next_deadline": null
+  },
+  {
+   "step": 1,
+   "op": "touch",
+   "at_ms": 100,
+   "touch": [
+    16,
+    0,
+    700,
+    1000
+   ],
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 2,
+   "op": "draft",
+   "at_ms": 200,
+   "refreshes": [
+    "partial@200"
+   ],
+   "next_deadline": 3200
+  },
+  {
+   "step": 3,
+   "op": "tick",
+   "at_ms": 3100,
+   "refreshes": [],
+   "next_deadline": 3200
+  },
+  {
+   "step": 4,
+   "op": "tick",
+   "at_ms": 3300,
+   "refreshes": [
+    "clean@3200"
+   ],
+   "next_deadline": null
+  },
+  {
+   "step": 5,
+   "op": "tick",
+   "at_ms": 4999,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 6,
+   "op": "touch",
+   "at_ms": 5000,
+   "touch": [
+    17,
+    0,
+    700,
+    1000
+   ],
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 7,
+   "op": "tick",
+   "at_ms": 7999,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 8,
+   "op": "tick",
+   "at_ms": 8000,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 9,
+   "op": "tick",
+   "at_ms": 9000,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 10,
+   "op": "tick",
+   "at_ms": 12000,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 11,
+   "op": "draft",
+   "at_ms": 20000,
+   "refreshes": [
+    "partial@20000"
+   ],
+   "next_deadline": null
+  },
+  {
+   "step": 12,
+   "op": "draft",
+   "at_ms": 20200,
+   "refreshes": [
+    "partial@20200"
+   ],
+   "next_deadline": 23200
+  },
+  {
+   "step": 13,
+   "op": "touch",
+   "at_ms": 20300,
+   "touch": [
+    16,
+    0,
+    700,
+    1000
+   ],
+   "refreshes": [],
+   "next_deadline": 23300
+  },
+  {
+   "step": 14,
+   "op": "touch",
+   "at_ms": 20400,
+   "touch": [
+    16,
+    1,
+    700,
+    1000
+   ],
+   "refreshes": [],
+   "next_deadline": 23400
+  },
+  {
+   "step": 15,
+   "op": "touch",
+   "at_ms": 20500,
+   "touch": [
+    17,
+    0,
+    700,
+    1000
+   ],
+   "refreshes": [],
+   "next_deadline": 23500
+  },
+  {
+   "step": 16,
+   "op": "tick",
+   "at_ms": 23499,
+   "refreshes": [],
+   "next_deadline": 23500
+  },
+  {
+   "step": 17,
+   "op": "tick",
+   "at_ms": 23600,
+   "refreshes": [
+    "clean@23500"
+   ],
+   "next_deadline": null
+  },
+  {
+   "step": 18,
+   "op": "draft",
+   "at_ms": 24000,
+   "refreshes": [
+    "partial@24000"
+   ],
+   "next_deadline": null
+  },
+  {
+   "step": 19,
+   "op": "tick",
+   "at_ms": 26000,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 20,
+   "op": "touch",
+   "at_ms": 27000,
+   "touch": [
+    17,
+    1,
+    700,
+    1000
+   ],
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 21,
+   "op": "tick",
+   "at_ms": 29999,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 22,
+   "op": "tick",
+   "at_ms": 30000,
+   "refreshes": [],
+   "next_deadline": null
+  },
+  {
+   "step": 23,
+   "op": "tick",
+   "at_ms": 31000,
+   "refreshes": [],
+   "next_deadline": null
+  }
+ ]
+}
