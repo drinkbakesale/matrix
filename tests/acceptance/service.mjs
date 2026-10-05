@@ -13,7 +13,7 @@ import {
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
   countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks,
 } from './service-support.mjs';
-import { evaluateCorpus, targetAndInputChecks } from './corpus.mjs';
+import { evaluateCorpus, targetAndInputChecks, generationRaceChecks } from './corpus.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 const oracleDir = args.oracle;
@@ -420,6 +420,8 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   t.ok(brief.current !== byId.f2.expectedCurrent, 'and specifically not the value the edit replaced');
   t.eq(brief.goal, 'ship the new judge', 'clearing one field leaves the other edit alone');
 
+  for (const [a, e, d] of await generationRaceChecks({ clock, storeFile: `${storeFile}.race`, byId })) t.eq(a, e, d);
+
   // Invalid input is refused without changing anything.
   const reject = async (body, code, why) => {
     let err = null;
@@ -433,18 +435,16 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   await reject({ goal: 'x', revision: brief.revision - 1 }, 'revision_conflict', 'a stale revision is a conflict');
   t.eq((await service.read('A')).goal, 'ship the new judge', 'no rejected edit changed stored state');
 
-  let unknownErr = null;
+  let unknownErr = null, goneErr = null;
   try { await service.patch('../../etc/passwd', { goal: 'x', revision: 0 }); } catch (e) { unknownErr = e; }
   t.ok(unknownErr && (unknownErr.code === 'invalid_session' || unknownErr.code === 'unknown_session'),
     'a forged filesystem path is not a session');
-  let goneErr = null;
   try { await service.read('nope'); } catch (e) { goneErr = e; }
   t.eq(goneErr && goneErr.status, 404, 'an unknown session is a 404');
 
   // A conflict is reported through HTTP as 409, not as success.
   const conflict = await briefRoutes.respond(service, 'PATCH', 'A', { goal: 'x', revision: 0 }, '');
-  t.eq(conflict.status, 409, 'HTTP reports a revision conflict as 409');
-  t.eq(conflict.body.ok, false, 'a conflict is never reported as ok');
+  t.eq([conflict.status, conflict.body.ok], [409, false], 'HTTP reports a revision conflict as 409, never as ok');
 
   // Overrides survive a restart.
   service = makeService({ stack: tmuxStack(fake), clock, generator: extractive(), storeFile });

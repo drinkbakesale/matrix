@@ -145,13 +145,55 @@ export async function mobileStreamSelection(ctx, t) {
   });
   t.eq(detached, true, 'switching sessions detaches the previous socket handlers');
   await page.waitForTimeout(100);
-  await page.evaluate(() => {
+  // Asserted IMMEDIATELY after each of A's captured callbacks, BEFORE B's own dump: that
+  // dump replaces the children and would erase the contamination, so a mobile client with
+  // no token propagation could pass a check made after it.
+  const mobileStale = await page.evaluate(() => {
+    const before = transcript.snapshotText();
     window.__staleHandler({ data: JSON.stringify({ type: 'output', data: 'STALE SESSION A TEXT\n' }) });
+    const afterOutput = transcript.snapshotText();
+    window.__staleHandler({ data: JSON.stringify({ type: 'screen', data: 'STALE SESSION A SCREEN\n' }) });
+    return { before, afterOutput, afterScreen: transcript.snapshotText() };
   });
+  t.ok(!mobileStale.afterOutput.includes('STALE SESSION A TEXT'), 'stale session A output never reaches session B on mobile');
+  t.ok(!mobileStale.afterScreen.includes('STALE SESSION A SCREEN'), 'stale session A screen never reaches session B on mobile');
+  t.eq(mobileStale.afterOutput, mobileStale.before, 'B\'s transcript is byte-identical right after A\'s output callback');
+  t.eq(mobileStale.afterScreen, mobileStale.before, 'B\'s transcript is byte-identical right after A\'s screen callback');
   await emit(page, 'output', 'session B history\n');
   const switched = await page.evaluate(() => transcript.snapshotText());
   t.ok(!switched.includes('STALE SESSION A TEXT'), 'a stale callback from session A never lands on session B');
   t.includes(switched, 'session B history', 'session B shows its own stream');
+
+  // Mobile automatic reconnect. Unlike a session switch this never clears the transcript,
+  // so the fresh connection would inherit the dead one's token unless the client advances
+  // the epoch; an already-dispatched callback holds the handler itself, so detaching the
+  // socket's properties cannot retire it.
+  const mobileReconnect = await page.evaluate(async () => {
+    const dying = window.__sockets.at(-1);
+    const handler = dying.onmessage;
+    const close = dying.onclose;
+    close({});
+    await new Promise(r => setTimeout(r, 1700));
+    const fresh = window.__sockets.at(-1);
+    fresh.onmessage({ data: JSON.stringify({ type: 'output', data: 'MOBILE NEW SNAPSHOT\n' }) });
+    fresh.onmessage({ data: JSON.stringify({ type: 'stream-target', session: 'B', window: 'new-window' }) });
+    const afterNew = { text: transcript.snapshotText(), window: briefView ? briefView.window() : null };
+    const socketsBefore = window.__sockets.length;
+    handler({ data: JSON.stringify({ type: 'output', data: 'MOBILE OLD OUTPUT\n' }) });
+    handler({ data: JSON.stringify({ type: 'screen', data: 'MOBILE OLD SCREEN\n' }) });
+    handler({ data: JSON.stringify({ type: 'stream-target', session: 'B', window: 'old-window' }) });
+    close({});
+    await new Promise(r => setTimeout(r, 1800));
+    return { afterNew, text: transcript.snapshotText(),
+      window: briefView ? briefView.window() : null,
+      socketsBefore, socketsAfter: window.__sockets.length };
+  });
+  t.includes(mobileReconnect.afterNew.text, 'MOBILE NEW SNAPSHOT', 'mobile: the reconnect delivered its own snapshot');
+  t.ok(!mobileReconnect.text.includes('MOBILE OLD OUTPUT'), 'mobile: a superseded connection\'s output never lands after a reconnect');
+  t.ok(!mobileReconnect.text.includes('MOBILE OLD SCREEN'), 'mobile: a superseded connection\'s screen never lands after a reconnect');
+  t.includes(mobileReconnect.text, 'MOBILE NEW SNAPSHOT', 'mobile: the new connection\'s snapshot is still what is shown');
+  t.eq(mobileReconnect.window, mobileReconnect.afterNew.window, 'mobile: a superseded stream-target never re-points the brief');
+  t.eq(mobileReconnect.socketsAfter, mobileReconnect.socketsBefore, 'mobile: an obsolete reconnect timer does not open another connection');
 
   recordCapabilityBranch(t, { webkit: wk, chromium: chromiumHold });
   await page.screenshot({ path: `${ctx.artifactDir}/mobile-copy.png` });

@@ -55,6 +55,11 @@ function switchableGenerator(state) {
   return {
     name: 'extractive', version: '1',
     async generate(input) {
+      // An explicit, controllable boundary. `slow` is a timing hack and cannot prove a job
+      // was still running when an edit landed; `gate` holds the job inside generate() until
+      // the test releases it, and records that it really entered.
+      state.entered += 1;
+      if (state.gate) { state.pending += 1; try { await state.gate; } finally { state.pending -= 1; } }
       if (state.mode === 'slow') await new Promise(r => setTimeout(r, state.slowMs || 1500));
       if (state.mode === 'fail') throw new briefGenerator.BriefGenerationError('generator_failed', 'fake CLI exited with an error');
       if (state.mode === 'timeout') throw new briefGenerator.BriefGenerationError('generator_timeout', 'brief generation timed out');
@@ -74,7 +79,7 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
   // exercise the same session/window resolution the live server uses.
   const tmux = fakeTmuxProcess(sessions);
   const stack = tmuxStack(tmux);
-  const state = { mode: 'ok', slowMs: 1500 };
+  const state = { mode: 'ok', slowMs: 1500, gate: null, releaseGate: null, entered: 0, pending: 0 };
   const generator = switchableGenerator(state);
   const home = storeFile || path.join(tempDir('matrix-home-'), 'briefs.json');
   let service = makeService({ stack, clock, generator, storeFile: home, literalRequired });
@@ -170,6 +175,14 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
         return json(200, { session: name, window, sessionId, target: window ? tmux.windowId(name, window) : sessionId });
       }
       if (op === 'mode') { state.mode = url.searchParams.get('mode') || 'ok'; return json(200, { mode: state.mode }); }
+      if (op === 'gate') { state.gate = new Promise(r => { state.releaseGate = r; }); return json(200, { ok: true }); }
+      if (op === 'ungate') {
+        const r = state.releaseGate;
+        state.gate = null; state.releaseGate = null;
+        if (r) r();
+        return json(200, { ok: true });
+      }
+      if (op === 'genstate') { return json(200, { entered: state.entered, pending: state.pending }); }
       if (op === 'settle') { await service.settle(); return json(200, { ok: true }); }
       if (op === 'restart') {
         service = makeService({ stack, clock, generator, storeFile: home, literalRequired });

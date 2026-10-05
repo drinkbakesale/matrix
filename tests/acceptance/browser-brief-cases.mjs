@@ -32,6 +32,18 @@ async function waitForBrief(page, predicate, deadlineMs, label) {
   }
 }
 
+// Polls a control endpoint until it satisfies `predicate`, so the race below waits on an
+// observed generator state rather than on a guessed delay.
+async function waitForControl(page, op, predicate, deadlineMs, label) {
+  const started = Date.now();
+  for (;;) {
+    const value = await control(page, op);
+    if (predicate(value)) return value;
+    if (Date.now() - started > deadlineMs) throw new Error(`${label}: ${op} never satisfied in ${deadlineMs}ms (last ${JSON.stringify(value)})`);
+    await page.waitForTimeout(50);
+  }
+}
+
 async function readBrief(page) {
   return page.evaluate(() => ({
     status: document.getElementById('brief').getAttribute('data-status'),
@@ -39,6 +51,7 @@ async function readBrief(page) {
     current: document.getElementById('brief-current').textContent,
     age: document.getElementById('brief-age').textContent,
     note: document.getElementById('brief-status').textContent,
+    generated: briefView.current() ? briefView.current().generated : null,
     generatedAt: briefView.current() ? briefView.current().generatedAt : null,
     revision: briefView.current() ? briefView.current().revision : null,
     stale: briefView.current() ? briefView.current().stale : null,
@@ -228,15 +241,33 @@ export async function updatesAndOverrides(ctx, t) {
   t.ok(brief.current !== F2.current, 'and specifically not the pre-edit value');
   t.eq(brief.goal, 'ship the judging step', 'clearing one override leaves the other edit in place');
 
-  // An older job racing a new edit: the edit wins.
-  await control(page, 'mode', { mode: 'slow' });
-  await control(page, 'pane', { session: 'A', pane: ctx.panes.f3 });
+  // A generation ALREADY RUNNING when a newer edit lands. Two things make this a real race
+  // rather than a shape: the evidence moves to a fixture neither field has carried (f3 again
+  // would hit the unchanged-fingerprint early return and never start a job at all), and the
+  // generator is held at an explicit boundary instead of merely being slow, so the test can
+  // observe that generation entered and is still pending before it saves the edit.
+  await control(page, 'pane', { session: 'A', pane: ctx.panes.f1 });
+  const enteredBefore = (await control(page, 'genstate')).entered;
+  await control(page, 'gate');
   await control(page, 'advance', { ms: 31000 });
-  await editField(page, 'current', 'edit during a slow job');
+  const racing = await waitForControl(page, 'genstate',
+    g => g.entered > enteredBefore && g.pending > 0, 8000, 'held generation');
+  t.ok(racing.entered > enteredBefore, `the held generation really started (entered ${racing.entered})`);
+  t.ok(racing.pending > 0, 'and is still pending at the boundary, not already finished');
+  await editField(page, 'current', 'saved while the job was mid-flight');
+  t.eq((await readBrief(page)).current, 'saved while the job was mid-flight', 'the edit is accepted while generation is in flight');
+  t.eq((await control(page, 'genstate')).pending, 1, 'the job was still held when the edit was saved');
+  await control(page, 'ungate');
   await settleAndRefresh(page);
   brief = await readBrief(page);
-  t.eq(brief.current, 'edit during a slow job', 'an edit beats a generation that was already running');
-  await control(page, 'mode', { mode: 'ok' });
+  t.eq(brief.current, 'saved while the job was mid-flight', 'the completing job cannot clobber an edit saved after it started');
+  t.eq(brief.generated.current, F1.current, 'but the generated value underneath did complete and update');
+  await control(page, 'restart');
+  await settleAndRefresh(page);
+  brief = await readBrief(page);
+  t.eq(brief.current, 'saved while the job was mid-flight', 'the mid-flight edit survives a service restart');
+  t.eq(brief.generated.current, F1.current, 'and so does the generated value that job wrote');
+  t.eq(brief.goal, 'ship the judging step', 'the other override is untouched by the race');
 
   // A brief refresh or collapse must not disturb an active transcript selection.
   await emit(page, 'output', 'selectable transcript text\n');

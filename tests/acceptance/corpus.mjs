@@ -4,8 +4,8 @@
 //   abstentions       = correct unavailable outcomes / the two unanswerable records (target 2/2)
 //   unsupported       = factual clauses not entailed by their cited evidence / all clauses (target 0)
 //
-// This is a fixed synthetic corpus, not customer data and not a production accuracy estimate.
-// It measures the deterministic extractive generator only; the opt-in `claude` CLI generator
+// A fixed synthetic corpus, not customer data and not a production accuracy estimate. It
+// measures the deterministic extractive generator only; the opt-in `claude` CLI generator
 // cannot be measured offline and is reported as unmeasured, never scored from a stub.
 
 import fs from 'node:fs';
@@ -13,7 +13,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   briefGenerator, briefRoutes, briefTmux, fakeTmuxProcess, claudeSession, makeService, tmuxStack,
-  paneStreamProbe, tempDir,
+  paneStreamProbe, tempDir, countingGenerator, paneFor, sleep,
 } from './service-support.mjs';
 
 // The two panes every target case discriminates between: the window the client is streaming,
@@ -24,9 +24,9 @@ const COLON = '> The broad goal is the invoicing service. We are currently fixin
 const leaks = v => /payroll|signing keys/.test(JSON.stringify(v || ''));
 const paneOf = text => `${text}\n\n⏺ working…\n`;
 
-// A clause is supported when the text the generator emitted is literally present in the
-// evidence item it cited. That is a strong check for an extractive generator and a weak one
-// for a model: it proves provenance, not entailment — which is why the CLI path is not scored.
+// A clause is supported when the emitted text is literally present in the evidence item it
+// cited: strong for an extractive generator, weak for a model (provenance, not entailment),
+// which is why the CLI path is not scored.
 function supportCheck(field, items) {
   if (!field) return { supported: false, reason: 'missing' };
   const source = items.find(i => i.id === field.evidenceId);
@@ -115,13 +115,11 @@ export async function evaluateCorpus(corpus, generator = briefGenerator.createEx
   };
 }
 
-// Untrusted input and tmux target resolution, end to end on the delivered modules.
-//
-// First: a pane holding a real user turn AND a tool block that quotes a "> " line — only the
-// real turn is intent, driven through collector -> service -> generator. Then the
-// `session`/`window` query parameters, and then the two halves that have to hold together:
-// a live name carrying `.` or `:` must stay fully usable (compatibility), while no target
-// the delivered code builds may ever be reinterpretable (isolation).
+// Untrusted input and tmux target resolution, end to end on the delivered modules. First a
+// pane holding a real user turn AND a tool block quoting a "> " line — only the real turn is
+// intent, driven through collector -> service -> generator. Then the `session`/`window`
+// query parameters, then the two halves that must hold together: a live name carrying `.`
+// or `:` stays usable (compatibility) while no target built is reinterpretable (isolation).
 export async function targetAndInputChecks({ clock, generator, storeFile }) {
   const checks = [];
   const pane = [
@@ -145,16 +143,13 @@ export async function targetAndInputChecks({ clock, generator, storeFile }) {
   );
 
   // The pane-stream boundary, through the delivered module and the same fake-tmux probe the
-  // announcement checks use — it records every argv tmux was handed and offers an injected
-  // command a file to create if a shell ever evaluates it.
+  // announcement checks use: it records every argv and offers an injected command a file.
   const windows = [['claude', 'claude'], ['two', 'bash'], ['v2.1', 'bash']];
   const attempts = [];
-  // A name that no live session or window answers to is refused. Nothing is "sanitised":
-  // resolution is exact equality against what tmux itself reported, so an unmatched name
-  // simply has nowhere to go.
+  // A name no live session or window answers to is refused. Nothing is "sanitised":
+  // resolution is exact equality against what tmux reported, so it has nowhere to go.
   for (const [label, query] of [
-    ['unknown session', 'session=claude%3Atwo'],
-    ['unknown window', 'session=A&window=claude.1'],
+    ['unknown session', 'session=claude%3Atwo'], ['unknown window', 'session=A&window=claude.1'],
     ['control character', `session=${encodeURIComponent('A\u0000evil')}`],
   ]) {
     const run = paneStreamProbe({ windows, query });
@@ -195,14 +190,12 @@ export async function targetAndInputChecks({ clock, generator, storeFile }) {
   return { checks, report: { attempts, resolution: resolution.report, realTmux: real.report } };
 }
 
-// Compatibility and isolation, which only mean anything together.
-//
-// tmux window names legitimately contain `.` and `:` (verified on tmux 3.6a; session names
-// cannot — tmux rewrites both to `_`). `A:v2.1` is read as window `v2`, pane 1, so a target
-// built out of names reaches somebody else's pane. The fix is not to refuse the name: it is
-// to resolve the name against the live list and then address the resolved window id. So both
-// halves are asserted on one fixture — the dotted window stays fully usable, AND no target
-// the delivered code ever hands tmux is one that could be reinterpreted.
+// Compatibility and isolation, which only mean anything together. tmux window names
+// legitimately contain `.` and `:` (verified on tmux 3.6a; session names cannot — tmux
+// rewrites both to `_`), and `A:v2.1` is read as window `v2`, pane 1, so a name-built
+// target reaches somebody else's pane. The fix is not to refuse the name but to resolve it
+// against the live list and address the resolved window id, so both halves are asserted on
+// one fixture: the dotted window stays usable AND no target is reinterpretable.
 async function targetResolutionChecks({ clock, generator, storeFile }) {
   const out = [];
   const fake = fakeTmuxProcess({
@@ -268,12 +261,10 @@ async function targetResolutionChecks({ clock, generator, storeFile }) {
   return { checks: out, report: { targets: [...new Set(targets)] } };
 }
 
-// The background path, sequenced so it actually exercises tick().
-//
-// A session only gets a runtime entry once a read succeeds, so the session is registered and
-// settled on a plain window first; only then does Claude move to a separator-bearing one.
-// The poll must FOLLOW it — re-resolving to the new window's id — and must still never
-// address a pane by name.
+// The background path, sequenced so it actually exercises tick(). A session only gets a
+// runtime entry once a read succeeds, so it is registered and settled on a plain window
+// first; only then does Claude move to a separator-bearing one. The poll must FOLLOW it,
+// re-resolving to the new window's id, and must still never address a pane by name.
 async function backgroundTargetChecks({ clock, generator, storeFile }) {
   const out = [];
   const start = { sessionId: '$B', createdAt: 1_600_000_500, windows: [
@@ -319,12 +310,11 @@ async function backgroundTargetChecks({ clock, generator, storeFile }) {
 }
 
 // Real tmux, on a PRIVATE socket with disposable sessions, killed on the way out.
-//
-// Everything above runs against a fake process that models tmux target parsing. This proves
-// the model: the installed tmux really does read `S:v2.1` as window `v2` pane 1, really does
+// Everything above runs against a fake that models tmux target parsing; this proves the
+// model. The installed tmux really does read `S:v2.1` as window `v2` pane 1, really does
 // accept `@id`/`$id`, and really does let the delivered resolver, capture, brief, edit and
-// pane-stream work on names carrying `.` and `:`. The user's own tmux server is never
-// contacted — a `-L` socket is a separate server, and nothing here runs without one.
+// pane-stream work on names carrying `.` and `:`. The user's own server is never contacted:
+// a private socket is a separate server, and nothing here runs without one.
 export async function realTmuxChecks({ clock, generator, storeFile }) {
   const out = [];
   let tmuxBin = '';
@@ -459,3 +449,51 @@ export async function realTmuxChecks({ clock, generator, storeFile }) {
   return { checks: out, report };
 }
 
+const waitUntil = async (fn, ms = 4000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if (fn()) return true; await sleep(5); }
+  return false;
+};
+
+// A generation ALREADY RUNNING when a newer edit lands. Two things make this a race rather
+// than the shape of one: the evidence moves to a fixture the fields have not carried
+// (re-submitting the current pane hits the unchanged-fingerprint early return and never
+// starts a job), and the generator is held at an explicit boundary instead of being made
+// slow, so the test observes that generation entered and is STILL PENDING when the edit is
+// saved rather than hoping a sleep was long enough.
+export async function generationRaceChecks({ clock, storeFile, byId }) {
+  const out = [];
+  const fake = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f2)) });
+  const racing = countingGenerator(briefGenerator.createExtractiveGenerator());
+  let service = makeService({ stack: tmuxStack(fake), clock, generator: racing, storeFile });
+  await service.read('A');
+  await service.settle();
+  const seeded = await service.patch('A', { goal: 'edited goal stays put', revision: (await service.read('A')).revision });
+  out.push([seeded.goal, 'edited goal stays put', 'race: a goal override is in place before the race starts']);
+  fake.set('A', claudeSession('A', paneFor(byId.f1)));
+  const enteredBefore = racing.calls;
+  const release = racing.hold();
+  clock.advance(31000);
+  await service.tick();
+  out.push([await waitUntil(() => racing.calls > enteredBefore), true, 'race: the held generation really entered'],
+    [service.jobs.size > 0, true, 'race: and is still pending at the boundary, not already finished']);
+
+  const mid = await service.patch('A', { current: 'saved while the job was mid-flight', revision: (await service.read('A')).revision });
+  out.push([mid.current, 'saved while the job was mid-flight', 'race: the edit is accepted while generation is in flight'],
+    [service.jobs.size > 0, true, 'race: the job was still held at the boundary when the edit was saved']);
+
+  await release();
+  await service.settle();
+  const raced = await service.read('A');
+  out.push(
+    [raced.current, 'saved while the job was mid-flight', 'race: the completing job cannot clobber an edit saved after it started'],
+    [raced.generated.current, byId.f1.expectedCurrent, 'race: but the generated value underneath did complete and update'],
+    [raced.goal, 'edited goal stays put', 'race: the other override is untouched by the race'],
+  );
+
+  service = makeService({ stack: tmuxStack(fake), clock, generator: briefGenerator.createExtractiveGenerator(), storeFile });
+  const restarted = await service.read('A');
+  out.push([restarted.current, 'saved while the job was mid-flight', 'race: the mid-flight edit survives a service restart'],
+    [restarted.generated.current, byId.f1.expectedCurrent, 'race: and so does the generated value that job wrote']);
+  return out;
+}
