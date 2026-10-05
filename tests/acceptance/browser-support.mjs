@@ -20,7 +20,19 @@ export const SOCKET_STUB = () => {
       this.url = url;
       this.readyState = 1;
       window.__sockets.push(this);
-      setTimeout(() => { if (this.onopen) this.onopen({}); }, 0);
+      setTimeout(() => {
+        if (this.onopen) this.onopen({});
+        // pane-stream announces its resolved target as the first message of every connection;
+        // pages that opt in get the same announcement, resolved by the fixture server.
+        if (!window.__autoAnnounce) return;
+        const q = new URL(url, location.href).searchParams;
+        const session = q.get('session');
+        const asked = q.get('window') || '';
+        const announce = info => { if (this.readyState === 1 && this.onmessage) {
+          this.onmessage({ data: JSON.stringify({ type: 'stream-target', ...info }) }); } };
+        if (asked) announce({ session, window: asked });
+        else fetch(`/__control/stream-target?session=${encodeURIComponent(session)}`).then(r => r.json()).then(announce);
+      }, 0);
     }
     send(data) { window.__sent.push(data); }
     close() { this.readyState = 3; }
@@ -402,60 +414,36 @@ export async function emptyWindowBindingCases(ctx, t, deps) {
 // The window string does not change, but the binding does.
 //
 // A client that has not been told its window yet asks the server to find Claude, so while
-// Claude is running in window two an UNBOUND read answers for C:two and an unbound edit is
-// addressed there. Both can still be in flight when the connection announces window:"".
-// Neither may land afterwards: the answers belong to a pane this view is no longer showing.
-// Only an epoch bump on becoming bound stops them, which is why it cannot be conditional on
-// the window string changing.
+// Claude is running in window two, so a server asked to "find Claude" would answer for C:two
+// while the stream shows C's active window. An UNBOUND view therefore asks nothing at all:
+// no read, no edit, nothing to render or save until the connection announces its target.
+// The announcement of window:"" — the same string the client already had — still binds.
 async function inFlightAcrossEmptyBinding(page, t, kind, deps) {
   const { control, readBrief, settleAndRefresh, announceC, F1, F3 } = deps;
   const emptyAnnouncement = { session: 'C', window: '', target: 'C' };
-  // Back to unbound, with Claude in window two so discovery answers for a different pane.
+  // Back to unbound, with Claude in window two so discovery would answer for a different pane.
   await page.evaluate(() => briefView.open('C', ''));
   t.eq(await page.evaluate(() => briefView.bound()), false, `${kind}: a fresh open is not bound yet`);
-  await control(page, 'advance', { ms: 31000 });
-  await settleAndRefresh(page);
-  t.eq((await readBrief(page)).goal, F3.goal, `${kind}: while unbound the server discovers Claude in window two`);
-
   await control(page, 'hold', { session: 'C' });
-  // An unbound GET, then an unbound edit, both captured against C:two and held.
+  await control(page, 'advance', { ms: 31000 });
   await page.evaluate(() => { briefView.refresh(); });
-  await page.waitForTimeout(150);
+  await page.waitForTimeout(3500);   // longer than one poll interval
+  t.eq((await control(page, 'held', { session: 'C' })).count, 0,
+    `${kind}: an unbound view sends no brief request, by refresh or by poll`);
+  const unbound = await page.evaluate(() => ({
+    status: document.getElementById('brief').getAttribute('data-status'),
+    goal: document.getElementById('brief-goal').textContent,
+  }));
+  t.eq(unbound.status, 'loading', `${kind}: an unbound view stays in the loading state`);
+  t.ok(!unbound.goal.includes(F3.goal), `${kind}: an unbound view never shows another pane's text`);
   await page.click('#brief-edit-goal');
-  await page.waitForSelector('#brief-input-goal');
-  await page.fill('#brief-input-goal', 'obsolete save from the unbound view');
-  await page.click('#brief-save-goal');
   await page.waitForTimeout(150);
-  t.ok((await control(page, 'held', { session: 'C' })).count >= 2,
-    `${kind}: an unbound read and an unbound edit are both in flight`);
+  t.ok(await page.evaluate(() => !document.getElementById('brief-input-goal')),
+    `${kind}: an unbound view offers no editor`);
 
-  // The connection announces window:"" — the same string the client already had.
-  // The edit's acknowledgement is still held, so its editor is still open and still holds
-  // the typed text when the connection announces window:"" — the same string the client
-  // already had.
-  t.ok(await page.evaluate(() => !!document.getElementById('brief-input-goal')),
-    `${kind}: the unbound edit is still open while its acknowledgement is held`);
+  await control(page, 'unhold', { session: 'C' });
   await announceC(emptyAnnouncement);
   t.eq(await page.evaluate(() => briefView.bound()), true, `${kind}: the announcement binds even with an unchanged window`);
-  t.ok(await page.evaluate(() => !document.getElementById('brief-input-goal')),
-    `${kind}: rebinding closes the editor that belonged to the other pane`);
-
-  await control(page, 'release', { session: 'C', count: 2 });   // FIFO: the GET then the PATCH
-  await page.waitForTimeout(300);
-  const stale = await page.evaluate(() => ({
-    brief: document.getElementById('brief').textContent,
-    goal: document.getElementById('brief-goal').textContent,
-    note: document.getElementById('brief-status').textContent,
-    editor: !!document.getElementById('brief-input-goal'),
-  }));
-  t.ok(!stale.goal.includes(F3.goal), `${kind}: the released unbound read cannot render the other pane's text`);
-  t.ok(!stale.brief.includes('obsolete save from the unbound view'),
-    `${kind}: the released edit acknowledgement cannot render an obsolete save`);
-  t.ok(!/not saved/i.test(stale.note), `${kind}: no obsolete save failure is reported`);
-  t.eq(stale.editor, false, `${kind}: a stale acknowledgement does not resurrect an editor`);
-
-  await control(page, 'release', { session: 'C' });
-  await control(page, 'unhold', { session: 'C' });
   await settleAndRefresh(page);
   // The streamed pane's own saved edit, made earlier against this exact target, survived
   // the detour through the unbound view.

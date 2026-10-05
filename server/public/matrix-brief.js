@@ -128,7 +128,9 @@
     }
 
     async function load() {
-      if (!session || !fetchImpl) return;
+      // Unbound means the server would pick "wherever Claude is", which may not be the pane the
+      // stream ends up showing; wait for the stream's announcement instead of asking.
+      if (!session || !fetchImpl || !bound) return;
       var id = ++requestId;
       var token = epoch;
       var name = session;
@@ -194,7 +196,7 @@
     }
 
     async function patch(body) {
-      if (!session || !fetchImpl) return null;
+      if (!session || !fetchImpl || !bound) return null;
       var name = session;
       var token = epoch;
       var res = await fetchImpl(briefUrl(name), {
@@ -251,9 +253,10 @@
         epoch += 1;
         session = name;
         windowName = typeof streamedWindow === 'string' ? streamedWindow : '';
-        // A fresh open only knows what the user asked for. Until the new connection
-        // announces its target, an empty window still means "find Claude for me".
-        bound = false;
+        // A window the user picked is the pane the stream will show, so it binds now. An empty
+        // window means "find Claude for me": that stays unbound, and nothing is fetched, until
+        // the new connection announces its target.
+        bound = windowName !== '';
         latest = null;
         appliedId = 0;
         editing = null;

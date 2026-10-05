@@ -290,8 +290,10 @@ export async function isolationAndFailures(ctx, t) {
 
   // ---- A held HTTP response for a session the user has left ---- A's answer is computed now and written
   // only when the test releases it, so this is a genuinely in-flight response, not a simulated one.
+  // The window A's stream resolves to; opening with it binds at once, as an announcement would.
+  const aWin = (await control(page, 'stream-target', { session: 'A' })).window;
   await control(page, 'hold', { session: 'A' });
-  await page.evaluate(() => briefView.open('A', ''));          // request for A: captured, held
+  await page.evaluate(w => briefView.open('A', w), aWin);       // request for A: captured, held
   await page.waitForTimeout(150);
   t.ok((await control(page, 'held', { session: 'A' })).count >= 1, 'A\'s response is genuinely in flight');
   await page.evaluate(() => openTerminal('B'));                 // B answers normally
@@ -307,11 +309,11 @@ export async function isolationAndFailures(ctx, t) {
 
   // ---- A -> B -> A with TWO A answers in flight at once ---- The first one belongs to a superseded open of
   // the same session; releasing it before the current one must change nothing on screen.
-  await page.evaluate(() => briefView.open('A', ''));           // stale request, held
+  await page.evaluate(w => briefView.open('A', w), aWin);       // stale request, held
   await page.waitForTimeout(150);
   await page.evaluate(() => openTerminal('B'));
   await page.waitForTimeout(150);
-  await page.evaluate(() => briefView.open('A', ''));           // current request, held
+  await page.evaluate(w => briefView.open('A', w), aWin);       // current request, held
   await page.waitForTimeout(150);
   const pending = await control(page, 'held', { session: 'A' });
   t.ok(pending.count >= 2, `both A answers are in flight (${pending.count})`);

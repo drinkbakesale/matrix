@@ -308,6 +308,8 @@ export async function setPageClock(page, ms) {
 // reading what is on screen, and asserting the age line. Kept beside the control channel
 // and page clock it drives rather than in any one case file.
 export async function settleAndRefresh(page) {
+  // The view asks nothing until the stream has announced its pane.
+  await page.waitForFunction(() => briefView.bound(), null, { timeout: 5000 });
   await control(page, 'settle');
   await page.evaluate(() => briefView.refresh());
   await page.waitForTimeout(80);
@@ -344,13 +346,13 @@ export async function readBrief(page) {
 
 export async function openClient(ctx, kind, name = 'A') {
   if (kind === 'mobile') {
-    const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'] });
+    const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'], init: [AUTO_ANNOUNCE] });
     await installPageClock(page, ctx.server.clock.now());
     await page.goto(`${ctx.origin}/?open=${encodeURIComponent(name)}`);
     await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
     return { context, page };
   }
-  const { context, page } = await newPage(ctx.browser, { viewport: { width: 1280, height: 860 } });
+  const { context, page } = await newPage(ctx.browser, { viewport: { width: 1280, height: 860 }, init: [AUTO_ANNOUNCE] });
   await installPageClock(page, ctx.server.clock.now());
   await page.goto(`${ctx.origin}/desktop.html`);
   await page.waitForSelector(`.project-item[data-session="${name}"]`);
@@ -358,6 +360,10 @@ export async function openClient(ctx, kind, name = 'A') {
   await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
   return { context, page };
 }
+
+// The brief view waits for the stream's announcement before asking for anything, so brief
+// pages get a socket that announces like pane-stream does (see SOCKET_STUB).
+const AUTO_ANNOUNCE = () => { window.__autoAnnounce = true; };
 
 // Asserts the age line the USER SEES, and proves at the same moment that the assertion can
 // tell the two timestamps apart: it reports what an evidenceAt-reading renderer would have
