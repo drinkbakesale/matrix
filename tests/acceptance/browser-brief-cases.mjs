@@ -94,9 +94,19 @@ export async function pinnedBothClients(ctx, t) {
 
     await emit(page, 'output', Array.from({ length: 200 }, (_, i) => `scroll filler ${i}`).join('\n') + '\n');
     await page.waitForTimeout(100);
+    // The browser CLAMPS scrollTop to scrollHeight - clientHeight, so ASKING for 1.5
+    // viewports is not evidence that 1.5 viewports were travelled: with a short transcript
+    // the request silently becomes a few pixels. Measure what actually moved, in whichever
+    // direction has room — the transcript is normally already following the bottom when the
+    // filler lands, so the room is upwards.
     const layout = await page.evaluate(() => {
       const viewer = document.getElementById('terminal');
-      viewer.scrollTop = viewer.clientHeight * 1.5;
+      const startTop = viewer.scrollTop;
+      const clientHeight = viewer.clientHeight;
+      const maxTop = viewer.scrollHeight - clientHeight;
+      const down = Math.min(maxTop, startTop + clientHeight * 1.5);
+      const up = Math.max(0, startTop - clientHeight * 1.5);
+      viewer.scrollTop = Math.abs(down - startTop) >= Math.abs(startTop - up) ? down : up;
       viewer.dispatchEvent(new Event('scroll'));
       const b = document.getElementById('brief').getBoundingClientRect();
       const v = viewer.getBoundingClientRect();
@@ -108,10 +118,15 @@ export async function pinnedBothClients(ctx, t) {
         copy: { y: copy.y, height: copy.height, bottom: copy.bottom },
         input: { y: input.y, height: input.height },
         innerHeight: window.innerHeight,
+        scroll: { startTop, clientHeight, maxTop, endTop: viewer.scrollTop, moved: Math.abs(viewer.scrollTop - startTop) },
       };
     });
     boxes[kind] = layout;
-    t.ok(layout.viewer.scrollTop > 0, `${kind}: the transcript actually scrolled by more than a viewport`);
+    const { moved, clientHeight, maxTop } = layout.scroll;
+    t.ok(maxTop >= clientHeight,
+      `${kind}: the transcript holds more than one viewport of scrollable content (${Math.round(maxTop)}px of travel, viewport ${Math.round(clientHeight)}px)`);
+    t.ok(moved >= clientHeight,
+      `${kind}: the transcript actually scrolled by at least one viewport (moved ${Math.round(moved)}px, viewport ${Math.round(clientHeight)}px)`);
     t.ok(layout.brief.y >= 0 && layout.brief.bottom <= layout.innerHeight + 1, `${kind}: the brief stays inside the viewport while the transcript scrolls`);
     t.ok(layout.brief.bottom <= layout.viewer.y + 1, `${kind}: the brief is pinned above the transcript, not inside it`);
     t.ok(layout.copy.bottom <= layout.viewer.y + 1 && layout.copy.height > 0, `${kind}: the copy control is visible and does not overlap the transcript`);
