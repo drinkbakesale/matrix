@@ -102,11 +102,39 @@ function extractFields(items) {
   return { goal, current };
 }
 
+// Claude Code's recap is already a two-part statement: "Goal: <purpose>. <where things are>."
+// Its sentences are used verbatim (only trailing punctuation is trimmed), so the literal
+// check still holds; a field longer than the brief allows is cut back to a whole word.
+function clip(sentence) {
+  let text = String(sentence).trim().replace(/[.;,!?]+$/u, '').trim();
+  if (text.length > MAX_FIELD_CHARS) text = text.slice(0, MAX_FIELD_CHARS).replace(/\s+\S*$/u, '');
+  return text || null;
+}
+
+function recapFields(items) {
+  const recap = (Array.isArray(items) ? items : []).find(i => i && i.role === 'recap' && typeof i.text === 'string');
+  if (!recap) return null;
+  const sentences = splitSentences(recap.text);
+  if (!sentences.length) return null;
+  const labelled = /^goal\s*:\s*(.+)$/isu.exec(sentences[0]);
+  const goal = clip(labelled ? labelled[1] : sentences[0]);
+  const current = sentences.length > 1 ? clip(sentences[1]) : null;
+  const field = raw => (raw ? { raw, evidenceId: recap.id } : null);
+  return goal || current ? { goal: field(goal), current: field(current) } : null;
+}
+
 function createExtractiveGenerator() {
   return {
     name: 'extractive',
-    version: '1',
+    version: '2',
     async generate({ items }) {
+      const fromRecap = recapFields(items);
+      if (fromRecap) {
+        const out = {};
+        if (fromRecap.goal) out.goal = { text: fromRecap.goal.raw, evidenceId: 'recap', literal: fromRecap.goal.raw };
+        if (fromRecap.current) out.current = { text: fromRecap.current.raw, evidenceId: 'recap', literal: fromRecap.current.raw };
+        return out;
+      }
       const { goal, current } = extractFields(items);
       if (!goal && !current) {
         return { unavailable: 'no statement of the goal or the current work was found in this session' };

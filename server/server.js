@@ -13,6 +13,7 @@ const paneStream = require('./lib/pane-stream');
 const { listLiveSessions, sweepAttention } = require('./lib/sessions');
 const { createTmux, createSessionResolver, createPaneCapture } = require('./lib/brief-tmux');
 const { createEvidenceCollector } = require('./lib/brief-evidence');
+const { createRecapReader } = require('./lib/brief-recap');
 const { createExtractiveGenerator, createClaudeCliGenerator } = require('./lib/brief-generator');
 const { BriefService, resolveEvidenceInterval } = require('./lib/brief-service');
 const briefRoutes = require('./lib/brief-routes');
@@ -83,7 +84,12 @@ const briefCapture = createPaneCapture({ tmux: briefTmux });
 const briefService = new BriefService({
   storeFile: config.BRIEF_PATH,
   resolveSession: (name, window, options) => briefResolver.resolve(name, window, options),
-  collector: createEvidenceCollector({ capturePane: identity => briefCapture.capture(identity) }),
+  collector: createEvidenceCollector({
+    capturePane: identity => briefCapture.capture(identity),
+    // Claude Code's own "※ recap" for the bound pane, via the hook's session-links record.
+    readRecap: (reader => identity => reader.read(identity))(
+      createRecapReader({ linksDir: path.join(config.MATRIX_HOME, 'session-links') })),
+  }),
   generator,
   literalRequired,
   // Validated, not trusted: MATRIX_BRIEF_INTERVAL_MS may shorten the evidence interval but

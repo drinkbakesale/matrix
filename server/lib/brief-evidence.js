@@ -75,12 +75,17 @@ function userTurns(capture) {
 //
 // `capture` is the recent tail. `earlyCapture`, when supplied, is a slice of the very start
 // of the pane's history; `pane-early` prefers it and falls back to the head of the tail.
-function buildEvidence({ capture, earlyCapture, evidenceAt }) {
+function buildEvidence({ capture, earlyCapture, evidenceAt, recap }) {
   const text = typeof capture === 'string' ? capture : '';
   const earlyText = typeof earlyCapture === 'string' ? earlyCapture : '';
   const turns = userTurns(text);
   const earlyTurns = earlyText ? userTurns(earlyText) : [];
   const items = [];
+  // Claude Code's own recap of the session (goal and where things stand) comes first: it is
+  // the best single statement of both sentences the brief needs.
+  if (recap && typeof recap.text === 'string' && recap.text.trim()) {
+    items.push({ id: 'recap', role: 'recap', text: collapse([recap.text], MAX_FIELD_CHARS) });
+  }
   const earlySource = earlyTurns.length ? earlyTurns.slice(0, 4) : turns.slice(0, 4);
   if (earlySource.length) {
     items.push({ id: 'pane-early', role: 'user', text: collapse(earlySource, MAX_FIELD_CHARS) });
@@ -102,7 +107,7 @@ function buildEvidence({ capture, earlyCapture, evidenceAt }) {
     items: bounded,
     evidenceAt: Number.isFinite(evidenceAt) ? evidenceAt : Date.now(),
     fingerprint: fingerprintItems(bounded),
-    hasUserEvidence: bounded.some(i => i.role === 'user'),
+    hasUserEvidence: bounded.some(i => i.role === 'user' || i.role === 'recap'),
   };
 }
 
@@ -118,7 +123,7 @@ function fingerprintItems(items) {
 // fake-process adapter in tests). It may return a plain string (tail only) or
 // `{ recent, early }` from the two-capture reader. A capture failure propagates: the service
 // records it as an error rather than silently reporting "no evidence".
-function createEvidenceCollector({ capturePane, now = Date.now, maxChars = MAX_EVIDENCE_CHARS }) {
+function createEvidenceCollector({ capturePane, readRecap = null, now = Date.now, maxChars = MAX_EVIDENCE_CHARS }) {
   if (typeof capturePane !== 'function') throw new Error('evidence collector requires capturePane');
   return {
     async collect(identity) {
@@ -128,7 +133,8 @@ function createEvidenceCollector({ capturePane, now = Date.now, maxChars = MAX_E
       const bound = s => (typeof s === 'string' ? s.slice(-maxChars * 4) : '');
       const capture = typeof raw === 'string' ? bound(raw) : bound(raw && raw.recent);
       const earlyCapture = typeof raw === 'string' ? '' : bound(raw && raw.early);
-      return { ...buildEvidence({ capture, earlyCapture, evidenceAt: now() }), target: identity.target };
+      const recap = readRecap ? await readRecap(identity) : null;
+      return { ...buildEvidence({ capture, earlyCapture, evidenceAt: now(), recap }), target: identity.target };
     },
   };
 }
