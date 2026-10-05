@@ -73,6 +73,23 @@ module.exports = (L) => {
     const stages = (sb) => fs.readdirSync(path.join(sb.root, 'tmp')).filter((n) => /^matrix-rm2\./.test(n));
     const sshLog = (sb) => (fs.existsSync(path.join(sb.top, 'ssh.log')) ? fs.readFileSync(path.join(sb.top, 'ssh.log'), 'utf8').split('\n').filter(Boolean) : []);
     const removed = (sb) => sshLog(sb).filter((l) => /\brm -rf\b/.test(l));
+    // Evidence: every installer invocation with its command, exit status, output, the remote commands
+    // it issued (creation, use, deletion), the unrelated path's metadata before and after, and what was
+    // left in /tmp. Written to the case artifacts even when an assertion fails.
+    const evidence = { finding: 'L3-1', invocations: [] };
+    const file = path.join(t.dir, 'staging-ownership.json');
+    const observe = (sb, scenario, cmd, watched, beforeMeta, mark, res) => {
+      const trace = sshLog(sb).slice(mark);
+      evidence.invocations.push({
+        scenario, command: ['rm2-install', ...sb.argv(cmd).slice(1)].map((a) => a.replace(sb.top, '<sandbox>').replace(L.candidate, '<candidate>')), exit_status: res.status, stdout: res.stdout, stderr: res.stderr,
+        ssh_trace: trace, created: trace.filter((l) => /mktemp -d/.test(l)), deleted: trace.filter((l) => /\brm -rf\b/.test(l)),
+        unrelated_path: watched ? path.relative(sb.root, watched) : null, unrelated_before: beforeMeta, unrelated_after: watched && fs.existsSync(watched) ? meta(watched) : null,
+        staging_left_in_tmp: stages(sb),
+      });
+    };
+    const run = (sb, scenario, cmd, watched, beforeMeta, more = {}) => { const mark = sshLog(sb).length; const r = sb.install(cmd, [], more); observe(sb, scenario, cmd, watched, beforeMeta, mark, r); return r; };
+    let deviceToken = '';
+    try {
     const seed = (sb) => {
       const d = path.join(sb.root, 'tmp/matrix-rm2');
       fs.mkdirSync(path.join(d, 'sub'), { recursive: true });
@@ -88,8 +105,9 @@ module.exports = (L) => {
     let before = meta(other);
     const ran = [];
     for (const cmd of ['check', 'install', 'activate', 'stock', 'uninstall']) {
-      const r = sb.install(cmd);
+      const r = run(sb, 'unrelated directory at /tmp/matrix-rm2', cmd, other, before);
       ran.push(`${cmd}=${r.status}`);
+      if (cmd === 'install') deviceToken = JSON.parse(sb.read('home/root/.config/matrix-rm2/config.json')).token;
       assert.ok(cmd === 'check' ? [0, 7].includes(r.status) : r.status === 0, `${cmd} ran (exit ${r.status}): ${r.stderr}`);
       assert.deepEqual(meta(other), before, `${cmd} left the unrelated /tmp/matrix-rm2 exactly as it was (contents, modes, inodes, times)`);
       assert.equal(fs.readFileSync(path.join(sb.root, 'tmp/matrix-rm2-stage.tar'), 'utf8'), 'NOT OURS', `${cmd} left the unrelated tar file alone`);
@@ -105,7 +123,7 @@ module.exports = (L) => {
     fs.symlinkSync(victim, path.join(sb.root, 'tmp/matrix-rm2'));
     before = meta(victim);
     for (const cmd of ['check', 'install']) {
-      const r = sb.install(cmd);
+      const r = run(sb, 'symlink at /tmp/matrix-rm2', cmd, victim, before);
       assert.ok([0, 7].includes(r.status), `${cmd} with a symlink present (exit ${r.status}): ${r.stderr}`);
       assert.deepEqual(meta(victim), before, `${cmd} did not write into or delete the symlink's target`);
       assert.equal(fs.readlinkSync(path.join(sb.root, 'tmp/matrix-rm2')), victim, 'the symlink itself is untouched');
@@ -115,7 +133,7 @@ module.exports = (L) => {
     for (const [what, script] of [['fails', '#!/bin/sh\necho "mktemp: No space left on device" >&2\nexit 1\n'], ['answers with an existing path', '#!/bin/sh\necho "$RM2_ROOT/tmp/matrix-rm2"\n']]) {
       sb = sandbox(); other = seed(sb); before = meta(other);
       fs.writeFileSync(path.join(sb.top, 'bin/mktemp'), script, { mode: 0o755 });
-      const r = sb.install('check');
+      const r = run(sb, `mktemp ${what}`, 'check', other, before);
       assert.notEqual(r.status, 0, `check stops when mktemp ${what}`);
       assert.match(r.stderr, /staging directory|No space left/, 'the reason is stated');
       assert.deepEqual(removed(sb), [], `no delete was issued when mktemp ${what}`);
@@ -124,16 +142,37 @@ module.exports = (L) => {
     }
     // (4) Failure after staging (the transfer breaks): only the directory that was created is removed.
     sb = sandbox(); other = seed(sb); before = meta(other);
-    let r = sb.install('check', [], { FAKE_SCP_MODE: 'fail' });
+    let r = run(sb, 'transfer fails after staging', 'check', other, before, { FAKE_SCP_MODE: 'fail' });
     assert.notEqual(r.status, 0);
     assert.deepEqual([meta(other), stages(sb), removed(sb).length], [before, [], 1], 'after a failed transfer the run removed its one directory and nothing else');
     // (5) Two installers at once work in different directories and each removes only its own.
     sb = sandbox(); other = seed(sb); before = meta(other);
-    const both = await Promise.all([0, 1].map(() => new Promise((resolve) => { const p = L.spawn(process.execPath, sb.argv('check'), { env: sb.env, stdio: 'ignore' }); L.registerProc(p); p.on('exit', resolve); })));
+    const pair = await Promise.all([0, 1].map(() => new Promise((resolve) => {
+      const p = L.spawn(process.execPath, sb.argv('check'), { env: sb.env, stdio: ['ignore', 'pipe', 'pipe'] });
+      L.registerProc(p);
+      const res = { status: null, stdout: '', stderr: '' };
+      p.stdout.on('data', (d) => { res.stdout += d; }); p.stderr.on('data', (d) => { res.stderr += d; });
+      p.on('close', (code) => { res.status = code; resolve(res); });
+    })));
+    // The two runs share one ssh log; each is recorded with its own output and the whole interleaved trace.
+    pair.forEach((res, n) => observe(sb, `concurrent check ${n + 1} of 2`, 'check', other, before, 0, res));
+    const both = pair.map((q) => q.status);
     assert.ok(both.every((c) => [0, 7].includes(c)), `both concurrent checks completed (${both})`);
     const two = removed(sb);
     assert.deepEqual([two.length, new Set(two).size, stages(sb), meta(other)], [2, 2, [], before], 'two distinct staging directories, both removed, the unrelated one untouched');
     t.note(`staging ownership: unrelated /tmp/matrix-rm2 (dir and symlink) unchanged in contents+metadata across ${ran.join(' ')}; mktemp failure / bogus answer → stop with 0 deletes; failed transfer → only its own directory removed; 2 concurrent checks → 2 distinct directories`);
+    } finally {
+      fs.writeFileSync(file, JSON.stringify(evidence, null, 1));
+    }
+    // The evidence was stored and holds the observations (and no device credential).
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const inv = stored.invocations;
+    assert.equal(inv.length, 12, `12 installer invocations recorded (${inv.length})`);
+    assert.ok(inv.every((q) => Number.isInteger(q.exit_status) && typeof q.stdout === 'string' && typeof q.stderr === 'string' && q.command[1] && q.ssh_trace.length >= 1 && q.unrelated_before && q.unrelated_after && Array.isArray(q.staging_left_in_tmp)), 'every record has command, exit status, output, ssh trace, before/after metadata and the cleanup observation');
+    assert.ok(inv.filter((q) => !/^mktemp/.test(q.scenario)).every((q) => q.created.length >= 1 && q.deleted.length >= 1), 'creation and deletion of the staging directory are in each trace');
+    assert.ok(inv.filter((q) => /^concurrent/.test(q.scenario)).every((q) => /Tablet software version/.test(q.stdout)), 'each concurrent run kept its own output');
+    assert.match(deviceToken, /^mx_device_/, 'the installed device credential was read for this check');
+    assert.ok(!/mx_(device|controller|hook)_/.test(fs.readFileSync(file, 'utf8')) && !fs.readFileSync(file, 'utf8').includes(deviceToken), 'no device credential is in the evidence');
   }
 
   const notTmp = (rel) => rel === 'tmp' || rel.startsWith('tmp/') || rel === 'var' || rel.startsWith('var/');
