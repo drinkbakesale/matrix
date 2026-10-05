@@ -244,9 +244,16 @@ function connectWebSocket(session, windowName) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${proto}//${location.host}/?session=${encodeURIComponent(session)}${windowName ? `&window=${encodeURIComponent(windowName)}` : ''}`;
   ws = new WebSocket(wsUrl);
+  const socket = ws;
 
-  // Callbacks from a superseded connection/session are dropped by this token.
-  const token = transcript.epoch();
+  // Callbacks from a superseded connection/session are dropped by this token, and the
+  // epoch is ADVANCED here rather than merely read. Nulling the dead socket's handlers
+  // above does not retire a callback that was already dispatched — that callback holds the
+  // handler function itself, and on an automatic reconnect (which, unlike openTerminal,
+  // never calls clear()) it would otherwise still carry a token equal to this one.
+  // newEpoch() invalidates those tokens WITHOUT touching the DOM, so a protected selection
+  // and its staged data survive the reconnect.
+  const token = transcript.newEpoch();
 
   ws.onopen = () => {
     console.log('[ws] connected to', session);
@@ -283,11 +290,13 @@ function connectWebSocket(session, windowName) {
 
   ws.onclose = () => {
     console.log('[ws] disconnected from', session);
-    if (currentSession === session) {
-      setTimeout(() => {
-        if (currentSession === session) connectWebSocket(session, windowName);
-      }, 1500);
-    }
+    // Only the live connection may schedule a reconnect, and only if it is still live when
+    // the timer fires. A superseded socket closing — or its timer coming due after the user
+    // has already reconnected or switched away — must not open another connection.
+    if (ws !== socket || currentSession !== session) return;
+    setTimeout(() => {
+      if (ws === socket && currentSession === session) connectWebSocket(session, windowName);
+    }, 1500);
   };
 }
 

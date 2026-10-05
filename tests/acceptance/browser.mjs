@@ -10,8 +10,8 @@ import { createRun, parseArgs } from './assertions.mjs';
 import { playwright, saveArtifact } from './browser-support.mjs';
 import { startFixtureServer, exportBase, baseHash } from './browser-server.mjs';
 import { loadCorpus, tempDir, cleanupAll, paneFor, claudeSession } from './service-support.mjs';
-import { mobileStreamSelection, clipboardAndFailure, desktopScrollLifecycle } from './browser-copy-cases.mjs';
-import { copyDiagnosis } from './browser-diagnosis.mjs';
+import { mobileStreamSelection, desktopScrollLifecycle } from './browser-copy-cases.mjs';
+import { copyDiagnosis, clipboardAndFailure } from './browser-diagnosis.mjs';
 import { pinnedBothClients, updatesAndOverrides, isolationAndFailures } from './browser-brief-cases.mjs';
 
 const args = parseArgs(process.argv.slice(2));
@@ -89,6 +89,22 @@ const ASSERTION_AUDIT = {
       weakness: 'a fixed 100px floor on a transcript thousands of px tall',
       now: 'the gap must exceed one viewport height, reported in px',
       control: "matrix-transcript.js resume() forced to following=true and scrollTop=scrollHeight -> '0px above it' and the following-state assertion both fail" },
+    { id: 'A22-1', where: 'Copy::desktop_scroll_lifecycle, superseded connection after a reconnect',
+      weakness: 'no case covered an automatic reconnect at all; both clients read transcript.epoch() without advancing it, so the new connection inherited the dead one\'s token',
+      now: 'after a real reconnect, an already-dispatched old handler delivers output, screen and stream-target, and the dead connection\'s own close timer fires; the transcript, the brief binding and the socket count must all be unchanged',
+      control: "clients reverted to transcript.epoch() with the onclose guards removed -> stale output and screen land, brief rebinds to old-window, socket count 6 -> 7" },
+    { id: 'A22-2', where: 'Copy::desktop_scroll_lifecycle, stale callback across a session switch',
+      weakness: "B's transcript was only inspected after B's own dump and a switch back to A, either of which erases the contamination",
+      now: "asserted immediately after A's captured handler fires, for output AND screen, against a byte-identical before/after snapshot",
+      control: 'desktop token propagation removed -> `actual "STALE A OUTPUT\\n\\nSTALE A SCREEN", expected ""`' },
+    { id: 'A22-3', where: 'Copy::desktop_scroll_lifecycle, bounded staging',
+      weakness: 'overflowed() === true was treated as proof of bounded memory; a controller that raised the flag and kept buffering satisfied it',
+      now: '512 KiB more is pushed after overflow and the retained size must stay at zero, measured through transcript.stagedBytes() and heldCount()',
+      control: 'staging made to keep appending after overflow -> 12 items and 786444 bytes retained' },
+    { id: 'A22-4', where: 'Brief::updates_and_overrides and BriefService::edits_storage_identity, clear one override',
+      weakness: 'the field was cleared while its source evidence was unchanged, so "newest generated value" and "the value the edit replaced" were the same string',
+      now: 'evidence moves f2 -> f3 and generates underneath the visible override before the clear; the restored value must be the f3 one and explicitly not the f2 one',
+      control: 'brief-service frozen so generated.current stops updating while overridden -> both halves fail with `actual "fix inconsistent score normalization"`' },
     { id: 'W7', where: 'Copy::desktop_scroll_lifecycle, mouse drag',
       weakness: 'selected.length > 0, and nothing tied the string to the transcript',
       now: '>=10 characters AND the string must appear in the transcript snapshot',

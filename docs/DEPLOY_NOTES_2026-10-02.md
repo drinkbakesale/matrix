@@ -31,6 +31,17 @@ touched, and no notification was sent. **You deploy.**
   Claude and is streaming the session itself", which is why starting Claude in another
   window no longer drags the brief away from the pane you are reading. Polling, input
   routing and the `output`/`screen` frames are unchanged.
+* **A dropped connection can no longer write to the transcript after it reconnects.** Both
+  clients used to capture the transcript epoch when a socket was made without advancing it
+  (`server/public/app.js`, `server/public/desktop.js`). Opening a session clears the
+  transcript, which does advance it — but an automatic reconnect does not clear, so the new
+  connection inherited the dead one's token. Nulling the old socket's handlers does not help
+  a callback that was already dispatched: it holds the handler function itself. Reproduced
+  on both clients: stale output and a stale screen landed in the live transcript, a stale
+  `stream-target` re-pointed the brief at the old window, and the dead connection's own
+  reconnect timer opened a third socket. The epoch is now advanced per connection and only
+  the live socket may schedule a reconnect. Nothing about the visible stream changes; a
+  flaky connection just stops occasionally showing you the previous connection's text.
 * **The WebSocket stream no longer builds shell commands or name-based tmux targets.**
   `server/lib/pane-stream.js` used to interpolate the `session` and `window` query parameters
   into `tmux …` shell strings; a name containing a quote could run arbitrary commands. Every

@@ -261,6 +261,10 @@
       isProtected: function () { return mode !== 'live'; },
       heldCount: function () { return staged.outputs.length + (staged.snapshot === null ? 0 : 1) + (staged.screen === null ? 0 : 1); },
       overflowed: function () { return staged.overflow; },
+      // How much staged text is actually being held. Diagnostic only, but the bound is the
+      // feature: `overflowed()` alone could be true of a controller that set the flag and
+      // went on buffering, so a test has to be able to measure the retained size.
+      stagedBytes: function () { return staged.bytes; },
 
       clear: function () {
         epoch += 1;

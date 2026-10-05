@@ -91,3 +91,30 @@ test('a screen refresh replaces the live screen block instead of stacking copies
   assert.equal(count(viewer.textContent, 'live two'), 1);
   assert.equal(viewer.querySelectorAll('.msg-screen').length, 1);
 });
+
+// A reconnect does not clear the transcript, so the new connection would inherit the dead
+// one's token unless connectWebSocket ADVANCES the epoch. Nulling the old socket's handlers
+// cannot retire a callback that was already dispatched: it holds the handler itself.
+test('a superseded connection cannot write to the transcript after a reconnect', () => {
+  const { context, viewer, sockets, output, runTimers } = loadStream();
+  context.currentSession = '41';
+  context.connectWebSocket('41');
+  const staleMessage = sockets[0].onmessage;
+  const staleClose = sockets[0].onclose;
+  output(sockets[0], 'old connection line\r\n');
+
+  staleClose();
+  runTimers();
+  output(sockets[1], 'new connection line\r\n');
+  const socketsAfterReconnect = sockets.length;
+
+  staleMessage({ data: JSON.stringify({ type: 'output', data: 'old connection line\r\n' }) });
+  staleMessage({ data: JSON.stringify({ type: 'screen', data: 'old screen text' }) });
+  staleClose();
+  runTimers();
+
+  assert.equal(count(viewer.textContent, 'old connection line'), 0, 'stale output must not land');
+  assert.equal(count(viewer.textContent, 'old screen text'), 0, 'stale screen must not land');
+  assert.equal(count(viewer.textContent, 'new connection line'), 1, 'the live connection keeps its text');
+  assert.equal(sockets.length, socketsAfterReconnect, 'an obsolete close must not open another socket');
+});

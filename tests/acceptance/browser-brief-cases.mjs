@@ -211,11 +211,21 @@ export async function updatesAndOverrides(ctx, t) {
   t.eq(brief.goal, 'ship the judging step', 'edits survive a service restart');
   t.eq(brief.current, 'hand written current work', 'both edits survive a service restart');
 
-  // Clear only the current field.
+  // Clear only the current field. The source evidence is moved to f3 FIRST and allowed to
+  // generate underneath while the override is still on screen, so "restores the NEWEST
+  // generated value" is distinguishable from "restores the value that was there when you
+  // edited" — the two are the same string if the evidence never moves, which would let an
+  // implementation that freezes generated.current while overridden pass.
+  await control(page, 'pane', { session: 'A', pane: ctx.panes.f3 });
+  await control(page, 'advance', { ms: 31000 });
+  await settleAndRefresh(page);
+  brief = await readBrief(page);
+  t.eq(brief.current, 'hand written current work', 'the override still shows while new evidence generates underneath it');
   await page.click('#brief-clear-current');
   await page.waitForTimeout(150);
   brief = await readBrief(page);
-  t.eq(brief.current, F2.current, 'clearing one override restores that field\'s newest generated value');
+  t.eq(brief.current, F3.current, 'clearing one override restores that field\'s NEWEST generated value, not the one the edit replaced');
+  t.ok(brief.current !== F2.current, 'and specifically not the pre-edit value');
   t.eq(brief.goal, 'ship the judging step', 'clearing one override leaves the other edit in place');
 
   // An older job racing a new edit: the edit wins.

@@ -7,16 +7,12 @@
 
 import { TARGET } from './browser-diagnosis.mjs';
 import {
-  newPage, emit, SOCKET_STUB, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
-  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch,
+  newPage, emit, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
+  engineCapabilities, sustainedTouchOnChromium, recordCapabilityBranch,
   assertNativeSelectionSurvives, readRealClipboard,
 } from './browser-support.mjs';
 
 const UNICODE_LINE = 'café 日本語 — copy me exactly\twith a tab';
-// The clipboard oracle, fixed here rather than read back out of `#copy-text`. Reading the
-// expectation from the application's own snapshot is self-referential: a snapshot that
-// silently dropped its first or last line would still "match".
-const COPY_FIXTURE = `first line\n${UNICODE_LINE}\nlast line\n`;
 
 async function openMobile(ctx, { init = [], session = 'A' } = {}) {
   const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'], init });
@@ -95,10 +91,11 @@ export async function mobileStreamSelection(ctx, t) {
   await page.click('#copy-open');
   await page.waitForSelector('#copy-sheet:not([hidden])');
   await page.click('#copy-select-all');
-  const before = await page.evaluate(() => {
+  const read = () => page.evaluate(() => {
     const ta = document.getElementById('copy-text');
     return { value: ta.value, start: ta.selectionStart, end: ta.selectionEnd };
   });
+  const before = await read();
   t.includes(before.value, UNICODE_LINE, 'the snapshot holds the transcript text');
   // Select ALL means all of it: `end > start` would be satisfied by a single character.
   t.eq([before.start, before.end], [0, before.value.length], 'Select all really selected the whole snapshot');
@@ -110,10 +107,8 @@ export async function mobileStreamSelection(ctx, t) {
     if (typeof briefView !== 'undefined' && briefView) await briefView.refresh();
   });
   await page.waitForTimeout(3100);
-  const after = await page.evaluate(() => {
-    const ta = document.getElementById('copy-text');
-    return { value: ta.value, start: ta.selectionStart, end: ta.selectionEnd, status: document.getElementById('transcript-status').textContent };
-  });
+  const after = await read();
+  after.status = await page.textContent('#transcript-status');
   t.eq(after.value, before.value, 'the snapshot text survived 3s of updates, a reconnect and a brief refresh');
   t.eq(after.start, before.start, 'the selection start survived');
   t.eq(after.end, before.end, 'the selection end survived');
@@ -163,137 +158,6 @@ export async function mobileStreamSelection(ctx, t) {
   await context.close();
 }
 
-
-export async function clipboardAndFailure(ctx, t) {
-  const report = { engines: {} };
-  // At least one engine must produce a real, exact clipboard round-trip through the visible
-  // control. "Both engines said Copy failed" is a failing case, not a documented limitation.
-  const roundTrips = [];
-  const subsetRoundTrips = [];
-
-  for (const [engineName, launcher, device] of [
-    ['webkit-mobile', ctx.webkit, ctx.devices['iPhone 13']],
-    ['chromium-desktop', ctx.chromium, null],
-  ]) {
-    const browser = await launcher.launch();
-    try {
-      const contextOpts = device ? { ...device } : { viewport: { width: 1280, height: 860 } };
-      if (engineName.startsWith('chromium')) contextOpts.permissions = ['clipboard-read', 'clipboard-write'];
-      const context = await browser.newContext(contextOpts);
-      await context.addInitScript(SOCKET_STUB);
-      await context.addInitScript(STANDALONE_STUB);
-      const page = await context.newPage();
-      await page.goto(`${ctx.origin}/?open=A`);
-      await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
-      await emit(page, 'output', COPY_FIXTURE);
-      await page.waitForSelector('#terminal .msg');
-
-      const caps = await engineCapabilities(page);
-      await page.click('#copy-open');
-      await page.waitForSelector('#copy-sheet:not([hidden])');
-      // Checked before any copy, so a dropped line fails here rather than lowering the bar.
-      t.eq(await page.inputValue('#copy-text'), COPY_FIXTURE,
-        `${engineName}: the snapshot holds the fixture exactly, first and last line included`);
-      await page.click('#copy-all');
-      await page.waitForTimeout(200);
-      const status = await page.textContent('#copy-status');
-      const state = await page.getAttribute('#copy-sheet', 'data-copy-state');
-      const clip = await readRealClipboard(page, context);
-      report.engines[engineName] = { caps, status, state, clip: { ...clip, text: (clip.text || '').slice(0, 400) }, expectedLength: COPY_FIXTURE.length };
-
-      let clipboardWorks = false;
-      if (state === 'copied') {
-        t.ok(clip.ok, `${engineName}: a copy reported as succeeded is readable back from the real clipboard`);
-        if (clip.ok) {
-          const exact = clip.text === COPY_FIXTURE;
-          t.eq(clip.text, COPY_FIXTURE, `${engineName}: the pasted text is exactly the transcript snapshot`);
-          t.includes(clip.text, UNICODE_LINE, `${engineName}: Unicode and tabs survive the copy`);
-          t.ok(!clip.text.includes('Copy selection') && !clip.text.includes('Project goal'),
-            `${engineName}: no control label or brief text is included`);
-          if (exact) roundTrips.push({ engine: engineName, via: clip.via, chars: clip.text.length });
-          clipboardWorks = exact;
-        }
-      } else {
-        t.includes(status, 'Copy failed', `${engineName}: a copy that did not succeed says so instead of claiming success`);
-      }
-
-      // A NONEMPTY subset, offsets from the fixture literal: Copy selection must deliver
-      // exactly that subset, not the whole snapshot.
-      const subStart = COPY_FIXTURE.indexOf(UNICODE_LINE);
-      await page.evaluate(([s, e]) => {
-        const ta = document.getElementById('copy-text');
-        ta.focus();
-        ta.setSelectionRange(s, e);
-      }, [subStart, subStart + UNICODE_LINE.length]);
-      await page.click('#copy-selection');
-      await page.waitForTimeout(200);
-      const subState = await page.getAttribute('#copy-sheet', 'data-copy-state');
-      const subClip = subState === 'copied' ? await readRealClipboard(page, context) : null;
-      // An engine whose clipboard just carried the whole snapshot has no excuse for failing
-      // the subset, so a selection-only failure cannot hide behind the documented branch.
-      if (clipboardWorks) {
-        t.eq(subState, 'copied', `${engineName}: Copy selection succeeds on an engine whose Copy all just succeeded`);
-        t.ok(subClip && subClip.ok, `${engineName}: the selection copy is readable back from the real clipboard`);
-        t.eq(subClip && subClip.text, UNICODE_LINE, `${engineName}: Copy selection delivers exactly the selected subset`);
-        t.ok(subClip && !String(subClip.text).includes('first line') && !String(subClip.text).includes('last line'),
-          `${engineName}: Copy selection does not drag in unselected lines`);
-        if (subClip && subClip.ok && subClip.text === UNICODE_LINE) {
-          subsetRoundTrips.push({ engine: engineName, via: subClip.via, chars: subClip.text.length });
-        }
-      } else {
-        t.includes(await page.textContent('#copy-status'), 'Copy failed',
-          `${engineName}: with no working clipboard at all, the selection copy says so instead of claiming success`);
-      }
-
-      // Empty selection must not copy anything else.
-      await page.evaluate(() => { const ta = document.getElementById('copy-text'); ta.setSelectionRange(0, 0); });
-      await page.click('#copy-selection');
-      const emptyStatus = await page.textContent('#copy-status');
-      t.includes(emptyStatus, 'Nothing selected', `${engineName}: an empty selection refuses to copy unrelated text`);
-      t.eq(await page.getAttribute('#copy-sheet', 'data-copy-state'), 'error', `${engineName}: the refusal is an error state`);
-      t.eq(caps.standalone, true, `${engineName}: the programmatic standalone display-mode branch was exercised`);
-      await context.close();
-
-      // A denied / unavailable clipboard must fail visibly, keeping the snapshot.
-      const denied = await browser.newContext(contextOpts);
-      await denied.addInitScript(SOCKET_STUB);
-      await denied.addInitScript(() => {
-        Object.defineProperty(navigator, 'clipboard', {
-          configurable: true,
-          value: { writeText: () => Promise.reject(new DOMException('NotAllowedError: write permission denied')) },
-        });
-        document.execCommand = () => false;
-      });
-      const dpage = await denied.newPage();
-      await dpage.goto(`${ctx.origin}/?open=A`);
-      await dpage.waitForFunction(() => window.__sockets.some(s => s.onmessage));
-      await emit(dpage, 'output', `first line\n${UNICODE_LINE}\n`);
-      await dpage.click('#copy-open');
-      await dpage.click('#copy-all');
-      await dpage.waitForTimeout(150);
-      const deniedStatus = await dpage.textContent('#copy-status');
-      t.eq(await dpage.getAttribute('#copy-sheet', 'data-copy-state'), 'error', `${engineName}: a denied clipboard is an error, never a success`);
-      t.includes(deniedStatus, 'Copy failed', `${engineName}: the denial message is actionable`);
-      t.includes(deniedStatus, 'system Copy menu', `${engineName}: the user is told what to do instead`);
-      t.includes(await dpage.inputValue('#copy-text'), UNICODE_LINE, `${engineName}: the snapshot is retained after a failed copy`);
-      await denied.close();
-    } finally {
-      await browser.close();
-    }
-  }
-  report.limitation = 'A programmatic standalone display-mode is not an installed iOS PWA; no SpringBoard callout or OS share sheet is exercised here.';
-  report.successfulRoundTrips = roundTrips;
-  report.successfulSubsetRoundTrips = subsetRoundTrips;
-  saveArtifact(ctx.artifactDir, 'clipboard-evidence.json', report);
-  // The whole point of the case: somewhere, the visible control really did put the exact
-  // transcript text on the real system clipboard.
-  t.ok(roundTrips.length >= 1,
-    `at least one engine completed an exact clipboard round-trip through the visible control (got ${JSON.stringify(roundTrips)})`);
-  // Copy selection is its own path and needs its own real round-trip, not Copy all's.
-  t.ok(subsetRoundTrips.length >= 1,
-    `at least one engine completed an exact clipboard round-trip for a nonempty selected subset (got ${JSON.stringify(subsetRoundTrips)})`);
-  t.note('clipboard', { engines: report.engines, roundTrips, subsetRoundTrips });
-}
 
 export async function desktopScrollLifecycle(ctx, t) {
   const { context, page } = await newPage(ctx.browser, { viewport: { width: 1280, height: 800 } });
@@ -422,7 +286,18 @@ export async function desktopScrollLifecycle(ctx, t) {
   });
   t.eq(detached, true, 'switching projects detaches the previous socket handlers');
   await page.waitForTimeout(100);
-  await page.evaluate(() => window.__staleHandler({ data: JSON.stringify({ type: 'output', data: 'STALE A OUTPUT\n' }) }));
+  // Asserted IMMEDIATELY after A's captured callbacks fire, before B's own dump or a switch
+  // back to A can overwrite the contamination: either of those would erase the evidence and
+  // let a client with no token propagation pass this case.
+  const contamination = await page.evaluate(() => {
+    const before = transcript.snapshotText();
+    window.__staleHandler({ data: JSON.stringify({ type: 'output', data: 'STALE A OUTPUT\n' }) });
+    window.__staleHandler({ data: JSON.stringify({ type: 'screen', data: 'STALE A SCREEN\n' }) });
+    return { before, after: transcript.snapshotText() };
+  });
+  t.ok(!contamination.after.includes('STALE A OUTPUT'), 'session A stale output never reaches B\'s transcript');
+  t.ok(!contamination.after.includes('STALE A SCREEN'), 'session A stale screen never reaches B\'s transcript');
+  t.eq(contamination.after, contamination.before, 'B\'s transcript is byte-identical after A\'s callbacks fire');
   await emit(page, 'output', 'session B dump\n');
   await page.evaluate(() => selectProject('A'));
   await page.waitForTimeout(100);
@@ -434,6 +309,39 @@ export async function desktopScrollLifecycle(ctx, t) {
   t.eq(afterSwitch.split('reconnect dump line').length - 1, 1, 'a reconnect replaces the dump instead of duplicating it');
   t.ok(!afterSwitch.includes('STALE A OUTPUT'), 'a stale callback never lands on another session');
   t.ok(!afterSwitch.includes('session B dump'), 'session B text is gone after switching back to A');
+
+  // The same hazard across an automatic RECONNECT, which — unlike a session switch — never
+  // clears the transcript, so the new connection would inherit the dead one's token unless
+  // the client advances the epoch. Callbacks already dispatched hold the handler itself, so
+  // nulling the dead socket's properties cannot retire them.
+  const reconnectStale = await page.evaluate(async () => {
+    const dying = window.__sockets.at(-1);
+    const handler = dying.onmessage;
+    const close = dying.onclose;
+    close({});
+    await new Promise(r => setTimeout(r, 1700));
+    const fresh = window.__sockets.at(-1);
+    fresh.onmessage({ data: JSON.stringify({ type: 'output', data: 'NEW CONNECTION SNAPSHOT\n' }) });
+    fresh.onmessage({ data: JSON.stringify({ type: 'stream-target', session: 'A', window: 'new-window' }) });
+    const afterNew = { text: transcript.snapshotText(), window: briefView ? briefView.window() : null };
+    const socketsBefore = window.__sockets.length;
+    handler({ data: JSON.stringify({ type: 'output', data: 'OLD CONNECTION OUTPUT\n' }) });
+    handler({ data: JSON.stringify({ type: 'screen', data: 'OLD CONNECTION SCREEN\n' }) });
+    handler({ data: JSON.stringify({ type: 'stream-target', session: 'A', window: 'old-window' }) });
+    close({});
+    await new Promise(r => setTimeout(r, 1800));
+    return {
+      afterNew, text: transcript.snapshotText(),
+      window: briefView ? briefView.window() : null,
+      socketsBefore, socketsAfter: window.__sockets.length,
+    };
+  });
+  t.includes(reconnectStale.afterNew.text, 'NEW CONNECTION SNAPSHOT', 'the reconnect delivered its own snapshot');
+  t.ok(!reconnectStale.text.includes('OLD CONNECTION OUTPUT'), 'a superseded connection\'s output never lands after a reconnect');
+  t.ok(!reconnectStale.text.includes('OLD CONNECTION SCREEN'), 'a superseded connection\'s screen never lands after a reconnect');
+  t.includes(reconnectStale.text, 'NEW CONNECTION SNAPSHOT', 'the new connection\'s snapshot is still what is shown');
+  t.eq(reconnectStale.window, reconnectStale.afterNew.window, 'a superseded stream-target never re-points the brief');
+  t.eq(reconnectStale.socketsAfter, reconnectStale.socketsBefore, 'an obsolete reconnect timer does not open another connection');
 
   // Bounded buffer: overflow keeps the snapshot and asks for a fresh one on resume.
   await page.click('#copy-open');
@@ -452,6 +360,22 @@ export async function desktopScrollLifecycle(ctx, t) {
   t.eq(overflow.overflowed, true, 'the staged buffer is bounded');
   t.eq(overflow.snapshot, frozen, 'the stable snapshot the user is reading is kept');
   t.includes(overflow.status, 'fresh snapshot', 'the user is told a fresh snapshot is needed');
+  // Bounded memory is MEASURED, not inferred from the flag: a controller that raised
+  // overflowed() and went on buffering would satisfy the flag alone. Keep pushing payloads
+  // at it and require the retained size to stay at zero.
+  await page.evaluate(() => {
+    const s = window.__sockets.at(-1);
+    const blob = 'y'.repeat(64 * 1024) + '\n';
+    for (let i = 0; i < 8; i += 1) s.onmessage({ data: JSON.stringify({ type: 'output', data: blob }) });
+  });
+  const retained = await page.evaluate(() => ({
+    bytes: transcript.stagedBytes(), held: transcript.heldCount(), overflowed: transcript.overflowed(),
+    snapshot: document.getElementById('copy-text').value,
+  }));
+  t.eq(retained.overflowed, true, 'the overflow state persists through further traffic');
+  t.eq(retained.held, 0, `no further payload is held after overflow (${retained.held} items)`);
+  t.eq(retained.bytes, 0, `the staged buffer retains no bytes after overflow (${retained.bytes} bytes from 512 KiB pushed at it)`);
+  t.eq(retained.snapshot, frozen, 'the stable snapshot survives the post-overflow traffic too');
   const socketsBefore = await page.evaluate(() => window.__sockets.length);
   await page.click('#copy-resume');
   await page.waitForTimeout(150);

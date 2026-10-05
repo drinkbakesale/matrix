@@ -70,7 +70,12 @@ function connectWS(session) {
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/?session=${encodeURIComponent(session)}`);
-  const token = transcript.epoch();
+  const socket = ws;
+  // ADVANCED, not merely read: nulling the dead socket's handlers above does not retire a
+  // callback that was already dispatched, and an automatic reconnect never calls clear(),
+  // so without this the new connection would share the old one's token. newEpoch() leaves
+  // the DOM and any staged/protected state alone.
+  const token = transcript.newEpoch();
 
   ws.onopen = () => { ws.send(JSON.stringify({ type: 'resize', cols: 120, rows: 40 })); };
 
@@ -99,9 +104,10 @@ function connectWS(session) {
   };
 
   ws.onclose = () => {
-    if (currentSession === session) {
-      setTimeout(() => { if (currentSession === session) connectWS(session); }, 1500);
-    }
+    // Only the live connection may schedule a reconnect, and only if it is still live when
+    // the timer fires.
+    if (ws !== socket || currentSession !== session) return;
+    setTimeout(() => { if (ws === socket && currentSession === session) connectWS(session); }, 1500);
   };
 }
 

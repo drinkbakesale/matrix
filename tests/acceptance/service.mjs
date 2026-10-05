@@ -47,7 +47,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   // Opening never waits for generation.
   const release = gen.hold();
   const started = Date.now();
-  const first = await service.read('A');
+  const first = await service.read('A');   // never waits for the held generator
   t.ok(Date.now() - started < 120, 'GET returns without waiting for a held generator');
   t.eq(first.status, 'generating', 'an unseen session reports generating, not filler');
   release();
@@ -57,15 +57,14 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   const captures = fake.callsFor('capture-pane');
   t.ok(captures.length > 0, 'the pane was actually captured through the process boundary');
   t.ok(captures.every(c => c.args[c.args.indexOf('-t') + 1] === fake.windowId('A', 'claude')), 'only session A\'s streamed pane was captured');
-  const a1 = await service.read('A');
+  const a1 = await service.read('A');   // warm read, nothing re-generated
   t.eq(a1.goal, byId.f1.expectedGoal, 'goal comes from A\'s pane');
   t.eq(a1.current, byId.f1.expectedCurrent, 'current work comes from A\'s pane');
   t.eq(a1.session.target, fake.windowId('A', 'claude'), 'the brief is bound to that pane\'s resolved window id');
   t.ok(!JSON.stringify(a1).includes('misleading-payments'), 'the project label never leaks into the brief');
 
   // The streamed window wins over the tmux-active window.
-  await service.read('S');
-  await service.settle();
+  await service.read('S'); await service.settle();
   const s1 = await service.read('S');
   t.eq(s1.session.target, fake.windowId('S', 'claude'), 'resolution picks the Claude window, matching the stream');
   t.eq(s1.current, byId.f2.expectedCurrent, 'the brief describes the Claude window, not the active shell');
@@ -100,8 +99,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   // This window was last looked at moments ago, so the evidence interval is still holding
   // it off; let it elapse and the moved-to window generates from its own pane.
   clock.advance(31000);
-  await service.tick();
-  await service.settle();
+  await service.tick(); await service.settle();
   const settledAfterMove = await service.read('S');
   t.eq(settledAfterMove.goal, byId.f3.expectedGoal, 'the moved-to window generates from its own pane');
   t.eq(settledAfterMove.session.target, fake.windowId('S', 'shell'), 'generation stays bound to the moved-to window');
@@ -124,15 +122,13 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   const binding = await streamBindingChecks({
     clock, generator: extractive(), storeFile: store(),
     activePane: paneFor(byId.f1), otherPane: paneFor(byId.f3),
-    expect: { activeGoal: byId.f1.expectedGoal, otherGoal: byId.f3.expectedGoal },
-  });
+    expect: { activeGoal: byId.f1.expectedGoal, otherGoal: byId.f3.expectedGoal } });
   const targets = await targetAndInputChecks({ clock: fakeClock(), generator: extractive(), storeFile: store() });
   for (const [actual, expected, detail] of [...binding.checks, ...targets.checks]) t.eq(actual, expected, detail);
   t.note('streamBinding', { ...binding.report, targetsAndInput: targets.report });
 
   // Same project, different session: no cross-contamination.
-  await service.read('B');
-  await service.settle();
+  await service.read('B'); await service.settle();
   const b1 = await service.read('B');
   t.eq(b1.goal, byId.f3.expectedGoal, 'session B gets its own goal');
   t.ok(!String(b1.current).includes('judging'), 'B never shows A\'s work');
@@ -147,8 +143,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   // Changed work refreshes inside one evidence interval.
   fake.set('A', claudeSession('A', paneFor(byId.f2)));
   clock.advance(31000);
-  await service.tick();
-  await service.settle();
+  await service.tick(); await service.settle();
   const a2 = await service.read('A');
   t.eq(a2.current, byId.f2.expectedCurrent, 'changed work refreshes after one evidence interval');
   t.eq(a2.goal, byId.f2.expectedGoal, 'the broad goal survives the refresh');
@@ -159,8 +154,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
     '> We are now fixing inconsistent score normalization.', ''].join('\n');
   fake.set('A', claudeSession('A', longPane));
   clock.advance(31000);
-  await service.tick();
-  await service.settle();
+  await service.tick(); await service.settle();
   const a3 = await service.read('A');
   t.eq(a3.current, byId.f2.expectedCurrent, 'current work tracks the newest turn after the goal scrolled away');
   t.eq(a3.goal, byId.f1.expectedGoal, 'the broad goal is retained once the opening turn leaves the tail window');
@@ -396,8 +390,7 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   const fake = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f1)) });
   let service = makeService({ stack: tmuxStack(fake), clock, generator: countingGenerator(extractive()), storeFile });
 
-  await service.read('A');
-  await service.settle();
+  await service.read('A'); await service.settle();
   let brief = await service.read('A');
 
   // A valid edit wins over the generated value and survives further generation.
@@ -406,17 +399,25 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   t.eq(brief.overrides.current, null, 'the other field keeps no override');
   fake.set('A', claudeSession('A', paneFor(byId.f2)));
   clock.advance(31000);
-  await service.tick();
-  await service.settle();
+  await service.tick(); await service.settle();
   brief = await service.read('A');
   t.eq(brief.goal, 'ship the new judge', 'a later generation cannot clobber an edit');
   t.eq(brief.current, byId.f2.expectedCurrent, 'the un-edited field still refreshes');
 
-  // Edit the second field, then clear only that one.
+  // Edit the second field, move its SOURCE EVIDENCE on, let generation complete underneath
+  // the override, and only then clear: clearing straight after editing restores the same
+  // string that was already there, which a frozen-while-overridden implementation also does.
   brief = await service.patch('A', { current: 'hand-written note', revision: brief.revision });
   t.eq(brief.current, 'hand-written note', 'the second field can be edited separately');
+  fake.set('A', claudeSession('A', paneFor(byId.f3)));
+  clock.advance(31000);
+  await service.tick(); await service.settle();
+  brief = await service.read('A');
+  t.eq(brief.current, 'hand-written note', 'the override still holds while newer evidence generates underneath');
+  t.eq(brief.generated.current, byId.f3.expectedCurrent, 'the generated value underneath did move on');
   brief = await service.patch('A', { current: null, revision: brief.revision });
-  t.eq(brief.current, byId.f2.expectedCurrent, 'clearing restores the newest generated value');
+  t.eq(brief.current, byId.f3.expectedCurrent, 'clearing restores the NEWEST generated value, not the pre-edit one');
+  t.ok(brief.current !== byId.f2.expectedCurrent, 'and specifically not the value the edit replaced');
   t.eq(brief.goal, 'ship the new judge', 'clearing one field leaves the other edit alone');
 
   // Invalid input is refused without changing anything.
@@ -470,8 +471,7 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   // Generation for the reborn session also goes through the same revalidating resolver.
   await service.settle();
   clock.advance(31000);
-  await service.tick();
-  await service.settle();
+  await service.tick(); await service.settle();
   const regenerated = await service.read('A');
   t.eq(regenerated.goal, byId.f3.expectedGoal, 'the reborn session generates from its own pane');
   t.ok(!String(regenerated.goal).includes('judge'), 'no text from the dead incarnation survives generation');
