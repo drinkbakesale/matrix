@@ -13,7 +13,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   briefGenerator, briefRoutes, briefTmux, fakeTmuxProcess, claudeSession, makeService, tmuxStack,
-  paneStreamProbe, tempDir, countingGenerator, paneFor, sleep,
+  paneStreamProbe, tempDir, paneFor,
 } from './service-support.mjs';
 
 // The two panes every target case discriminates between: the window the client is streaming,
@@ -56,13 +56,21 @@ export async function evaluateCorpus(corpus, generator = briefGenerator.createEx
       }
     })();
 
-    const goalText = raw.goal ? raw.goal.text : null;
-    const currentText = raw.current ? raw.current.text : null;
+    // Scored on what the service would ACTUALLY use — validateBriefOutput's ACCEPTED
+    // output — not on the generator's raw return. Scoring the raw fields made the metric
+    // independent of validation: with validation rejecting every output the corpus still
+    // reported 6/6 useful summaries and 0/12 unsupported clauses.
+    const accepted = validated.status === 'ok' ? validated : { goal: null, current: null };
+    const goalText = accepted.goal ? accepted.goal.text : null;
+    const currentText = accepted.current ? accepted.current.text : null;
     const produced = [goalText, currentText].filter(Boolean);
     const joined = produced.join(' ‖ ').toLowerCase();
     const forbiddenHits = (fixture.forbidden || []).filter(f => joined.includes(String(f).toLowerCase()));
-    const goalSupport = supportCheck(raw.goal, items);
-    const currentSupport = supportCheck(raw.current, items);
+    // Provenance stays on the RAW field, because the literal is the provenance anchor and
+    // checkField strips it from the accepted value; asking whether the summary TEXT is
+    // verbatim in the evidence is a different question the generator never promised.
+    const goalSupport = supportCheck(accepted.goal && raw.goal, items);
+    const currentSupport = supportCheck(accepted.current && raw.current, items);
 
     for (const [field, support] of [['goal', goalSupport], ['current', currentSupport]]) {
       if ((field === 'goal' ? goalText : currentText) === null) continue;
@@ -78,7 +86,8 @@ export async function evaluateCorpus(corpus, generator = briefGenerator.createEx
       answerable += 1;
       const goalOk = goalText !== null && goalSupport.supported && goalText === fixture.expectedGoal;
       const currentOk = currentText !== null && currentSupport.supported && currentText === fixture.expectedCurrent;
-      if (goalOk && currentOk && forbiddenHits.length === 0) useful += 1;
+      // An output the validator refused is not a useful summary, whatever it said.
+      if (validated.status === 'ok' && goalOk && currentOk && forbiddenHits.length === 0) useful += 1;
     }
 
     records.push({
@@ -88,6 +97,8 @@ export async function evaluateCorpus(corpus, generator = briefGenerator.createEx
       evidenceIds: items.map(i => `${i.id}:${i.role}`),
       rawOutput: raw,
       validated,
+      acceptedGoal: goalText,
+      acceptedCurrent: currentText,
       goal: goalText,
       current: currentText,
       expectedGoal: fixture.expectedGoal || null,
@@ -447,53 +458,4 @@ export async function realTmuxChecks({ clock, generator, storeFile }) {
     try { tm('kill-server'); } catch { /* the server is gone either way */ }
   }
   return { checks: out, report };
-}
-
-const waitUntil = async (fn, ms = 4000) => {
-  const end = Date.now() + ms;
-  while (Date.now() < end) { if (fn()) return true; await sleep(5); }
-  return false;
-};
-
-// A generation ALREADY RUNNING when a newer edit lands. Two things make this a race rather
-// than the shape of one: the evidence moves to a fixture the fields have not carried
-// (re-submitting the current pane hits the unchanged-fingerprint early return and never
-// starts a job), and the generator is held at an explicit boundary instead of being made
-// slow, so the test observes that generation entered and is STILL PENDING when the edit is
-// saved rather than hoping a sleep was long enough.
-export async function generationRaceChecks({ clock, storeFile, byId }) {
-  const out = [];
-  const fake = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f2)) });
-  const racing = countingGenerator(briefGenerator.createExtractiveGenerator());
-  let service = makeService({ stack: tmuxStack(fake), clock, generator: racing, storeFile });
-  await service.read('A');
-  await service.settle();
-  const seeded = await service.patch('A', { goal: 'edited goal stays put', revision: (await service.read('A')).revision });
-  out.push([seeded.goal, 'edited goal stays put', 'race: a goal override is in place before the race starts']);
-  fake.set('A', claudeSession('A', paneFor(byId.f1)));
-  const enteredBefore = racing.calls;
-  const release = racing.hold();
-  clock.advance(31000);
-  await service.tick();
-  out.push([await waitUntil(() => racing.calls > enteredBefore), true, 'race: the held generation really entered'],
-    [service.jobs.size > 0, true, 'race: and is still pending at the boundary, not already finished']);
-
-  const mid = await service.patch('A', { current: 'saved while the job was mid-flight', revision: (await service.read('A')).revision });
-  out.push([mid.current, 'saved while the job was mid-flight', 'race: the edit is accepted while generation is in flight'],
-    [service.jobs.size > 0, true, 'race: the job was still held at the boundary when the edit was saved']);
-
-  await release();
-  await service.settle();
-  const raced = await service.read('A');
-  out.push(
-    [raced.current, 'saved while the job was mid-flight', 'race: the completing job cannot clobber an edit saved after it started'],
-    [raced.generated.current, byId.f1.expectedCurrent, 'race: but the generated value underneath did complete and update'],
-    [raced.goal, 'edited goal stays put', 'race: the other override is untouched by the race'],
-  );
-
-  service = makeService({ stack: tmuxStack(fake), clock, generator: briefGenerator.createExtractiveGenerator(), storeFile });
-  const restarted = await service.read('A');
-  out.push([restarted.current, 'saved while the job was mid-flight', 'race: the mid-flight edit survives a service restart'],
-    [restarted.generated.current, byId.f1.expectedCurrent, 'race: and so does the generated value that job wrote']);
-  return out;
 }

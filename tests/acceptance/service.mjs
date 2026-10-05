@@ -12,8 +12,9 @@ import {
   briefGenerator, briefRoutes, briefTmux, briefServiceMod, tempDir, cleanupAll, fakeClock,
   fakeTmuxProcess, claudeSession, shellActiveSession, paneFor, tmuxStack, makeService,
   countingGenerator, fakeCli, loadCorpus, sleep, streamBindingChecks, evidenceIntervalChecks,
+  aggregateEvidenceChecks, atomicPersistenceChecks, timestampChecks, generationRaceChecks,
 } from './service-support.mjs';
-import { evaluateCorpus, targetAndInputChecks, generationRaceChecks } from './corpus.mjs';
+import { evaluateCorpus, targetAndInputChecks } from './corpus.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 const oracleDir = args.oracle;
@@ -50,8 +51,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   const first = await service.read('A');   // never waits for the held generator
   t.ok(Date.now() - started < 120, 'GET returns without waiting for a held generator');
   t.eq(first.status, 'generating', 'an unseen session reports generating, not filler');
-  release();
-  await service.settle();
+  release(); await service.settle();
 
   // Exact-pane evidence only: every capture names session A's own Claude window.
   const captures = fake.callsFor('capture-pane');
@@ -136,8 +136,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
   // Unchanged evidence does not re-run the generator; coalesced reads do not either.
   const callsAfterFirst = gen.calls;
   clock.advance(31000);
-  await Promise.all([0, 1, 2, 3, 4].map(() => service.read('A')));
-  await service.settle();
+  await Promise.all([0, 1, 2, 3, 4].map(() => service.read('A'))); await service.settle();
   t.eq(gen.calls, callsAfterFirst, 'unchanged evidence reuses the cache and coalesces reads');
 
   // Changed work refreshes inside one evidence interval.
@@ -162,8 +161,7 @@ await run.runCase('BriefService::evidence_and_cache', async (t) => {
 
   // Empty and unusable evidence abstain instead of inventing.
   for (const name of ['D', 'E']) {
-    await service.read(name);
-    await service.settle();
+    await service.read(name); await service.settle();
     const brief = await service.read(name);
     t.eq(brief.goal, null, `${name} invents no goal`);
     t.eq(brief.status, 'unavailable', `${name} reports unavailable`);
@@ -276,10 +274,14 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
   const failing = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f1)) });
   const svc = makeService({ stack: tmuxStack(failing), clock, generator: extractive(), storeFile: store() });
   failing.behaviour.fail.add('capture-pane');
-  await svc.read('A');
-  await svc.settle();
+  await svc.read('A'); await svc.settle();
   const captureFail = await svc.read('A');
   t.eq(captureFail.status, 'error', 'a capture failure is reported as an error, not as unavailable');
+
+  // The AGGREGATE evidence bound, measured on the collector's output and on what the CLI
+  // adapter actually writes to stdin — not on the exported constants.
+  for (const [a, e, d] of await aggregateEvidenceChecks({
+    dir: tempDir(), execFile: (await import('node:child_process')).execFile })) t.eq(a, e, d);
 
   // ---- the generator process boundary ----
   const cli = fakeCli(dir, { stdout: good });
@@ -364,16 +366,10 @@ await run.runCase('BriefService::generation_boundary', async (t) => {
     'a reference to evidence that was not supplied is rejected');
   reject({ goal: { text: 'x'.repeat(600), evidenceId: 'c1' } }, 'an over-long field is rejected');
 
-  // Evidence itself is bounded before it ever reaches a generator.
-  const bounded = briefTmux && (await import('node:module')).createRequire(import.meta.url)(
-    path.join(import.meta.dirname, '..', '..', 'server', 'lib', 'brief-evidence.js'))
-    .buildEvidence({ capture: `> ${'x'.repeat(200000)}\n`, evidenceAt: 1 });
-  t.ok(bounded.items.every(i => i.text.length <= 8 * 1024), 'evidence items are capped');
-
-  // The deterministic extractor meets the same semantics without any CLI.
-  const report = await evaluateCorpus(corpus);
-  t.eq(report.metrics.usefulSummaries, '6/6', 'extractive generator produces six supported summaries');
+  const report = await evaluateCorpus(corpus);   // the extractor, same semantics, no CLI
+  t.eq(report.metrics.usefulSummaries, '6/6', 'extractive generator produces six ACCEPTED supported summaries');
   t.eq(report.metrics.abstentions, '2/2', 'extractive generator abstains on both unanswerable records');
+  t.ok(report.records.filter(r => !r.expectedUnavailable).every(r => r.validated.status === 'ok'), 'every answerable record was ACCEPTED by the delivered validator, not merely emitted');
   t.eq(report.metrics.unsupportedClauses.split('/')[0], '0', 'no clause is unsupported by its cited evidence');
   t.ok(report.records.every(r => r.forbiddenHits.length === 0), 'no forbidden claim appears in any output');
   fs.mkdirSync(artifactDir, { recursive: true });
@@ -393,7 +389,7 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   await service.read('A'); await service.settle();
   let brief = await service.read('A');
 
-  // A valid edit wins over the generated value and survives further generation.
+  // A valid edit wins and survives further generation.
   brief = await service.patch('A', { goal: 'ship the new judge', revision: brief.revision });
   t.eq(brief.goal, 'ship the new judge', 'the edit becomes the effective goal');
   t.eq(brief.overrides.current, null, 'the other field keeps no override');
@@ -405,8 +401,8 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   t.eq(brief.current, byId.f2.expectedCurrent, 'the un-edited field still refreshes');
 
   // Edit the second field, move its SOURCE EVIDENCE on, let generation complete underneath
-  // the override, and only then clear: clearing straight after editing restores the same
-  // string that was already there, which a frozen-while-overridden implementation also does.
+  // the override, then clear: clearing straight after editing restores the same string that
+  // was already there, which a frozen-while-overridden implementation also does.
   brief = await service.patch('A', { current: 'hand-written note', revision: brief.revision });
   t.eq(brief.current, 'hand-written note', 'the second field can be edited separately');
   fake.set('A', claudeSession('A', paneFor(byId.f3)));
@@ -420,7 +416,11 @@ await run.runCase('BriefService::edits_storage_identity', async (t) => {
   t.ok(brief.current !== byId.f2.expectedCurrent, 'and specifically not the value the edit replaced');
   t.eq(brief.goal, 'ship the new judge', 'clearing one field leaves the other edit alone');
 
-  for (const [a, e, d] of await generationRaceChecks({ clock, storeFile: `${storeFile}.race`, byId })) t.eq(a, e, d);
+  for (const [a, e, d] of [
+    ...await generationRaceChecks({ clock, storeFile: `${storeFile}.race`, byId }),
+    ...await atomicPersistenceChecks({ clock, storeFile: `${storeFile}.atomic`, pane: paneFor(byId.f1) }),
+    ...await timestampChecks({ clock, storeFile: `${storeFile}.ts`, pane1: paneFor(byId.f1), pane2: paneFor(byId.f2) }),
+  ]) t.eq(a, e, d);
 
   // Invalid input is refused without changing anything.
   const reject = async (body, code, why) => {

@@ -10,8 +10,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import {
+  tempDir, fakeClock, fakeCli, claudeSession, paneFor, countingGenerator, fakeTmuxProcess, sleep,
+} from './assertions.mjs';
 
 const require = createRequire(import.meta.url);
+
+// Generic fixtures live in assertions.mjs, which imports only node builtins, so they
+// cannot create a cycle with the delivered server modules loaded below. Re-exported
+// here so every runner and case module keeps importing them from one place.
+export {
+  tempDir, cleanupAll, fakeClock, argAfter, fakeCli, claudeSession, shellActiveSession,
+  paneFor, countingGenerator, loadCorpus, sleep, fakeTmuxProcess, lastLines,
+} from './assertions.mjs';
 const LIB = path.join(import.meta.dirname, '..', '..', 'server', 'lib');
 
 export const briefStore = require(path.join(LIB, 'brief-store.js'));
@@ -21,191 +32,14 @@ export const briefServiceMod = require(path.join(LIB, 'brief-service.js'));
 export const briefRoutes = require(path.join(LIB, 'brief-routes.js'));
 export const briefTmux = require(path.join(LIB, 'brief-tmux.js'));
 
-const cleanups = [];
 
-export function tempDir(prefix = 'matrix-brief-') {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
-  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
 
-export function cleanupAll() {
-  while (cleanups.length) { try { cleanups.pop()(); } catch {} }
-}
 
-export function fakeClock(start = 1_700_000_000_000) {
-  let value = start;
-  return { now: () => value, advance(ms) { value += ms; return value; }, set(ms) { value = ms; return value; } };
-}
 
-function argAfter(args, flag) { const at = args.indexOf(flag); return at >= 0 ? args[at + 1] : undefined; }
 
-function lastLines(text, n) {
-  const lines = String(text).split('\n');
-  return lines.slice(Math.max(0, lines.length - n)).join('\n');
-}
 
-// A fake `tmux` executable. Sessions hold real multi-window panes with real scrollback, so
-// window selection and the early/recent capture split are genuinely exercised.
-//   session: { sessionId, createdAt, windows: [{ name, command, active, pane, panes? }] }
-//
-// Two things make it a fake tmux rather than a lookup table:
-//   1. It RENDERS whatever `-F` format it is handed, so one fixture serves code that asks
-//      for different fields — including the pre-repair code a regression has to fail on.
-//   2. It models tmux TARGET parsing, verified against tmux 3.6a: `@id`/`$id` are exact,
-//      while `session:window.pane` splits a trailing `.<digits>` off as a pane index BEFORE
-//      matching the window name, so `A:v2.1` really reaches window `v2`, pane 1.
-// Window ids are opaque counters carrying nothing from the name, so code that built a target
-// out of names could not accidentally produce one.
-export function fakeTmuxProcess(initial = {}) {
-  const sessions = new Map(Object.entries(initial));
-  const calls = [];
-  const behaviour = { delayMs: 0, fail: new Set() };
-  const windowIds = new Map();                     // `${sessionId}\u0000${name}` -> `@n`
-  let nextWindowId = 0;
 
-  // tmux accepts a session name or a session id wherever a session is addressed.
-  function sessionBy(key) {
-    for (const [name, s] of sessions) if (name === key || s.sessionId === key) return s;
-    return null;
-  }
-  const windowsOf = key => { const s = sessionBy(key); return s ? (s.windows || []) : []; };
-  const key2 = (sid, w) => `${sid}\u0000${w}`;
-  function idFor(sessionId, windowName) {
-    const k = key2(sessionId, windowName);
-    if (!windowIds.has(k)) { nextWindowId += 1; windowIds.set(k, `@${nextWindowId}`); }
-    return windowIds.get(k);
-  }
-  const render = (fmt, vars) => String(fmt).replace(/#\{([a-z_]+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
 
-  function paneTextForTarget(target) {
-    const raw = String(target);
-    if (raw.startsWith('@')) {                     // an exact window id addresses one window
-      for (const s of sessions.values()) {
-        const hit = (s.windows || []).find(w => windowIds.get(key2(s.sessionId, w.name)) === raw);
-        if (hit) return String(hit.pane || '');
-      }
-      return null;
-    }
-    const colon = raw.indexOf(':');                // `$id` or a bare name addresses a session
-    const key = colon === -1 ? raw : raw.slice(0, colon);
-    let rest = colon === -1 ? '' : raw.slice(colon + 1);
-    const windows = windowsOf(key);
-    if (!windows.length) return null;
-    if (!rest) { const a = windows.find(w => w.active) || windows[0]; return a ? String(a.pane || '') : null; }
-    let paneIndex = null;
-    const dot = rest.lastIndexOf('.');
-    if (dot > 0 && /^\d+$/.test(rest.slice(dot + 1))) { paneIndex = Number(rest.slice(dot + 1)); rest = rest.slice(0, dot); }
-    const hit = windows.find(w => w.name === rest);
-    if (!hit) return null;
-    if (paneIndex !== null) return Array.isArray(hit.panes) ? (hit.panes[paneIndex] ?? null) : String(hit.pane || '');
-    return String(hit.pane || '');
-  }
-
-  function respond(args) {
-    const cmd = args[0];
-    if (behaviour.fail.has(cmd)) throw Object.assign(new Error(`fake tmux: ${cmd} failed`), { code: 1 });
-    if (cmd === 'list-sessions') {
-      const fmt = argAfter(args, '-F') || '#{session_name}';
-      return [...sessions.entries()].map(([name, s]) => render(fmt, {
-        session_name: name, session_id: s.sessionId, session_created: s.createdAt,
-      })).join('\n') + '\n';
-    }
-    if (cmd === 'list-panes') {
-      const s = sessionBy(argAfter(args, '-t'));
-      const windows = s ? (s.windows || []) : [];
-      if (!windows.length) throw Object.assign(new Error('no such session'), { code: 1 });
-      const fmt = argAfter(args, '-F') || '#{window_name}';
-      return windows.map((w, i) => render(fmt, {
-        window_index: i, window_id: idFor(s.sessionId, w.name), window_name: w.name,
-        window_active: w.active ? 1 : 0, pane_current_command: w.command || 'bash', pane_id: `%${i}`,
-      })).join('\n') + '\n';
-    }
-    if (cmd === 'display-message') {
-      const text = paneTextForTarget(argAfter(args, '-t'));
-      if (text === null) throw Object.assign(new Error('no such pane'), { code: 1 });
-      return render(args[args.length - 1], {
-        history_size: text.split('\n').length, pane_width: 80, pane_height: 24,
-      }) + '\n';
-    }
-    if (cmd === 'capture-pane') {
-      const text = paneTextForTarget(argAfter(args, '-t'));
-      if (text === null) throw Object.assign(new Error('no such pane'), { code: 1 });
-      const start = argAfter(args, '-S');
-      const end = argAfter(args, '-E');
-      const lines = text.split('\n');
-      if (end !== undefined) {
-        // Early slice: -S -<history> -E -<history - earlyLines>
-        const from = Math.max(0, lines.length + Number(start));
-        const to = Math.max(from, lines.length + Number(end));
-        return lines.slice(from, to).join('\n') + '\n';
-      }
-      return lastLines(text, Math.abs(Number(start) || 400)) + '\n';
-    }
-    throw Object.assign(new Error(`fake tmux: unsupported ${cmd}`), { code: 127 });
-  }
-
-  const execFileImpl = (bin, args, opts, cb) => {
-    calls.push({ bin, args: [...args], opts });
-    const finish = () => {
-      if (behaviour.delayMs && opts && opts.timeout && behaviour.delayMs > opts.timeout) {
-        cb(Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }), '', '');
-        return;
-      }
-      try { cb(null, respond(args), ''); } catch (err) { cb(err, '', String(err.message)); }
-    };
-    if (behaviour.delayMs) setTimeout(finish, Math.min(behaviour.delayMs, 50));
-    else setImmediate(finish);
-    return { stdin: null };
-  };
-
-  return {
-    sessions, calls, behaviour, execFileImpl,
-    set(name, data) { sessions.set(name, data); },
-    kill(name) { sessions.delete(name); },
-    callsFor(cmd) { return calls.filter(c => c.args[0] === cmd); },
-    // The identifiers a test must compare against: a resolved target is one of these, never
-    // a string a test could have spelled out of the session and window names.
-    sessionIdOf(name) { const s = sessionBy(name); return s ? s.sessionId : null; },
-    windowId(name, windowName) { const s = sessionBy(name); return s ? idFor(s.sessionId, windowName) : null; },
-    targetsFor(cmd) { return this.callsFor(cmd).map(c => c.args[c.args.indexOf('-t') + 1]); },
-    reset() { calls.length = 0; },
-  };
-}
-
-// A session whose single Claude window holds `pane`.
-export function claudeSession(id, pane, extra = {}) {
-  return {
-    sessionId: `$${id}`, createdAt: 1_600_000_000,
-    windows: [{ name: 'claude', command: 'claude', active: true, pane }], ...extra,
-  };
-}
-
-// A session whose tmux-active window is a shell and whose Claude window is elsewhere —
-// the case where "the active window" and "the streamed window" disagree.
-export function shellActiveSession(id, shellPane, claudePane) {
-  return {
-    sessionId: `$${id}`, createdAt: 1_600_000_000,
-    windows: [
-      { name: 'shell', command: 'bash', active: true, pane: shellPane },
-      { name: 'claude', command: 'claude', active: false, pane: claudePane },
-    ],
-  };
-}
-
-// Renders a fixture record as pane text the way the live pane shows a Claude turn, so the
-// evidence collector's own parser is exercised rather than bypassed.
-export function paneFor(record, { padLines = 0 } = {}) {
-  const lines = [];
-  for (const item of record.evidence || []) {
-    if (item.role === 'user') lines.push(`> ${item.text}`);
-    else lines.push(item.text);
-    lines.push('');
-  }
-  for (let i = 0; i < padLines; i += 1) lines.push(`filler output line ${i}`);
-  lines.push('⏺ working…');
-  return lines.join('\n');
-}
 
 // The delivered resolver/capture stack on the fake process, with the SHIPPED defaults.
 // Nothing here may relax caching or identity validation: a helper that quietly disabled a
@@ -236,54 +70,7 @@ export function makeService(opts) {
   });
 }
 
-// Counts calls and can be held open, so "no HTTP request waits for generation" and the
-// global concurrency bound are observable rather than assumed.
-export function countingGenerator(inner) {
-  let calls = 0;
-  let live = 0;
-  let maxLive = 0;
-  let gate = null;
-  return {
-    name: inner.name,
-    version: inner.version,
-    get calls() { return calls; },
-    get maxConcurrent() { return maxLive; },
-    hold() { let release; gate = new Promise(r => { release = r; }); return () => { const g = gate; gate = null; release(); return g; }; },
-    async generate(input) {
-      calls += 1;
-      live += 1;
-      maxLive = Math.max(maxLive, live);
-      try {
-        if (gate) await gate;
-        return await inner.generate(input);
-      } finally { live -= 1; }
-    },
-  };
-}
 
-// Writes a throwaway executable that records how it was invoked, so the CLI adapter's
-// process boundary (argv, stdin, cwd, env) is inspected rather than trusted.
-export function fakeCli(dir, { stdout = '', exitCode = 0, delayMs = 0 } = {}) {
-  const bin = path.join(dir, 'fake-claude');
-  const log = path.join(dir, 'fake-claude.json');
-  const script = `#!/usr/bin/env node
-const fs = require('fs');
-let stdin = '';
-process.stdin.on('data', c => { stdin += c; });
-process.stdin.on('end', () => {
-  fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({
-    argv: process.argv.slice(2), stdin, cwd: process.cwd(),
-    hasApiKey: Boolean(process.env.ANTHROPIC_API_KEY),
-    envKeys: Object.keys(process.env).sort(),
-  }));
-  // Exit only once stdout has actually flushed, so an oversized payload really reaches the
-  // parent's maxBuffer instead of being cut short by an early exit.
-  setTimeout(() => process.stdout.write(${JSON.stringify(stdout)}, () => process.exit(${exitCode})), ${delayMs});
-});
-`;
-  fs.writeFileSync(bin, script, { mode: 0o755 });
-  return { bin, log, read: () => JSON.parse(fs.readFileSync(log, 'utf8')) };
-}
 
 // Runs the delivered pane-stream module against a throwaway `tmux` on PATH and a fake
 // WebSocket, and records exactly what a connecting client is told. The stream fixes its
@@ -492,8 +279,206 @@ export async function evidenceIntervalChecks({ clock, generator, storeFile, pane
   return { checks, report: { maxMs: max, configuredMs: 600000, effectiveMs: service.evidenceIntervalMs } };
 }
 
-export function loadCorpus(oracleDir) {
-  return JSON.parse(fs.readFileSync(path.join(oracleDir, 'brief-fixtures.json'), 'utf8'));
+// A24-2. The AGGREGATE evidence bound, measured on what actually crosses the boundary.
+// Exported constants and per-item lengths say nothing about the total: a collector that
+// kept every item, or a CLI adapter that stopped slicing, would still satisfy both.
+export async function aggregateEvidenceChecks({ dir, execFile }) {
+  const out = [];
+  const cap = briefEvidence.MAX_EVIDENCE_CHARS;
+  // Ten items, each individually legal, together far over the aggregate cap.
+  const items = Array.from({ length: 10 }, (_, i) => ({
+    id: `bulk-${i}`, role: i === 9 ? 'tool' : 'user', text: `> turn ${i} ` + 'z'.repeat(8000),
+  }));
+  const supplied = items.reduce((n, i) => n + i.text.length, 0);
+  out.push([supplied > cap * 2, true, `aggregate: the fixture really is oversized (${supplied} chars for a ${cap} cap)`]);
+
+  const built = briefEvidence.buildEvidence({
+    capture: items.map(i => i.text).join('\n'), earlyCapture: '', evidenceAt: 1,
+  });
+  const collected = built.items.reduce((n, i) => n + i.text.length, 0);
+  const perItem = 8 * 1024;   // the collector's own per-item collapse limit
+  // The single-enormous-turn case the old inline check covered, kept beside the rest.
+  const oneHuge = briefEvidence.buildEvidence({ capture: `> ${'x'.repeat(200000)}\n`, evidenceAt: 1 });
+  out.push([oneHuge.items.every(i => i.text.length <= perItem), true,
+    'aggregate: one enormous turn is capped per item as well']);
+  out.push(
+    [collected <= cap, true, `aggregate: the collector's items total within the cap (${collected} <= ${cap})`],
+    [built.items.every(i => i.text.length <= perItem), true,
+      `aggregate: and no single collected item exceeds ${perItem} chars`],
+  );
+
+  // The binding aggregate bound is in the CLI adapter, not the collector: the collector
+  // emits at most three items whose per-item caps already sum below the aggregate cap, so
+  // its own ceiling is unreachable by construction and asserting it would prove nothing.
+  // What CAN be measured is the payload the adapter actually writes to the process.
+  const cli = fakeCli(dir, { stdout: '{"unavailable":"none"}' });
+  const gen = briefGenerator.createClaudeCliGenerator({ execFile, bin: cli.bin, timeoutMs: 5000, cwd: dir });
+  await gen.generate({ items: [] });
+  const headerOnly = cli.read().stdin.length;      // the fixed prompt, measured not guessed
+  await gen.generate({ items });
+  const { stdin } = cli.read();
+  out.push(
+    [stdin.length <= headerOnly + cap, true,
+      `aggregate: the CLI stdin payload is bounded (${stdin.length} <= ${headerOnly} prompt + ${cap} evidence)`],
+    [stdin.length < supplied, true, `aggregate: and is far smaller than the evidence handed in (${stdin.length} < ${supplied})`],
+    [stdin.includes('bulk-0'), true, 'aggregate: the kept head of the evidence really did reach the CLI'],
+    [stdin.includes('bulk-9'), false, 'aggregate: and the tail beyond the cap really was dropped'],
+  );
+  return out;
 }
 
-export const sleep = ms => new Promise(r => setTimeout(r, ms));
+// A24-3. Persistence is ATOMIC: the live file is replaced, never written through. With a
+// saved override already on disk, a failure injected BEFORE the replacement must leave the
+// previous complete record readable now and after a restart, and must not be acknowledged.
+export async function atomicPersistenceChecks({ clock, storeFile, pane }) {
+  const out = [];
+  const fake = fakeTmuxProcess({ A: claudeSession('A', pane) });
+  const gen = briefGenerator.createExtractiveGenerator();
+  let service = makeService({ stack: tmuxStack(fake), clock, generator: gen, storeFile });
+  await service.read('A'); await service.settle();
+  const saved = await service.patch('A', { goal: 'the override already on disk', revision: (await service.read('A')).revision });
+  out.push([saved.goal, 'the override already on disk', 'atomic: a complete record is saved before the failure']);
+
+  // Real fs, except that the replacement step fails. A store that wrote the live file
+  // directly would never reach renameSync and would therefore succeed here.
+  const writes = [];
+  const renames = [];
+  const failing = {
+    ...fs,
+    writeFileSync: (f, d, o) => { writes.push(String(f)); return fs.writeFileSync(f, d, o); },
+    renameSync: (a, b) => { renames.push([String(a), String(b)]); throw Object.assign(new Error('EIO'), { code: 'EIO' }); },
+  };
+  service = makeService({ stack: tmuxStack(fake), clock, generator: gen, storeFile, fsImpl: failing });
+  const before = await service.read('A');
+  let err = null;
+  try { await service.patch('A', { goal: 'this must never be acknowledged', revision: before.revision }); } catch (e) { err = e; }
+  out.push(
+    [err && err.status, 500, 'atomic: a persistence failure is an error, never a success'],
+    [writes.some(f => f !== storeFile && f.startsWith(storeFile)), true,
+      `atomic: the write went to a temporary beside the live file, not through it (${JSON.stringify(writes)})`],
+    [writes.includes(storeFile), false, 'atomic: the live file was never written directly'],
+    [renames.length > 0, true, 'atomic: replacement of the live file was attempted'],
+    [(await service.read('A')).goal, 'the override already on disk', 'atomic: the in-memory record is rolled back to the saved one'],
+  );
+
+  // A restart reads the file off disk: the previous complete record must still be there.
+  service = makeService({ stack: tmuxStack(fake), clock, generator: gen, storeFile });
+  const restarted = await service.read('A');
+  out.push(
+    [restarted.goal, 'the override already on disk', 'atomic: the file on disk still holds the previous complete record'],
+    [restarted.storageError, null, 'atomic: and it is not corrupt'],
+    [fs.readFileSync(storeFile, 'utf8').includes('this must never be acknowledged'), false,
+      'atomic: the unacknowledged edit never reached the file'],
+  );
+  return out;
+}
+
+// A24-4. evidenceAt and generatedAt mean different things and must move independently:
+// evidenceAt is how fresh the SOURCE is, generatedAt is when a generation last SUCCEEDED.
+// Nothing asserted either before, so a service that returned polling time as evidenceAt,
+// or simply echoed generatedAt, would have been indistinguishable.
+export async function timestampChecks({ clock, storeFile, pane1, pane2 }) {
+  const out = [];
+  const fake = fakeTmuxProcess({ A: claudeSession('A', pane1) });
+  const gen = countingGenerator(briefGenerator.createExtractiveGenerator());
+  let service = makeService({ stack: tmuxStack(fake), clock, generator: gen, storeFile });
+  await service.read('A'); await service.settle();
+  const first = await service.read('A');
+  out.push(
+    [Number.isFinite(first.evidenceAt), true, `timestamps: a generated brief reports when its evidence was read (${first.evidenceAt})`],
+    [Number.isFinite(first.generatedAt), true, 'timestamps: and when it was generated'],
+  );
+
+  // Polling with UNCHANGED evidence must not make the old evidence look freshly read.
+  clock.advance(31000);
+  await service.tick(); await service.settle();
+  const polled = await service.read('A');
+  out.push(
+    [polled.evidenceAt, first.evidenceAt, 'timestamps: unchanged evidence does not refresh evidenceAt to the polling time'],
+    [polled.generatedAt, first.generatedAt, 'timestamps: and does not move generatedAt either'],
+    [polled.evidenceAt !== clock.now(), true, `timestamps: evidenceAt is not just "now" (${polled.evidenceAt} vs ${clock.now()})`],
+  );
+
+  // CHANGED evidence moves both, and they are not the same number by construction.
+  fake.set('A', claudeSession('A', pane2));
+  clock.advance(31000);
+  const atChange = clock.now();
+  await service.tick(); await service.settle();
+  clock.advance(5000);
+  const changed = await service.read('A');
+  out.push(
+    [changed.evidenceAt > first.evidenceAt, true, `timestamps: changed evidence moves evidenceAt (${first.evidenceAt} -> ${changed.evidenceAt})`],
+    [changed.evidenceAt, atChange, 'timestamps: to when that evidence was actually read, not to the read time'],
+    [changed.generatedAt >= atChange, true, 'timestamps: and generatedAt advances on the successful generation'],
+  );
+
+  // A FAILED refresh keeps the last successful generatedAt while still reporting freshness.
+  const failing = { name: 'extractive', version: '1', generate: async () => { throw new briefGenerator.BriefGenerationError('generator_failed', 'NCfail'); } };
+  fake.set('A', claudeSession('A', `${pane1}\n> and one more different turn here\n`));
+  service = makeService({ stack: tmuxStack(fake), clock, generator: failing, storeFile });
+  clock.advance(31000);
+  // A fresh service has an empty runtime map, so tick() would iterate nothing: the first
+  // read is what registers the session AND schedules the job that then fails.
+  await service.read('A'); await service.settle();
+  const failed = await service.read('A');
+  out.push(
+    [failed.generatedAt, changed.generatedAt, 'timestamps: a failed refresh preserves the last successful generation time'],
+    [failed.stale, true, 'timestamps: and the kept text is labelled stale'],
+    [failed.evidenceAt > changed.evidenceAt, true, 'timestamps: while source freshness still moves, so the two are distinguishable'],
+  );
+
+  // A restart serves the persisted timestamps, not fresh ones.
+  service = makeService({ stack: tmuxStack(fake), clock, generator: failing, storeFile });
+  const restarted = await service.read('A');
+  out.push([restarted.generatedAt, changed.generatedAt, 'timestamps: generatedAt survives a restart unchanged']);
+  return out;
+}
+
+const waitUntil = async (fn, ms = 4000) => {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if (fn()) return true; await sleep(5); }
+  return false;
+};
+
+// A generation ALREADY RUNNING when a newer edit lands. Two things make this a race rather
+// than the shape of one: the evidence moves to a fixture the fields have not carried
+// (re-submitting the current pane hits the unchanged-fingerprint early return and never
+// starts a job), and the generator is held at an explicit boundary instead of being made
+// slow, so the test observes that generation entered and is STILL PENDING when the edit is
+// saved rather than hoping a sleep was long enough.
+export async function generationRaceChecks({ clock, storeFile, byId }) {
+  const out = [];
+  const fake = fakeTmuxProcess({ A: claudeSession('A', paneFor(byId.f2)) });
+  const racing = countingGenerator(briefGenerator.createExtractiveGenerator());
+  let service = makeService({ stack: tmuxStack(fake), clock, generator: racing, storeFile });
+  await service.read('A');
+  await service.settle();
+  const seeded = await service.patch('A', { goal: 'edited goal stays put', revision: (await service.read('A')).revision });
+  out.push([seeded.goal, 'edited goal stays put', 'race: a goal override is in place before the race starts']);
+  fake.set('A', claudeSession('A', paneFor(byId.f1)));
+  const enteredBefore = racing.calls;
+  const release = racing.hold();
+  clock.advance(31000);
+  await service.tick();
+  out.push([await waitUntil(() => racing.calls > enteredBefore), true, 'race: the held generation really entered'],
+    [service.jobs.size > 0, true, 'race: and is still pending at the boundary, not already finished']);
+
+  const mid = await service.patch('A', { current: 'saved while the job was mid-flight', revision: (await service.read('A')).revision });
+  out.push([mid.current, 'saved while the job was mid-flight', 'race: the edit is accepted while generation is in flight'],
+    [service.jobs.size > 0, true, 'race: the job was still held at the boundary when the edit was saved']);
+
+  await release();
+  await service.settle();
+  const raced = await service.read('A');
+  out.push(
+    [raced.current, 'saved while the job was mid-flight', 'race: the completing job cannot clobber an edit saved after it started'],
+    [raced.generated.current, byId.f1.expectedCurrent, 'race: but the generated value underneath did complete and update'],
+    [raced.goal, 'edited goal stays put', 'race: the other override is untouched by the race'],
+  );
+
+  service = makeService({ stack: tmuxStack(fake), clock, generator: briefGenerator.createExtractiveGenerator(), storeFile });
+  const restarted = await service.read('A');
+  out.push([restarted.current, 'saved while the job was mid-flight', 'race: the mid-flight edit survives a service restart'],
+    [restarted.generated.current, byId.f1.expectedCurrent, 'race: and so does the generated value that job wrote']);
+  return out;
+}

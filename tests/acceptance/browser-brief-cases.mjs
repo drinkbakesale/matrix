@@ -32,8 +32,8 @@ async function waitForBrief(page, predicate, deadlineMs, label) {
   }
 }
 
-// Polls a control endpoint until it satisfies `predicate`, so the race below waits on an
-// observed generator state rather than on a guessed delay.
+// Polls a control endpoint until `predicate` holds, so the race waits on an observed
+// generator state rather than a guessed delay.
 async function waitForControl(page, op, predicate, deadlineMs, label) {
   const started = Date.now();
   for (;;) {
@@ -53,6 +53,7 @@ async function readBrief(page) {
     note: document.getElementById('brief-status').textContent,
     generated: briefView.current() ? briefView.current().generated : null,
     generatedAt: briefView.current() ? briefView.current().generatedAt : null,
+    evidenceAt: briefView.current() ? briefView.current().evidenceAt : null,
     revision: briefView.current() ? briefView.current().revision : null,
     stale: briefView.current() ? briefView.current().stale : null,
   }));
@@ -84,10 +85,9 @@ async function editField(page, field, value) {
 export async function pinnedBothClients(ctx, t) {
   const boxes = {};
   for (const kind of ['mobile', 'desktop']) {
-    // A genuinely unseen session: earlier cases shared this store, so start a fresh
-    // incarnation to observe the real first-open state rather than a warm cache. The
-    // generator is held slow so the pending state is observed deterministically instead of
-    // racing a fast extractor.
+    // A genuinely unseen session: earlier cases shared this store, so start a fresh incarnation to observe
+    // the real first-open state rather than a warm cache. The generator is held slow so the pending state is
+    // observed deterministically instead of racing a fast extractor.
     await fetch(`${ctx.origin}/__control/reincarnate?session=A`);
     await fetch(`${ctx.origin}/__control/mode?mode=slow`);
     const { context, page } = await openClient(ctx, kind);
@@ -107,11 +107,10 @@ export async function pinnedBothClients(ctx, t) {
 
     await emit(page, 'output', Array.from({ length: 200 }, (_, i) => `scroll filler ${i}`).join('\n') + '\n');
     await page.waitForTimeout(100);
-    // The browser CLAMPS scrollTop to scrollHeight - clientHeight, so ASKING for 1.5
-    // viewports is not evidence that 1.5 viewports were travelled: with a short transcript
-    // the request silently becomes a few pixels. Measure what actually moved, in whichever
-    // direction has room — the transcript is normally already following the bottom when the
-    // filler lands, so the room is upwards.
+    // The browser CLAMPS scrollTop to scrollHeight - clientHeight, so ASKING for 1.5 viewports is not
+    // evidence that 1.5 viewports were travelled: with a short transcript the request silently becomes a few
+    // pixels. Measure what actually moved, in whichever direction has room — the transcript is normally
+    // already following the bottom when the filler lands, so the room is upwards.
     const layout = await page.evaluate(() => {
       const viewer = document.getElementById('terminal');
       const startTop = viewer.scrollTop;
@@ -182,6 +181,9 @@ export async function updatesAndOverrides(ctx, t) {
   t.eq(second.current, F2.current, 'current work refreshes within one evidence interval');
   t.eq(second.goal, F2.goal, 'the broad goal stays supported across the refresh');
   t.ok(second.generatedAt > first.generatedAt, 'generatedAt advances on a successful generation');
+  // Different quantities, both carried: evidenceAt is source freshness, generatedAt is
+  // when generation last succeeded.
+  t.ok(second.evidenceAt > first.evidenceAt, `evidenceAt advances when the evidence changes (${first.evidenceAt} -> ${second.evidenceAt})`);
 
   // A failed refresh keeps the old text, marks it stale and does not move generatedAt.
   await control(page, 'mode', { mode: 'fail' });
@@ -191,10 +193,12 @@ export async function updatesAndOverrides(ctx, t) {
   const failed = await readBrief(page);
   t.eq(failed.current, F2.current, 'the last good text is kept when a refresh fails');
   t.eq(failed.generatedAt, second.generatedAt, 'the generation time does not move on failure');
+  // Where they visibly come apart: the source moved on, the last success did not.
+  t.ok(failed.evidenceAt > second.evidenceAt, `source freshness still advances on a failed refresh (${second.evidenceAt} -> ${failed.evidenceAt})`);
+  t.ok(failed.evidenceAt !== failed.generatedAt, 'and evidenceAt is then not an echo of generatedAt');
   t.eq(failed.stale, true, 'the kept text is labelled stale');
   t.includes(failed.note, 'refresh failed', 'the failure is visible to the user');
-  await control(page, 'mode', { mode: 'ok' });
-  await control(page, 'pane', { session: 'A', pane: ctx.panes.f2 });
+  await control(page, 'mode', { mode: 'ok' }); await control(page, 'pane', { session: 'A', pane: ctx.panes.f2 });
 
   // Per-field edits.
   await editField(page, 'goal', 'ship the judging step');
@@ -215,7 +219,7 @@ export async function updatesAndOverrides(ctx, t) {
   // Reload the page and restart the service: the edits persist.
   await page.goto(`${ctx.origin}/?open=A`);
   await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
-  await settleAndRefresh(page);
+  await settleAndRefresh(page);   // reload: the overrides must come back from storage
   brief = await readBrief(page);
   t.eq(brief.goal, 'ship the judging step', 'edits survive a page reload');
   await control(page, 'restart');
@@ -224,11 +228,10 @@ export async function updatesAndOverrides(ctx, t) {
   t.eq(brief.goal, 'ship the judging step', 'edits survive a service restart');
   t.eq(brief.current, 'hand written current work', 'both edits survive a service restart');
 
-  // Clear only the current field. The source evidence is moved to f3 FIRST and allowed to
-  // generate underneath while the override is still on screen, so "restores the NEWEST
-  // generated value" is distinguishable from "restores the value that was there when you
-  // edited" — the two are the same string if the evidence never moves, which would let an
-  // implementation that freezes generated.current while overridden pass.
+  // Clear only the current field. The evidence moves to f3 FIRST and generates underneath
+  // while the override is on screen, so "restores the NEWEST generated value" differs from
+  // "restores what was there when you edited" — identical strings if evidence never moves,
+  // which would let a freeze-while-overridden implementation pass.
   await control(page, 'pane', { session: 'A', pane: ctx.panes.f3 });
   await control(page, 'advance', { ms: 31000 });
   await settleAndRefresh(page);
@@ -241,11 +244,10 @@ export async function updatesAndOverrides(ctx, t) {
   t.ok(brief.current !== F2.current, 'and specifically not the pre-edit value');
   t.eq(brief.goal, 'ship the judging step', 'clearing one override leaves the other edit in place');
 
-  // A generation ALREADY RUNNING when a newer edit lands. Two things make this a real race
-  // rather than a shape: the evidence moves to a fixture neither field has carried (f3 again
-  // would hit the unchanged-fingerprint early return and never start a job at all), and the
-  // generator is held at an explicit boundary instead of merely being slow, so the test can
-  // observe that generation entered and is still pending before it saves the edit.
+  // A generation ALREADY RUNNING when a newer edit lands. Two things make it a real race:
+  // the evidence moves to a fixture neither field has carried (f3 again would hit the
+  // unchanged-fingerprint early return and start no job), and the generator is held at an
+  // explicit boundary, so the test can see generation entered and is still pending.
   await control(page, 'pane', { session: 'A', pane: ctx.panes.f1 });
   const enteredBefore = (await control(page, 'genstate')).entered;
   await control(page, 'gate');
@@ -296,9 +298,8 @@ export async function isolationAndFailures(ctx, t) {
   await settleAndRefresh(page);
   t.eq((await readBrief(page)).goal, F1.goal, 'session A starts with its own brief');
 
-  // ---- A held HTTP response for a session the user has left ----
-  // A's answer is computed now and written only when the test releases it, so this is a
-  // genuinely in-flight response, not a simulated one.
+  // ---- A held HTTP response for a session the user has left ---- A's answer is computed now and written
+  // only when the test releases it, so this is a genuinely in-flight response, not a simulated one.
   await control(page, 'hold', { session: 'A' });
   await page.evaluate(() => briefView.open('A', ''));          // request for A: captured, held
   await page.waitForTimeout(150);
@@ -314,9 +315,8 @@ export async function isolationAndFailures(ctx, t) {
     'session B never displays session A\'s brief');
   t.ok(!afterRelease.goal.includes('shared-project'), 'the shared project label is not used as a goal');
 
-  // ---- A -> B -> A with TWO A answers in flight at once ----
-  // The first one belongs to a superseded open of the same session; releasing it before the
-  // current one must change nothing on screen.
+  // ---- A -> B -> A with TWO A answers in flight at once ---- The first one belongs to a superseded open of
+  // the same session; releasing it before the current one must change nothing on screen.
   await page.evaluate(() => briefView.open('A', ''));           // stale request, held
   await page.waitForTimeout(150);
   await page.evaluate(() => openTerminal('B'));
