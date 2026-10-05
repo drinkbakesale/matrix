@@ -5,7 +5,8 @@
 # removes only that. RM2_ROOT prefixes every path (empty on the real device).
 set -u
 ROOT="${RM2_ROOT:-}"
-STAGE="$ROOT/tmp/matrix-rm2"
+# The staged files sit beside this script, in the private directory the installer created for this run.
+STAGE="$(cd "$(dirname "$0")" && pwd)"
 XOVI="$ROOT/home/root/xovi"
 APP="$XOVI/exthome/appload/matrix-rm2"
 CONF_DIR="$ROOT/home/root/.config/matrix-rm2"

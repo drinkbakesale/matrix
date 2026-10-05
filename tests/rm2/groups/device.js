@@ -63,8 +63,79 @@ module.exports = (L) => {
     const env = { ...process.env, MATRIX_HOME: home, RM2_SSH: path.join(doubles, 'fake-ssh'), RM2_SCP: path.join(doubles, 'fake-scp'), FAKE_DEVICE_ROOT: root, FAKE_DEVICE_BIN: path.join(top, 'bin'), RM2_DEPS_MANIFEST: manifest, MATRIX_RM2_DEPS: deps };
     fs.mkdirSync(path.join(top, 'bin'));
     const install = (cmd, extra = [], more = {}) => L.spawnSync(process.execPath, [path.join(L.candidate, 'scripts', 'rm2-install'), cmd, '--host', 'tablet.sandbox', '--binary', L.hostBin(), '--report-dir', reportDir, ...(cmd === 'install' ? ['--url', 'https://192.168.68.63:7779'] : []), ...extra], { encoding: 'utf8', env: { ...env, ...more } });
-    return { top, root, deps, home, env, install, reportDir, writeManifest, manifest, read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'), exists: (rel) => fs.existsSync(path.join(root, rel)), xoviState: () => (fs.existsSync(path.join(root, 'var/xovi-state')) ? fs.readFileSync(path.join(root, 'var/xovi-state'), 'utf8').trim().split('\n') : []) };
+    const argv = (cmd, extra = []) => [path.join(L.candidate, 'scripts', 'rm2-install'), cmd, '--host', 'tablet.sandbox', '--binary', L.hostBin(), '--report-dir', reportDir, ...(cmd === 'install' ? ['--url', 'https://192.168.68.63:7779'] : []), ...extra];
+    return { argv, top, root, deps, home, env, install, reportDir, writeManifest, manifest, read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'), exists: (rel) => fs.existsSync(path.join(root, rel)), xoviState: () => (fs.existsSync(path.join(root, 'var/xovi-state')) ? fs.readFileSync(path.join(root, 'var/xovi-state'), 'utf8').trim().split('\n') : []) };
   }
+  // L3-1: the installer's temporary files on the tablet are its own. Whatever already exists under
+  // /tmp, including a /tmp/matrix-rm2 it used to claim, is never adopted, followed or deleted.
+  async function stagingOwnership(t) {
+    const meta = (root) => { const out = {}; const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); const st = fs.lstatSync(p); out[path.relative(root, p)] = [st.mode, st.ino, st.size, st.mtimeMs, e.isSymbolicLink() ? fs.readlinkSync(p) : e.isFile() ? sha(p) : 'dir']; if (e.isDirectory()) walk(p); } }; walk(root); const st = fs.lstatSync(root); out['.'] = [st.mode, st.ino, st.mtimeMs]; return out; };
+    const stages = (sb) => fs.readdirSync(path.join(sb.root, 'tmp')).filter((n) => /^matrix-rm2\./.test(n));
+    const sshLog = (sb) => (fs.existsSync(path.join(sb.top, 'ssh.log')) ? fs.readFileSync(path.join(sb.top, 'ssh.log'), 'utf8').split('\n').filter(Boolean) : []);
+    const removed = (sb) => sshLog(sb).filter((l) => /\brm -rf\b/.test(l));
+    const seed = (sb) => {
+      const d = path.join(sb.root, 'tmp/matrix-rm2');
+      fs.mkdirSync(path.join(d, 'sub'), { recursive: true });
+      fs.writeFileSync(path.join(d, 'sentinel.txt'), 'SOMEONE ELSE\'S DATA', { mode: 0o640 });
+      fs.writeFileSync(path.join(d, 'sub/device.sh'), '#!/bin/sh\necho MUST-NOT-RUN > "$RM2_ROOT/tmp/ran"\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(sb.root, 'tmp/matrix-rm2-stage.tar'), 'NOT OURS');
+      for (const f of ['sub/device.sh', 'sub', 'sentinel.txt', '.']) fs.utimesSync(path.join(d, f), 1600000000, 1600000000);
+      return d;
+    };
+    // (1) An unrelated /tmp/matrix-rm2 survives every command, contents and metadata, and nothing is left behind.
+    let sb = sandbox();
+    let other = seed(sb);
+    let before = meta(other);
+    const ran = [];
+    for (const cmd of ['check', 'install', 'activate', 'stock', 'uninstall']) {
+      const r = sb.install(cmd);
+      ran.push(`${cmd}=${r.status}`);
+      assert.ok(cmd === 'check' ? [0, 7].includes(r.status) : r.status === 0, `${cmd} ran (exit ${r.status}): ${r.stderr}`);
+      assert.deepEqual(meta(other), before, `${cmd} left the unrelated /tmp/matrix-rm2 exactly as it was (contents, modes, inodes, times)`);
+      assert.equal(fs.readFileSync(path.join(sb.root, 'tmp/matrix-rm2-stage.tar'), 'utf8'), 'NOT OURS', `${cmd} left the unrelated tar file alone`);
+      assert.deepEqual(stages(sb), [], `${cmd} removed its own staging directory`);
+    }
+    assert.ok(!fs.existsSync(path.join(sb.root, 'tmp/ran')), 'the unrelated device.sh was never executed');
+    const rm = removed(sb);
+    assert.ok(rm.length >= 5 && rm.every((l) => /^rm -rf "\$\{RM2_ROOT:-\}\/tmp\/matrix-rm2\.[A-Za-z0-9]{6}"$/.test(l)), `every delete names exactly one directory the tablet created for that run: ${JSON.stringify(rm)}`);
+    assert.equal(new Set(rm).size, rm.length, 'each run had its own directory');
+    // (2) /tmp/matrix-rm2 is a symlink to someone's directory: not followed, not replaced.
+    sb = sandbox();
+    const victim = path.join(sb.root, 'home/root/victim'); fs.mkdirSync(victim); fs.writeFileSync(path.join(victim, 'keep.txt'), 'KEEP');
+    fs.symlinkSync(victim, path.join(sb.root, 'tmp/matrix-rm2'));
+    before = meta(victim);
+    for (const cmd of ['check', 'install']) {
+      const r = sb.install(cmd);
+      assert.ok([0, 7].includes(r.status), `${cmd} with a symlink present (exit ${r.status}): ${r.stderr}`);
+      assert.deepEqual(meta(victim), before, `${cmd} did not write into or delete the symlink's target`);
+      assert.equal(fs.readlinkSync(path.join(sb.root, 'tmp/matrix-rm2')), victim, 'the symlink itself is untouched');
+      assert.deepEqual(stages(sb), []);
+    }
+    // (3) The tablet cannot create a staging directory, or answers with a path that is not a new one: stop, delete nothing.
+    for (const [what, script] of [['fails', '#!/bin/sh\necho "mktemp: No space left on device" >&2\nexit 1\n'], ['answers with an existing path', '#!/bin/sh\necho "$RM2_ROOT/tmp/matrix-rm2"\n']]) {
+      sb = sandbox(); other = seed(sb); before = meta(other);
+      fs.writeFileSync(path.join(sb.top, 'bin/mktemp'), script, { mode: 0o755 });
+      const r = sb.install('check');
+      assert.notEqual(r.status, 0, `check stops when mktemp ${what}`);
+      assert.match(r.stderr, /staging directory|No space left/, 'the reason is stated');
+      assert.deepEqual(removed(sb), [], `no delete was issued when mktemp ${what}`);
+      assert.deepEqual([meta(other), stages(sb)], [before, []], 'the unrelated directory is untouched and nothing was created');
+      assert.ok(!sshLog(sb).some((l) => /device\.sh/.test(l)), 'no staged script was run');
+    }
+    // (4) Failure after staging (the transfer breaks): only the directory that was created is removed.
+    sb = sandbox(); other = seed(sb); before = meta(other);
+    let r = sb.install('check', [], { FAKE_SCP_MODE: 'fail' });
+    assert.notEqual(r.status, 0);
+    assert.deepEqual([meta(other), stages(sb), removed(sb).length], [before, [], 1], 'after a failed transfer the run removed its one directory and nothing else');
+    // (5) Two installers at once work in different directories and each removes only its own.
+    sb = sandbox(); other = seed(sb); before = meta(other);
+    const both = await Promise.all([0, 1].map(() => new Promise((resolve) => { const p = L.spawn(process.execPath, sb.argv('check'), { env: sb.env, stdio: 'ignore' }); L.registerProc(p); p.on('exit', resolve); })));
+    assert.ok(both.every((c) => [0, 7].includes(c)), `both concurrent checks completed (${both})`);
+    const two = removed(sb);
+    assert.deepEqual([two.length, new Set(two).size, stages(sb), meta(other)], [2, 2, [], before], 'two distinct staging directories, both removed, the unrelated one untouched');
+    t.note(`staging ownership: unrelated /tmp/matrix-rm2 (dir and symlink) unchanged in contents+metadata across ${ran.join(' ')}; mktemp failure / bogus answer → stop with 0 deletes; failed transfer → only its own directory removed; 2 concurrent checks → 2 distinct directories`);
+  }
+
   const notTmp = (rel) => rel === 'tmp' || rel.startsWith('tmp/') || rel === 'var' || rel.startsWith('var/');
 
   return {
@@ -275,6 +346,7 @@ module.exports = (L) => {
       assert.equal(cli('uninstall-hook').status, 0);
       assert.deepEqual(JSON.parse(fs.readFileSync(settings, 'utf8')), original, 'uninstall restores exactly the original settings');
       assert.equal(cli('uninstall-hook').status, 0);
+      await stagingOwnership(t);
       t.note('fresh tablet and tablet with existing XOVI: install → check (hashtable step) → activate → client launches and exits cleanly (Exit button, SIGTERM) → stock → reinstall → uninstall; unrelated files byte-identical; Mac hook install/uninstall idempotent and exact');
     },
 

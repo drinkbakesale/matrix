@@ -85,6 +85,8 @@ ssh-copy-id root@10.11.99.1         # first time only: compare the host fingerpr
                                     # The installer never asks for or stores a password.
 scripts/rm2-fetch-deps              # downloads the two pinned third-party artifacts once and checks their SHA-256
 scripts/rm2-install check   --host 10.11.99.1                                   # changes nothing; prints model/version/checks
+                                    # (every command works in a private /tmp/matrix-rm2.XXXXXX directory that the tablet
+                                    # creates for that run and that is removed afterwards; nothing else in /tmp is touched)
 scripts/rm2-install install --host 10.11.99.1 --url https://<mac-LAN-address>:7779
 ssh -t root@10.11.99.1 /home/root/xovi/rebuild_hashtable   # once per software version; asks for the tablet passcode
 scripts/rm2-install activate --host 10.11.99.1             # starts it for this boot

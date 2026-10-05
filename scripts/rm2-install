@@ -27,7 +27,24 @@ const SCP = process.env.RM2_SCP || 'scp';
 const host = opt('host');
 const SSH_OPTS = ['-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 
-const die = (msg, code = 1) => { console.error(`rm2-install: ${msg}`); process.exit(code); };
+// Temporary files belong to this run only. On the tablet the installer works in one directory that
+// the tablet itself created for it (mktemp), recorded here only once that succeeded; on the Mac in
+// mkdtemp directories. Cleanup removes exactly those paths and nothing else: a /tmp/matrix-rm2 (or
+// anything else) that already exists on the tablet is never read, reused or deleted.
+let remoteStage = null; // e.g. "/tmp/matrix-rm2.Ab3dEf" on the tablet
+const localDirs = [];
+const R = (p) => `"\${RM2_ROOT:-}${p}"`; // RM2_ROOT is empty on a real tablet
+function cleanup() {
+  const stage = remoteStage;
+  remoteStage = null; // cleared first: a failing cleanup must not re-enter itself through die()
+  if (stage) {
+    const r = spawnSync(SSH, [...SSH_OPTS, `root@${host}`, `rm -rf ${R(stage)}`], { encoding: 'utf8' });
+    if (r.error || r.status !== 0) console.error(`rm2-install: WARNING: could not remove the staging directory ${stage} on the tablet; remove it by hand: ssh root@${host} rm -rf ${stage}`);
+  }
+  for (const d of localDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+}
+const finish = (code) => { cleanup(); process.exit(code); };
+const die = (msg, code = 1) => { console.error(`rm2-install: ${msg}`); finish(code); };
 const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 function ssh(remote, { allowFail = false } = {}) {
@@ -46,7 +63,7 @@ function scp(local, remotePath) {
   if (r.status !== 0) die(`transfer failed (exit ${r.status}): ${r.stderr.trim()}`);
 }
 
-const DEVICE = 'sh "${RM2_ROOT:-}/tmp/matrix-rm2/device.sh"';
+const device = (sub) => `sh ${R(`${remoteStage}/matrix-rm2/device.sh`)} ${sub}`;
 
 function buildBinary() {
   if (opt('binary')) return opt('binary');
@@ -101,6 +118,7 @@ function revokeToken(id) {
 
 function stage(binary, deps, config) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matrix-rm2-stage-'));
+  localDirs.push(dir);
   const root = path.join(dir, 'matrix-rm2');
   fs.mkdirSync(path.join(root, 'app'), { recursive: true });
   execFileSync('tar', ['xzf', deps['xovi-bundle'], '-C', root]); // -> root/xovi/...
@@ -125,15 +143,19 @@ function stage(binary, deps, config) {
 }
 
 function upload(tarball) {
-  ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2" && mkdir -p "${RM2_ROOT:-}/tmp"');
-  scp(tarball, '/tmp/matrix-rm2-stage.tar');
-  ssh('tar xf "${RM2_ROOT:-}/tmp/matrix-rm2-stage.tar" -C "${RM2_ROOT:-}/tmp" && rm -f "${RM2_ROOT:-}/tmp/matrix-rm2-stage.tar"');
+  // The tablet creates a new, private directory with a name nothing else has; it deletes nothing.
+  const r = ssh('umask 077 && d=$(mktemp -d "${RM2_ROOT:-}/tmp/matrix-rm2.XXXXXX") && echo "${d##*/}"');
+  const name = r.stdout.trim().split('\n').pop();
+  if (!/^matrix-rm2\.[A-Za-z0-9]{6}$/.test(name)) die(`the tablet did not create a staging directory (it answered ${JSON.stringify(r.stdout.trim())}); nothing was changed`);
+  remoteStage = `/tmp/${name}`;
+  scp(tarball, `${remoteStage}/stage.tar`);
+  ssh(`tar xf ${R(`${remoteStage}/stage.tar`)} -C ${R(remoteStage)} && rm -f ${R(`${remoteStage}/stage.tar`)}`);
 }
 
 // Runs the first-run check on the tablet and reports it on the Mac. For an
 // unsupported tablet it also writes the diagnostic PDF for USB import.
 function check() {
-  const r = ssh(`${DEVICE} check`, { allowFail: true });
+  const r = ssh(device('check'), { allowFail: true });
   let rep;
   try { rep = JSON.parse(r.stdout.trim().split('\n').pop()); } catch {
     die(`the first-run check did not produce a report (exit ${r.status}):\n${(r.stderr || r.stdout).trim()}`);
@@ -173,11 +195,10 @@ if (cmd === 'check' || cmd === 'install') {
   if (!rep.supported && rep.code !== 7) {
     if (made.tokenId) revokeToken(made.tokenId); // the device token never reached the tablet
     refusePdf(rep);
-    ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2"');
-    process.exit(rep.code);
+    finish(rep.code);
   }
-  if (cmd === 'check') { ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2"'); process.exit(rep.code); }
-  const r = ssh(`${DEVICE} install`, { allowFail: true });
+  if (cmd === 'check') finish(rep.code);
+  const r = ssh(device('install'), { allowFail: true });
   process.stdout.write(r.stdout);
   if (r.status !== 0) {
     revokeToken(made.tokenId); // the token never reached a working install
@@ -187,17 +208,18 @@ if (cmd === 'check' || cmd === 'install') {
   console.log(`  1. One time per software version, build the XOVI hashtable (interactive; asks for the tablet passcode):\n       ssh -t root@${host} /home/root/xovi/rebuild_hashtable`);
   console.log(`  2. Start it for this boot:   scripts/rm2-install activate --host ${host}`);
   console.log('  3. On the tablet open AppLoad and tap Matrix. The first-run report appears; tap the screen to confirm touch.');
+  finish(0);
 } else {
   // activate/stock/uninstall need device.sh on the tablet: send just the script.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matrix-rm2-ctl-'));
+  localDirs.push(dir);
   fs.mkdirSync(path.join(dir, 'matrix-rm2'));
   fs.copyFileSync(path.join(REPO, 'rm2', 'app', 'device.sh'), path.join(dir, 'matrix-rm2', 'device.sh'));
   const tarball = path.join(dir, 'stage.tar');
   execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2']);
   upload(tarball);
-  const r = ssh(`${DEVICE} ${cmd}`, { allowFail: true });
+  const r = ssh(device(cmd), { allowFail: true });
   process.stdout.write(r.stdout);
   process.stderr.write(r.stderr);
-  ssh('rm -rf "${RM2_ROOT:-}/tmp/matrix-rm2"', { allowFail: true });
-  process.exit(r.status);
+  finish(r.status);
 }
