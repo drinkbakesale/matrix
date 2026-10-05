@@ -7,12 +7,12 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 const webpush = require('web-push');
 const { cleanLabel } = require('./session-identity');
 const { VAPID_PATH, SUBS_PATH } = require('./matrix-config');
 const attention = require('./attention');
 const { resolveLiveNotificationTarget } = require('./sessions');
+const { typeInto } = require('./pane-stream');
 
 // VAPID "sub" must be a valid mailto:/https: URI with a routable domain — Apple Push
 // Services rejects localhost/non-routable domains with 403 BadJwtToken.
@@ -173,11 +173,13 @@ function mount(app) {
     res.json({ ok: true });
   });
 
-  app.post('/api/send', (req, res) => {
+  // Same typing rule as the terminal stream: text and return as separate writes, so a long
+  // message is submitted rather than left in the input box. Argument vector, no shell.
+  app.post('/api/send', async (req, res) => {
     const { session, text } = req.body;
     if (!session || !text) return res.status(400).json({ error: 'session and text required' });
     try {
-      execSync(`tmux send-keys -t '${session}' ${JSON.stringify(text)} Enter`);
+      await typeInto(session, String(text) + '\r');
       attention.clearForSession(session);
       res.json({ ok: true });
     } catch (e) {

@@ -31,6 +31,26 @@ function tmux(args, extra) {
   return execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], ...extra });
 }
 
+// Claude Code reads a burst of keystrokes that arrives in one write as a paste, and a return
+// at the end of a paste is not a submit. Typing "message + \r" as one send-keys call left
+// messages of roughly 90+ characters sitting fully typed in the input box (measured on a live
+// session: 30/60 submitted, 90/120/800 stuck). So the text and the return go as two separate
+// writes with a short gap — measured to submit at every length tried, up to 3000 characters.
+const ENTER_GAP_MS = 80;
+const hexKeys = text => Buffer.from(text).toString('hex').match(/.{2}/g).map(h => '0x' + h);
+
+async function typeInto(target, data, { run = tmux, wait = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+  const text = String(data);
+  if (!text) return;
+  const submits = text.length > 1 && text.endsWith('\r');
+  const body = submits ? text.slice(0, -1) : text;
+  run(['send-keys', '-t', target, '-H', ...hexKeys(body)]);
+  if (submits) {
+    await wait(ENTER_GAP_MS);
+    run(['send-keys', '-t', target, '-H', '0x0d']);
+  }
+}
+
 const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
 
 // Listing rows put the NAME last, so a name containing `|` cannot shift the other columns.
@@ -192,12 +212,17 @@ function attach(wss, { port }) {
 
     initStreaming();
 
+    // Inputs are typed strictly in order: a second message never interleaves with the first
+    // one's text-then-return pair.
+    let typing = Promise.resolve();
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw);
         if (msg.type === 'input') {
-          const hex = Buffer.from(msg.data).toString('hex').match(/.{2}/g).map(h => '0x' + h);
-          tmux(['send-keys', '-t', target, '-H', ...hex]);
+          typing = typing.then(() => typeInto(target, msg.data)).catch(err => {
+            console.error(`[pane-stream] typing into ${session} failed: ${err.message}`);
+            if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input-error', message: err.message }));
+          });
           attention.clearForSession(session);   // the user just answered
         } else if (msg.type === 'resize') {
           const size = getPaneSize();
@@ -220,4 +245,4 @@ function attach(wss, { port }) {
   });
 }
 
-module.exports = { attach };
+module.exports = { attach, typeInto, ENTER_GAP_MS };
