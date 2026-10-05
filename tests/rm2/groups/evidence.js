@@ -26,79 +26,116 @@ module.exports = (L) => {
   const asstRec = (id, blocks, extra = {}) => jl({ type: 'assistant', isSidechain: false, uuid: `a-${id}`, message: { id, role: 'assistant', content: blocks }, ...extra });
   const text = (t) => ({ type: 'text', text: t });
 
-  // A14-1: a transcript read that ends inside a multi-byte character must not damage it. Driven through the
-  // production collector (polls while working), reducer, final digest, and the RM client's rendered digest.
+  // A14-1: a transcript read that ends inside a multi-byte character must not damage it. Production
+  // collector, reducer and digest (the service wired by build(), with only tmux doubled), then the
+  // production renderer. Each collection cycle is awaited and observed: the collector announces
+  // "progress" exactly when it consumed new transcript bytes, so the test knows the incomplete bytes
+  // were read before it appends the rest. No sleeps. All observations go to the case artifacts.
   async function splitCharacters(t) {
-    const tm = L.fakeTmux(); const p = tm.pane({}); tm.setPanes([p]);
-    const srv = await L.startServer({ env: tm.env, tls: true });
-    L.hookToken(srv);
-    const ctl = srv.token('controller'); const sid = L.sessionId(p);
-    const sess = async () => ((await L.http('GET', `${srv.api}/snapshot`, { token: ctl })).data.sessions.find((q) => q.id === sid));
-    await L.until(sess, 5000, 'the session to be collected');
-    assert.equal((await L.http('POST', `${srv.api}/select`, { token: ctl, body: { session_id: sid, base_revision: 1 } })).status, 200);
-    const conv = 'conv-utf8-split-01';
-    const file = path.join(srv.transcripts, 'proj', `${conv}.jsonl`);
-    fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, '');
-    const fire = (name, extra = {}) => L.hook(srv, p, { session_id: conv, transcript_path: file, hook_event_name: name, ...extra });
-    const client = await L.startClient({ endpoints: [srv.endpoint()], token: srv.token('device') });
-    const polls = () => L.wait(400); // at least two collector polls (every 150ms) while the session is working
-    const finish = async (body, what) => {
-      fire('Stop', { stop_hook_active: false }); // no last_assistant_message: the text can only come from the transcript
-      const s = await sess();
-      assert.deepEqual([s.state, s.message.available, s.message.text, s.message.reason], ['done', true, body, ''], `${what}: the final digest is the exact source text`);
-      const d = await client.waitDump((q) => (q.visible.digest || '').includes(body), 6000, `the RM2 to render ${JSON.stringify(body)} (${what})`);
-      assert.ok(!d.visible.digest.includes('\uFFFD'), `${what}: no replacement character is rendered`);
-    };
-    let n = 0; let previous = null; const seen = [];
-    for (const [ch, source] of [['é', 'Complete café response'], ['✓', 'Checked ✓ twice'], ['😀', 'Smile 😀 end']]) {
-      const width = Buffer.byteLength(ch);
-      for (let k = 1; k < width; k++) {
-        n += 1;
-        const body = `${source} #${n}`; const prompt = `split turn ${n}`;
-        fire('UserPromptSubmit', { prompt });
-        const rec = Buffer.from(asstRec(`m-split-${n}`, [text(body)]));
-        const cut = rec.indexOf(Buffer.from(ch)) + k; // the record stops k bytes into the character
-        fs.appendFileSync(file, Buffer.concat([Buffer.from(userRec(prompt)), rec.subarray(0, cut)]));
-        await polls();
-        const s = await sess();
-        assert.equal(s.state, 'working');
-        if (previous === null) assert.equal(s.message.available, false, 'nothing is shown from a partial record');
-        else assert.deepEqual([s.message.available, s.message.text], [true, previous], 'the preceding complete message is intact while the new record is partial');
-        fs.appendFileSync(file, rec.subarray(cut));
-        await finish(body, `${width}-byte ${ch} split after byte ${k}`);
-        previous = body; seen.push(`${width}b@${k}`);
+    const out = path.join(t.dir, 'utf8-split.json');
+    const evidence = { finding: 'A14-1', splits: [], bytewise: null, resets: [], invalid: null };
+    const hex = (b) => Buffer.from(b).toString('hex');
+    try {
+      const tm = L.fakeTmux(); const p = tm.pane({}); tm.setPanes([p]);
+      process.env.FAKE_TMUX_DIR = tm.dir;
+      const home = L.tmp('utf8');
+      const { build } = require(path.join(L.candidate, 'server/lib/eink'));
+      const sys = build({ home, tmuxBin: tm.bin, sendPush: async () => {}, vapidReady: () => true, transcriptRoot: home });
+      await sys.evidence.collect();
+      const sid = L.sessionId(p);
+      sys.service.select({ session_id: sid, base_revision: 1 });
+      const conv = 'conv-utf8-split-01';
+      const file = path.join(home, `${conv}.jsonl`);
+      fs.writeFileSync(file, '');
+      let seq = 0;
+      const ingest = (name, extra = {}) => sys.evidence.ingest({ v: 1, event_id: `utf8-evt-${String(++seq).padStart(4, '0')}`, seq, hook_event_name: name, session_id: conv, transcript_path: file, cwd: home, pane: { server_pid: p.pid, pane_id: p.pane_id }, ...extra });
+      const events = [];
+      sys.service.addClient((type, body) => events.push({ type, ...JSON.parse(body) }));
+      // One awaited production collection cycle; returns how many times it reported consuming transcript bytes.
+      const cycle = async () => { const n = events.length; await sys.evidence.tick(); return events.slice(n).filter((e) => e.type === 'progress' && e.session_ids.includes(sid)).length; };
+      const view = () => { const v = sys.service.snapshot().sessions.find((q) => q.id === sid); return { state: v.state, message: v.message, prompt: v.prompt.text }; };
+      const rendered = () => L.script({ screen: [1404, 1872], initial: { snapshot: JSON.parse(JSON.stringify(sys.service.snapshot())) }, config: { typing_coalesce_ms: 100, clean_after_partials: 100, quiet_ms: 3000 }, steps: [{ op: 'tick', at_ms: 1 }] }).steps[0].visible_text.digest;
+      const finish = async (body, rec) => {
+        await ingest('Stop', { stop_hook_active: false }); // no last_assistant_message: the text can only come from the transcript
+        const final = view(); const digest = rendered();
+        Object.assign(rec, { final_snapshot: final, rendered_digest: digest });
+        assert.deepEqual([final.state, final.message.available, final.message.text, final.message.reason], ['done', true, body, ''], `${rec.what}: the final digest is the exact source text`);
+        assert.ok(digest.includes(body) && !digest.includes('�'), `${rec.what}: the RM2 renders the exact text with no replacement character: ${JSON.stringify(digest)}`);
+      };
+      let n = 0; let previous = null;
+      for (const [ch, source] of [['é', 'Complete café response'], ['✓', 'Checked ✓ twice'], ['😀', 'Smile 😀 end']]) {
+        const width = Buffer.byteLength(ch);
+        for (let k = 1; k < width; k++) {
+          n += 1;
+          const body = `${source} #${n}`; const prompt = `split turn ${n}`;
+          const bytes = Buffer.from(asstRec(`m-split-${n}`, [text(body)]));
+          const cut = bytes.indexOf(Buffer.from(ch)) + k; // the record stops k bytes into the character
+          const rec = { what: `${width}-byte ${ch} split after byte ${k}`, label: `${width}b@${k}`, character: ch, source_text: body, record_hex: hex(bytes), split_offset: cut, character_offset: cut - k };
+          evidence.splits.push(rec);
+          await ingest('UserPromptSubmit', { prompt });
+          fs.appendFileSync(file, Buffer.concat([Buffer.from(userRec(prompt)), bytes.subarray(0, cut)]));
+          rec.collections = [await cycle(), await cycle()]; // growth is consumed, then a poll that finds nothing new
+          rec.intermediate_snapshot = view();
+          assert.deepEqual(rec.collections, [1, 0], `${rec.what}: the collector consumed the incomplete bytes, and the next poll found no growth`);
+          assert.equal(rec.intermediate_snapshot.state, 'working');
+          if (previous === null) assert.equal(rec.intermediate_snapshot.message.available, false, 'nothing is shown from a partial record');
+          else assert.deepEqual([rec.intermediate_snapshot.message.available, rec.intermediate_snapshot.message.text], [true, previous], 'the preceding complete message is intact while the new record is partial');
+          fs.appendFileSync(file, bytes.subarray(cut));
+          await finish(body, rec);
+          previous = body;
+        }
       }
+      // Successive one-byte appends across all three characters, each consumed by its own collection cycle,
+      // each followed by a cycle that finds no growth.
+      const body = 'A é ✓ 😀 Z'; const bytes = Buffer.from(asstRec('m-bytewise', [text(body)]));
+      const from = bytes.indexOf(Buffer.from('é')); const to = bytes.indexOf(Buffer.from('😀')) + 4;
+      const bw = { what: `${to - from} one-byte appends`, source_text: body, record_hex: hex(bytes), first_offset: from, end_offset: to, collections: [] };
+      evidence.bytewise = bw;
+      await ingest('UserPromptSubmit', { prompt: 'bytewise' });
+      fs.appendFileSync(file, Buffer.concat([Buffer.from(userRec('bytewise')), bytes.subarray(0, from)]));
+      bw.collections.push([await cycle(), await cycle()]);
+      for (let i = from; i < to; i++) { fs.appendFileSync(file, bytes.subarray(i, i + 1)); bw.collections.push([await cycle(), await cycle()]); }
+      bw.intermediate_snapshot = view();
+      assert.ok(bw.collections.length === to - from + 1 && bw.collections.every((c) => c[0] === 1 && c[1] === 0), `every single byte was consumed by its own collection, each followed by a no-growth poll: ${JSON.stringify(bw.collections)}`);
+      assert.equal(bw.intermediate_snapshot.message.text, previous, 'still the preceding message after byte-by-byte growth of a partial record');
+      fs.appendFileSync(file, bytes.subarray(to));
+      await finish(body, bw);
+      // Pending bytes do not leak into a truncated or replaced file; invalid bytes are reported, not shown.
+      const { createTranscriptReader } = require(path.join(L.candidate, 'server/lib/eink/transcript'));
+      for (const how of ['truncated', 'replaced']) {
+        const f = path.join(L.tmp('transcript'), 't.jsonl');
+        const old = Buffer.from(asstRec('old', [text(`${'x'.repeat(300)} café`)]));
+        const partial = Buffer.concat([Buffer.from(userRec('p1')), old.subarray(0, old.indexOf(Buffer.from('é')) + 1)]);
+        fs.writeFileSync(f, partial);
+        const r = createTranscriptReader({ path: f });
+        r.poll();
+        const pending = r.view();
+        const fresh = userRec('p2') + asstRec('new', [text('new ✓ text')]);
+        if (how === 'replaced') { fs.writeFileSync(`${f}.new`, fresh); fs.renameSync(`${f}.new`, f); } else { fs.truncateSync(f, 0); fs.writeFileSync(f, fresh); }
+        r.poll();
+        const v = r.view();
+        evidence.resets.push({ how, old_bytes_hex_tail: hex(partial.subarray(partial.length - 8)), view_while_pending: pending, new_contents: fresh, view_after: v });
+        assert.equal(pending.hasPartialLine, true, 'the cut record is pending');
+        assert.deepEqual([v.prompt, v.assistantText, v.malformed, v.hasPartialLine], ['p2', 'new ✓ text', 0, false], `${how}: the pending byte did not leak into the new contents`);
+        assert.match(v.error, new RegExp(how), `${how} is still reported`);
+      }
+      const bad = path.join(L.tmp('transcript'), 'bad.jsonl');
+      const badBytes = Buffer.concat([Buffer.from(userRec('p')), Buffer.from([0x7b, 0xff, 0xfe, 0x0a])]);
+      fs.writeFileSync(bad, badBytes);
+      const rb = createTranscriptReader({ path: bad }); rb.poll();
+      evidence.invalid = { bytes_hex_tail: hex(badBytes.subarray(badBytes.length - 4)), view: rb.view() };
+      assert.deepEqual([rb.view().malformed, /not valid UTF-8/.test(rb.view().error), rb.view().assistantText], [1, true, null], 'a complete line that is not UTF-8 is reported as malformed');
+    } finally {
+      delete process.env.FAKE_TMUX_DIR;
+      fs.writeFileSync(out, JSON.stringify(evidence, null, 1));
     }
-    // Successive one-byte appends across all three characters, with polls that find no growth in between.
-    const body = 'A é ✓ 😀 Z'; const rec = Buffer.from(asstRec('m-bytewise', [text(body)]));
-    const from = rec.indexOf(Buffer.from('é')); const to = rec.indexOf(Buffer.from('😀')) + 4;
-    fire('UserPromptSubmit', { prompt: 'bytewise' });
-    fs.appendFileSync(file, Buffer.concat([Buffer.from(userRec('bytewise')), rec.subarray(0, from)]));
-    for (let i = from; i < to; i++) { fs.appendFileSync(file, rec.subarray(i, i + 1)); await L.wait(i % 3 === 0 ? 500 : 200); }
-    assert.equal((await sess()).message.text, previous, 'still the preceding message after byte-by-byte growth of a partial record');
-    fs.appendFileSync(file, rec.subarray(to));
-    await finish(body, `${to - from} one-byte appends`);
-    // Pending bytes do not leak into a truncated or replaced file; invalid bytes are reported, not shown.
-    const { createTranscriptReader } = require(path.join(L.candidate, 'server/lib/eink/transcript'));
-    for (const how of ['truncated', 'replaced']) {
-      const f = path.join(L.tmp('transcript'), 't.jsonl');
-      const old = Buffer.from(asstRec('old', [text(`${'x'.repeat(300)} café`)]));
-      fs.writeFileSync(f, Buffer.concat([Buffer.from(userRec('p1')), old.subarray(0, old.indexOf(Buffer.from('é')) + 1)]));
-      const r = createTranscriptReader({ path: f });
-      r.poll();
-      assert.equal(r.view().hasPartialLine, true, 'the cut record is pending');
-      const fresh = userRec('p2') + asstRec('new', [text('new ✓ text')]);
-      if (how === 'replaced') { fs.writeFileSync(`${f}.new`, fresh); fs.renameSync(`${f}.new`, f); } else { fs.truncateSync(f, 0); fs.writeFileSync(f, fresh); }
-      r.poll();
-      const v = r.view();
-      assert.deepEqual([v.prompt, v.assistantText, v.malformed, v.hasPartialLine], ['p2', 'new ✓ text', 0, false], `${how}: the pending byte did not leak into the new contents`);
-      assert.match(v.error, new RegExp(how), `${how} is still reported`);
-    }
-    const bad = path.join(L.tmp('transcript'), 'bad.jsonl');
-    fs.writeFileSync(bad, Buffer.concat([Buffer.from(userRec('p')), Buffer.from([0x7b, 0xff, 0xfe, 0x0a])]));
-    const rb = createTranscriptReader({ path: bad }); rb.poll();
-    assert.deepEqual([rb.view().malformed, /not valid UTF-8/.test(rb.view().error), rb.view().assistantText], [1, true, null], 'a complete line that is not UTF-8 is reported as malformed');
-    t.note(`UTF-8 across polls: ${seen.join(' ')} and ${to - from} one-byte appends → exact text in the final digest and on the RM2, preceding message intact while partial; truncation/replacement drop pending bytes; invalid UTF-8 reported`);
+    // The observations were stored and are complete.
+    const stored = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.deepEqual(stored.splits.map((q) => q.label), ['2b@1', '3b@1', '3b@2', '4b@1', '4b@2', '4b@3'], 'every internal split position of 2-, 3- and 4-byte characters is recorded');
+    assert.ok([...stored.splits, stored.bytewise].every((q) => q.record_hex && q.source_text && q.collections.length && q.intermediate_snapshot && q.final_snapshot && typeof q.rendered_digest === 'string'), 'each case stores source bytes, collection observations, intermediate and final snapshots and the rendered text');
+    assert.ok(stored.splits.every((q) => Number.isInteger(q.split_offset) && Buffer.from(q.record_hex, 'hex').subarray(q.character_offset).toString('utf8').startsWith(q.character) && q.split_offset > q.character_offset && q.split_offset < q.character_offset + Buffer.byteLength(q.character)), 'each stored split offset really lies inside the stored character');
+    assert.ok(stored.resets.length === 2 && stored.resets.every((q) => q.view_while_pending && q.view_after) && stored.invalid && stored.invalid.view, 'the reset and invalid-byte observations are stored');
+    t.note(`UTF-8 across polls: ${stored.splits.map((q) => q.label).join(' ')} and ${stored.bytewise.collections.length - 1} one-byte appends, each consumed by an awaited collection ([1 progress, then 0]) → exact text in the final digest and rendered digest, preceding message intact while partial; truncation/replacement drop pending bytes; invalid UTF-8 reported; observations in utf8-split.json`);
   }
 
   return {
