@@ -1,70 +1,15 @@
 // Brief:: acceptance cases — the pinned view on both clients, refresh and per-field edits,
 // and cross-session isolation plus the truthful failure states.
 
-import { newPage, emit, saveArtifact, announceStreamTarget, emptyWindowBindingCases } from './browser-support.mjs';
-import { control, waitForControl } from './browser-server.mjs';
+import { emit, saveArtifact, announceStreamTarget, emptyWindowBindingCases } from './browser-support.mjs';
+import {
+  control, waitForControl, setPageClock,
+  settleAndRefresh, waitForBrief, readBrief, openClient, editField, expectAge,
+} from './browser-server.mjs';
 
 export const F1 = { goal: 'improve copy generation quality', current: 'add a judging step to compare candidate copy' };
 export const F2 = { goal: 'improve copy generation quality', current: 'fix inconsistent score normalization' };
 export const F3 = { goal: 'reliable inventory tracking', current: 'repair barcode import validation' };
-
-async function settleAndRefresh(page) {
-  await control(page, 'settle');
-  await page.evaluate(() => briefView.refresh());
-  await page.waitForTimeout(80);
-}
-
-// Waits for the DELIVERED client poll to bring a change in on its own. Nothing here calls
-// briefView.refresh(), so the deadline really is the shipped polling interval plus slack.
-async function waitForBrief(page, predicate, deadlineMs, label) {
-  const started = Date.now();
-  for (;;) {
-    const brief = await readBrief(page);
-    if (predicate(brief)) return { brief, elapsedMs: Date.now() - started };
-    if (Date.now() - started > deadlineMs) {
-      throw new Error(`${label}: client poll did not update within ${deadlineMs}ms (last ${JSON.stringify(brief)})`);
-    }
-    await page.waitForTimeout(100);
-  }
-}
-
-async function readBrief(page) {
-  return page.evaluate(() => ({
-    status: document.getElementById('brief').getAttribute('data-status'),
-    goal: document.getElementById('brief-goal').textContent,
-    current: document.getElementById('brief-current').textContent,
-    age: document.getElementById('brief-age').textContent,
-    note: document.getElementById('brief-status').textContent,
-    generated: briefView.current() ? briefView.current().generated : null,
-    generatedAt: briefView.current() ? briefView.current().generatedAt : null,
-    evidenceAt: briefView.current() ? briefView.current().evidenceAt : null,
-    revision: briefView.current() ? briefView.current().revision : null,
-    stale: briefView.current() ? briefView.current().stale : null,
-  }));
-}
-
-async function openClient(ctx, kind, name = 'A') {
-  if (kind === 'mobile') {
-    const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'] });
-    await page.goto(`${ctx.origin}/?open=${encodeURIComponent(name)}`);
-    await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
-    return { context, page };
-  }
-  const { context, page } = await newPage(ctx.browser, { viewport: { width: 1280, height: 860 } });
-  await page.goto(`${ctx.origin}/desktop.html`);
-  await page.waitForSelector(`.project-item[data-session="${name}"]`);
-  await page.click(`.project-item[data-session="${name}"] .project-content`);
-  await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
-  return { context, page };
-}
-
-async function editField(page, field, value) {
-  await page.click(`#brief-edit-${field}`);
-  await page.waitForSelector(`#brief-input-${field}`);
-  await page.fill(`#brief-input-${field}`, value);
-  await page.click(`#brief-save-${field}`);
-  await page.waitForTimeout(120);
-}
 
 export async function pinnedBothClients(ctx, t) {
   const boxes = {};
@@ -140,6 +85,27 @@ export async function pinnedBothClients(ctx, t) {
     await page.keyboard.press('Escape');
 
     await page.screenshot({ path: `${ctx.artifactDir}/brief-${kind}.png` });
+
+    // What the user actually reads for freshness, on BOTH clients. A failed refresh first
+    // opens a gap between the two timestamps, because while they are equal no assertion
+    // about the age line can tell which of them the renderer used.
+    await fetch(`${ctx.origin}/__control/mode?mode=fail`);
+    await fetch(`${ctx.origin}/__control/pane?session=A&pane=${encodeURIComponent(ctx.panes.f2)}`);
+    await fetch(`${ctx.origin}/__control/advance?ms=31000`);
+    await settleAndRefresh(page);
+    const aged = await readBrief(page);
+    t.eq(aged.generatedAt, brief.generatedAt, `${kind}: the failed refresh leaves the last successful generation in place`);
+    t.ok(aged.evidenceAt > aged.generatedAt, `${kind}: and moves source freshness ahead of it (${aged.generatedAt} -> ${aged.evidenceAt})`);
+    await expectAge(page, t, { at: aged.generatedAt + 600000, expected: 'updated 10 min ago', label: `${kind}: ten minutes after it` });
+    await expectAge(page, t, { at: aged.generatedAt + 7200000, expected: 'updated 2 h ago', label: `${kind}: two hours after it` });
+    // Hand the shared fixture back in a generated state: a recorded failure also arms the
+    // service's retry backoff, which would otherwise silence the next case's first poll.
+    await fetch(`${ctx.origin}/__control/mode?mode=ok`);
+    await fetch(`${ctx.origin}/__control/pane?session=A&pane=${encodeURIComponent(ctx.panes.f1)}`);
+    await fetch(`${ctx.origin}/__control/advance?ms=120000`);
+    await settleAndRefresh(page);
+    t.eq((await readBrief(page)).stale, false,
+      `${kind}: the injected failure is cleared before the next case sees the fixture`);
     await context.close();
   }
   saveArtifact(ctx.artifactDir, 'brief-layout.json', boxes);
@@ -182,6 +148,10 @@ export async function updatesAndOverrides(ctx, t) {
   t.ok(failed.evidenceAt !== failed.generatedAt, 'and evidenceAt is then not an echo of generatedAt');
   t.eq(failed.stale, true, 'the kept text is labelled stale');
   t.includes(failed.note, 'refresh failed', 'the failure is visible to the user');
+  // AFTER FAILURE the visible age must still name the last success, not the source it just
+  // re-read: the whole point of the stale label is that nothing new was generated.
+  await expectAge(page, t, { at: failed.generatedAt + 7200000, expected: 'updated 2 h ago', label: 'after a failed refresh' });
+  await setPageClock(page, ctx.server.clock.now());
   await control(page, 'mode', { mode: 'ok' }); await control(page, 'pane', { session: 'A', pane: ctx.panes.f2 });
 
   // Per-field edits.
@@ -236,6 +206,13 @@ export async function updatesAndOverrides(ctx, t) {
   // source. Changing the pane first lets the client's own 3s poll generate it ungated, after
   // which the held job re-reads identical evidence and freshness correctly does not move.
   const beforeHold = await readBrief(page);
+  // Anchor the page clock to a known bucket BEFORE the hold, and leave it there across the
+  // whole race: with the reader's clock standing still, any change in the age line can only
+  // come from the record behind it, so "did freshness move?" becomes directly observable.
+  const anchor = beforeHold.generatedAt + 600000;
+  await setPageClock(page, anchor);
+  t.eq((await readBrief(page)).age, 'updated 10 min ago',
+    'before the held job the age line reads ten minutes since the last success');
   const enteredBefore = (await control(page, 'genstate')).entered;
   await control(page, 'gate');
   await control(page, 'pane', { session: 'A', pane: ctx.panes.f1 });
@@ -253,15 +230,30 @@ export async function updatesAndOverrides(ctx, t) {
   const pending = await readBrief(page);
   t.eq(pending.generatedAt, beforeHold.generatedAt, 'a pending generation does not advance the displayed generation time');
   t.ok(pending.evidenceAt > beforeHold.evidenceAt, `while evidenceAt already describes the changed source (${beforeHold.evidenceAt} -> ${pending.evidenceAt})`);
+  // DURING the hold, on the unmoved reader clock: the age line must not have budged.
+  await expectAge(page, t, { at: anchor, expected: 'updated 10 min ago', label: 'while a generation is in flight' });
   await editField(page, 'current', 'saved while the job was mid-flight');
   t.eq((await readBrief(page)).current, 'saved while the job was mid-flight', 'the edit is accepted while generation is in flight');
   t.eq((await control(page, 'genstate')).pending, 1, 'the job was still held when the edit was saved');
+  // Let fixture time pass while the job is still held, so the generation it eventually
+  // records is stamped later than the source it read — otherwise the two timestamps would
+  // coincide on completion and the age assertion after it could not discriminate.
+  await control(page, 'advance', { ms: 120000 });
   await control(page, 'ungate');
   await settleAndRefresh(page);
   brief = await readBrief(page);
   t.ok(brief.generatedAt > beforeHold.generatedAt, 'the displayed generation time advances only once the job succeeded');
   t.eq(brief.current, 'saved while the job was mid-flight', 'the completing job cannot clobber an edit saved after it started');
   t.eq(brief.generated.current, F1.current, 'but the generated value underneath did complete and update');
+  // AFTER the job succeeded, with the reader's clock still on the same anchor: the age line
+  // must stop reading the pre-hold generation, and must read the new one.
+  t.ok((await readBrief(page)).age !== 'updated 10 min ago',
+    'once the job succeeds the age line stops reading the generation it replaced');
+  // The minute bucket, not the hour bucket: here the source is EARLIER than the generation
+  // that read it, so an evidenceAt renderer would print a LARGER age, and only a bucket fine
+  // enough to resolve the 120s gap can tell the two apart.
+  await expectAge(page, t, { at: brief.generatedAt + 600000, expected: 'updated 10 min ago', label: 'after the held job completed' });
+  await setPageClock(page, ctx.server.clock.now());
   await control(page, 'restart');
   await settleAndRefresh(page);
   brief = await readBrief(page);

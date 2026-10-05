@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { newPage } from './browser-support.mjs';
 import {
   briefGenerator, briefRoutes, briefTmux, fakeClock, fakeTmuxProcess, tmuxStack, makeService, tempDir,
 } from './service-support.mjs';
@@ -275,4 +276,111 @@ export async function waitForControl(page, op, predicate, deadlineMs, label) {
     if (Date.now() - started > deadlineMs) throw new Error(`${label}: ${op} never satisfied in ${deadlineMs}ms (last ${JSON.stringify(value)})`);
     await page.waitForTimeout(50);
   }
+}
+
+// Pins the PAGE's Date.now() onto the fixture timeline.
+//
+// matrix-brief.js renders the age line as ago(now(), brief.generatedAt), and `now()` is the
+// page's own Date.now(). The service stamps its timestamps from the injected fixture clock,
+// which starts in 2023, so an unpinned page compares a 2026 wall clock against a 2023
+// timestamp and prints "updated 1000 d ago" no matter which timestamp the renderer picked.
+// That string still contains "updated", which is why a contains-check could never see a
+// renderer reading the wrong field. Pinning the page clock is what makes the visible text a
+// measurement. Must be installed BEFORE the first navigation so the first render is already
+// on the fixture timeline.
+export function installPageClock(page, atMs) {
+  return page.addInitScript(ms => {
+    window.__pageNow = ms;
+    Date.now = () => window.__pageNow;
+  }, atMs);
+}
+
+// Moves the pinned page clock and lets the delivered view redraw from its existing record,
+// so the age line is recomputed without refetching. Returns the new value for readability.
+export async function setPageClock(page, ms) {
+  await page.evaluate(v => { window.__pageNow = v; }, ms);
+  await page.evaluate(() => briefView.refresh());
+  await page.waitForTimeout(80);
+  return ms;
+}
+
+// The page-side driver for the brief UI: opening a client on the fixture timeline,
+// reading what is on screen, and asserting the age line. Kept beside the control channel
+// and page clock it drives rather than in any one case file.
+export async function settleAndRefresh(page) {
+  await control(page, 'settle');
+  await page.evaluate(() => briefView.refresh());
+  await page.waitForTimeout(80);
+}
+
+// Waits for the DELIVERED client poll to bring a change in on its own. Nothing here calls
+// briefView.refresh(), so the deadline really is the shipped polling interval plus slack.
+export async function waitForBrief(page, predicate, deadlineMs, label) {
+  const started = Date.now();
+  for (;;) {
+    const brief = await readBrief(page);
+    if (predicate(brief)) return { brief, elapsedMs: Date.now() - started };
+    if (Date.now() - started > deadlineMs) {
+      throw new Error(`${label}: client poll did not update within ${deadlineMs}ms (last ${JSON.stringify(brief)})`);
+    }
+    await page.waitForTimeout(100);
+  }
+}
+
+export async function readBrief(page) {
+  return page.evaluate(() => ({
+    status: document.getElementById('brief').getAttribute('data-status'),
+    goal: document.getElementById('brief-goal').textContent,
+    current: document.getElementById('brief-current').textContent,
+    age: document.getElementById('brief-age').textContent,
+    note: document.getElementById('brief-status').textContent,
+    generated: briefView.current() ? briefView.current().generated : null,
+    generatedAt: briefView.current() ? briefView.current().generatedAt : null,
+    evidenceAt: briefView.current() ? briefView.current().evidenceAt : null,
+    revision: briefView.current() ? briefView.current().revision : null,
+    stale: briefView.current() ? briefView.current().stale : null,
+  }));
+}
+
+export async function openClient(ctx, kind, name = 'A') {
+  if (kind === 'mobile') {
+    const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'] });
+    await installPageClock(page, ctx.server.clock.now());
+    await page.goto(`${ctx.origin}/?open=${encodeURIComponent(name)}`);
+    await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
+    return { context, page };
+  }
+  const { context, page } = await newPage(ctx.browser, { viewport: { width: 1280, height: 860 } });
+  await installPageClock(page, ctx.server.clock.now());
+  await page.goto(`${ctx.origin}/desktop.html`);
+  await page.waitForSelector(`.project-item[data-session="${name}"]`);
+  await page.click(`.project-item[data-session="${name}"] .project-content`);
+  await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
+  return { context, page };
+}
+
+// Asserts the age line the USER SEES, and proves at the same moment that the assertion can
+// tell the two timestamps apart: it reports what an evidenceAt-reading renderer would have
+// printed instead, and requires it to differ. `expected` is always a literal, so the format
+// itself is asserted rather than recomputed from a copy of the renderer's own arithmetic.
+export async function expectAge(page, t, { at, expected, label }) {
+  await setPageClock(page, at);
+  const shown = await readBrief(page);
+  // Read from the record the renderer actually drew, not one sampled before the refresh.
+  const evidenceSecs = Math.max(0, Math.floor((at - shown.evidenceAt) / 1000));
+  const evidenceMin = Math.floor(evidenceSecs / 60);
+  const asEvidence = evidenceSecs < 45 ? 'updated just now'
+    : evidenceSecs < 3600 ? `updated ${evidenceMin} min ago`
+      : `updated ${Math.floor(evidenceSecs / 3600)} h ago`;
+  t.ok(asEvidence !== expected,
+    `${label}: at this clock an evidenceAt-reading renderer would print "${asEvidence}", not "${expected}" — the check discriminates`);
+  t.eq(shown.age, expected, `${label}: the visible age reads the last successful generation`);
+}
+
+export async function editField(page, field, value) {
+  await page.click(`#brief-edit-${field}`);
+  await page.waitForSelector(`#brief-input-${field}`);
+  await page.fill(`#brief-input-${field}`, value);
+  await page.click(`#brief-save-${field}`);
+  await page.waitForTimeout(120);
 }
