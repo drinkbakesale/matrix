@@ -12,7 +12,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TAIL_BYTES = 512 * 1024;
+// Busy sessions write megabytes between recaps, so the transcript is scanned backwards in
+// chunks until a recap turns up, up to SCAN_LIMIT_BYTES from the end.
+const CHUNK_BYTES = 512 * 1024;
+const SCAN_LIMIT_BYTES = 16 * 1024 * 1024;
 const CONFIG_HINT = /\s*\(disable recaps in \/config\)\s*$/i;
 
 function createRecapReader({ linksDir, transcriptsRoot = path.join(os.homedir(), '.claude', 'projects'), fsImpl = fs } = {}) {
@@ -30,16 +33,41 @@ function createRecapReader({ linksDir, transcriptsRoot = path.join(os.homedir(),
     return JSON.parse(raw);
   }
 
-  // Only the tail is read: transcripts grow to many megabytes and the latest recap is near the end.
-  function readTail(file) {
+  function latestRecap(rec) {
+    if (rec.type !== 'system' || rec.subtype !== 'away_summary' || typeof rec.content !== 'string') return null;
+    const text = rec.content.replace(CONFIG_HINT, '').trim();
+    return text ? { text, at: Date.parse(rec.timestamp) || null } : null;
+  }
+
+  // Newest first: walk back from the end one chunk at a time, carrying any partial line over
+  // to the next (earlier) chunk, and stop at the first recap.
+  function scanBackwards(file) {
     const fd = fsImpl.openSync(file, 'r');
     try {
       const size = fsImpl.fstatSync(fd).size;
-      const start = Math.max(0, size - TAIL_BYTES);
-      const buf = Buffer.alloc(size - start);
-      fsImpl.readSync(fd, buf, 0, buf.length, start);
-      const text = buf.toString('utf8');
-      return start > 0 ? text.slice(text.indexOf('\n') + 1) : text;   // drop a partial first line
+      const floor = Math.max(0, size - SCAN_LIMIT_BYTES);
+      let end = size;
+      let carry = Buffer.alloc(0);
+      while (end > floor) {
+        const start = Math.max(floor, end - CHUNK_BYTES);
+        const chunk = Buffer.alloc(end - start);
+        fsImpl.readSync(fd, chunk, 0, chunk.length, start);
+        const buf = Buffer.concat([chunk, carry]);
+        const text = buf.toString('utf8');
+        const firstBreak = start > floor ? text.indexOf('\n') : -1;
+        const complete = firstBreak >= 0 ? text.slice(firstBreak + 1) : text;
+        carry = firstBreak >= 0 ? buf.subarray(0, Buffer.byteLength(text.slice(0, firstBreak + 1))) : Buffer.alloc(0);
+        const lines = complete.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          if (!lines[i].includes('away_summary')) continue;
+          let rec;
+          try { rec = JSON.parse(lines[i]); } catch { continue; }
+          const recap = latestRecap(rec);
+          if (recap) return recap;
+        }
+        end = start;
+      }
+      return null;
     } finally {
       fsImpl.closeSync(fd);
     }
@@ -56,22 +84,10 @@ function createRecapReader({ linksDir, transcriptsRoot = path.join(os.homedir(),
       if (typeof identity.target === 'string' && identity.target.startsWith('@') && link.windowId !== identity.target) return null;
       const file = path.resolve(link.transcriptPath);
       if (!file.startsWith(root) || !file.endsWith('.jsonl')) return null;   // never read outside transcripts
-      let tail;
-      try { tail = readTail(file); } catch (err) {
+      try { return scanBackwards(file); } catch (err) {
         if (err.code === 'ENOENT') return null;
         throw err;
       }
-      const lines = tail.split('\n');
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (!lines[i].includes('away_summary')) continue;
-        let rec;
-        try { rec = JSON.parse(lines[i]); } catch { continue; }
-        if (rec.type !== 'system' || rec.subtype !== 'away_summary' || typeof rec.content !== 'string') continue;
-        const text = rec.content.replace(CONFIG_HINT, '').trim();
-        if (!text) continue;
-        return { text, at: Date.parse(rec.timestamp) || null };
-      }
-      return null;
     },
   };
 }

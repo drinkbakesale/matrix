@@ -160,18 +160,14 @@ function writeLink(link) {
 function run(input) {
   const pane = process.env.TMUX_PANE || '';
   if (!/^%\d+$/.test(pane) || !input || typeof input !== 'object') return;
-  const [session, windowId, paneId] = tmux(['display-message', '-p', '-t', pane,
-    '#{session_name}\t#{window_id}\t#{pane_id}']).split('\t');
-  if (!session) return;
+  // session_id ('$N') is tmux's own exact identifier: no name can be misread as a pattern.
+  const [session, sessionTarget, windowId, paneId] = tmux(['display-message', '-p', '-t', pane,
+    '#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}']).split('\t');
+  if (!session || !sessionTarget) return;
 
   const registry = buildRegistry();
   const toolPath = input.tool_input && (input.tool_input.file_path || input.tool_input.path);
   const project = projectFor(toolPath, registry) || projectFor(input.cwd, registry);
-  if (project) {
-    let current = '';
-    try { current = tmux(['show-option', '-t', '=' + session, '-v', '@matrix_project']); } catch {}
-    if (current !== project) tmux(['set-option', '-t', '=' + session, '@matrix_project', project]);
-  }
 
   const transcriptPath = typeof input.transcript_path === 'string' ? input.transcript_path : '';
   if (transcriptPath) {
@@ -180,6 +176,11 @@ function run(input) {
       sessionId: typeof input.session_id === 'string' ? input.session_id : '',
       cwd: typeof input.cwd === 'string' ? input.cwd : '', project: project || '', updatedAt: Date.now(),
     });
+  }
+  if (project) {
+    let current = '';
+    try { current = tmux(['show-option', '-t', sessionTarget, '-v', '@matrix_project']); } catch {}
+    if (current !== project) tmux(['set-option', '-t', sessionTarget, '@matrix_project', project]);
   }
   return session;
 }

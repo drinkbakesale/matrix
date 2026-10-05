@@ -73,3 +73,13 @@ test('with no recap the pane-based extraction still applies', async () => {
   const brief = validateBriefOutput(await createExtractiveGenerator().generate({ items }), items, { literalRequired: true });
   assert.match(brief.goal.text, /improve copy generation quality/);
 });
+
+test('a recap far back in a busy transcript is still found, across chunk boundaries', () => {
+  const filler = Array.from({ length: 3000 }, (_, i) => JSON.stringify({ type: 'assistant', n: i, text: 'x'.repeat(500 + (i % 37)) }));
+  const { reader, root } = fixture({ transcript: [OLD, NEW, ...filler] });
+  try {
+    const recap = reader.read({ name: '146', target: '@7' });
+    assert.ok(recap, 'found more than 1.5 MB back');
+    assert.match(recap.text, /^Goal: Matrix audit/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
