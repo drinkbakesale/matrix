@@ -2,15 +2,11 @@
 // and cross-session isolation plus the truthful failure states.
 
 import { newPage, emit, saveArtifact, announceStreamTarget, emptyWindowBindingCases } from './browser-support.mjs';
+import { control, waitForControl } from './browser-server.mjs';
 
 export const F1 = { goal: 'improve copy generation quality', current: 'add a judging step to compare candidate copy' };
 export const F2 = { goal: 'improve copy generation quality', current: 'fix inconsistent score normalization' };
 export const F3 = { goal: 'reliable inventory tracking', current: 'repair barcode import validation' };
-
-const control = (page, op, params = {}) => page.evaluate(
-  ([o, p]) => fetch(`/__control/${o}?${new URLSearchParams(p)}`).then(r => r.json()),
-  [op, params],
-);
 
 async function settleAndRefresh(page) {
   await control(page, 'settle');
@@ -29,18 +25,6 @@ async function waitForBrief(page, predicate, deadlineMs, label) {
       throw new Error(`${label}: client poll did not update within ${deadlineMs}ms (last ${JSON.stringify(brief)})`);
     }
     await page.waitForTimeout(100);
-  }
-}
-
-// Polls a control endpoint until `predicate` holds, so the race waits on an observed
-// generator state rather than a guessed delay.
-async function waitForControl(page, op, predicate, deadlineMs, label) {
-  const started = Date.now();
-  for (;;) {
-    const value = await control(page, op);
-    if (predicate(value)) return value;
-    if (Date.now() - started > deadlineMs) throw new Error(`${label}: ${op} never satisfied in ${deadlineMs}ms (last ${JSON.stringify(value)})`);
-    await page.waitForTimeout(50);
   }
 }
 
@@ -248,20 +232,34 @@ export async function updatesAndOverrides(ctx, t) {
   // the evidence moves to a fixture neither field has carried (f3 again would hit the
   // unchanged-fingerprint early return and start no job), and the generator is held at an
   // explicit boundary, so the test can see generation entered and is still pending.
-  await control(page, 'pane', { session: 'A', pane: ctx.panes.f1 });
+  // The gate goes on BEFORE the evidence moves, so the held job is the FIRST to see the new
+  // source. Changing the pane first lets the client's own 3s poll generate it ungated, after
+  // which the held job re-reads identical evidence and freshness correctly does not move.
+  const beforeHold = await readBrief(page);
   const enteredBefore = (await control(page, 'genstate')).entered;
   await control(page, 'gate');
+  await control(page, 'pane', { session: 'A', pane: ctx.panes.f1 });
   await control(page, 'advance', { ms: 31000 });
   const racing = await waitForControl(page, 'genstate',
     g => g.entered > enteredBefore && g.pending > 0, 8000, 'held generation');
   t.ok(racing.entered > enteredBefore, `the held generation really started (entered ${racing.entered})`);
   t.ok(racing.pending > 0, 'and is still pending at the boundary, not already finished');
+  // While that job is held, the displayed freshness must still describe the LAST SUCCESS,
+  // not the job in flight, even though the source it is reading has already moved on.
+  // Pull the record the client is holding straight from the server — `settleAndRefresh`
+  // cannot be used here because `settle` waits for the very job this case is holding open.
+  await page.evaluate(() => briefView.refresh());
+  await page.waitForTimeout(150);
+  const pending = await readBrief(page);
+  t.eq(pending.generatedAt, beforeHold.generatedAt, 'a pending generation does not advance the displayed generation time');
+  t.ok(pending.evidenceAt > beforeHold.evidenceAt, `while evidenceAt already describes the changed source (${beforeHold.evidenceAt} -> ${pending.evidenceAt})`);
   await editField(page, 'current', 'saved while the job was mid-flight');
   t.eq((await readBrief(page)).current, 'saved while the job was mid-flight', 'the edit is accepted while generation is in flight');
   t.eq((await control(page, 'genstate')).pending, 1, 'the job was still held when the edit was saved');
   await control(page, 'ungate');
   await settleAndRefresh(page);
   brief = await readBrief(page);
+  t.ok(brief.generatedAt > beforeHold.generatedAt, 'the displayed generation time advances only once the job succeeded');
   t.eq(brief.current, 'saved while the job was mid-flight', 'the completing job cannot clobber an edit saved after it started');
   t.eq(brief.generated.current, F1.current, 'but the generated value underneath did complete and update');
   await control(page, 'restart');

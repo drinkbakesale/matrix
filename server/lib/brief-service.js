@@ -303,11 +303,16 @@ class BriefService {
       // Re-checked on the same binding the job was scheduled under.
       const live = await this.resolveSession(identity.name, identity.window || '', { authoritative: !!identity.bound });
       if (!live || sessionKey(live) !== key) return;
-      if (evidence.fingerprint !== state.fingerprint) {
-        state.fingerprint = evidence.fingerprint;
-        state.evidenceAt = evidence.evidenceAt;
-      }
       const record = this.store.get(identity);
+      // Source freshness moves only when the SOURCE really changed, and "changed" has to be
+      // judged against what was last generated from — not against runtime state alone.
+      // `state.fingerprint` is per-process and null after a restart, so comparing with it by
+      // itself made the first background check of an unchanged pane look like freshly read
+      // evidence: evidenceAt jumped to the poll time while generatedAt correctly stood still,
+      // which is precisely the pair that is supposed to tell the user nothing has moved.
+      const lastGenerated = state.fingerprint !== null ? state.fingerprint : record.generated.fingerprint;
+      if (evidence.fingerprint !== lastGenerated) state.evidenceAt = evidence.evidenceAt;
+      state.fingerprint = evidence.fingerprint;
       if (record.generated.fingerprint === evidence.fingerprint && (record.generated.goal || record.generated.current)) {
         state.error = null;
         state.attempts = 0;

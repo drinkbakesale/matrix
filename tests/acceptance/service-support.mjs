@@ -12,16 +12,17 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import {
   tempDir, fakeClock, fakeCli, claudeSession, paneFor, countingGenerator, fakeTmuxProcess, sleep,
+  paneStreamProbe,
 } from './assertions.mjs';
 
 const require = createRequire(import.meta.url);
 
-// Generic fixtures live in assertions.mjs, which imports only node builtins, so they
+// Generic fixtures live in assertions.mjs, which imports nothing from this file, so they
 // cannot create a cycle with the delivered server modules loaded below. Re-exported
 // here so every runner and case module keeps importing them from one place.
 export {
   tempDir, cleanupAll, fakeClock, argAfter, fakeCli, claudeSession, shellActiveSession,
-  paneFor, countingGenerator, loadCorpus, sleep, fakeTmuxProcess, lastLines,
+  paneFor, countingGenerator, loadCorpus, sleep, fakeTmuxProcess, lastLines, paneStreamProbe,
 } from './assertions.mjs';
 const LIB = path.join(import.meta.dirname, '..', '..', 'server', 'lib');
 
@@ -31,14 +32,6 @@ export const briefGenerator = require(path.join(LIB, 'brief-generator.js'));
 export const briefServiceMod = require(path.join(LIB, 'brief-service.js'));
 export const briefRoutes = require(path.join(LIB, 'brief-routes.js'));
 export const briefTmux = require(path.join(LIB, 'brief-tmux.js'));
-
-
-
-
-
-
-
-
 
 
 // The delivered resolver/capture stack on the fake process, with the SHIPPED defaults.
@@ -70,72 +63,6 @@ export function makeService(opts) {
   });
 }
 
-
-
-// Runs the delivered pane-stream module against a throwaway `tmux` on PATH and a fake
-// WebSocket, and records exactly what a connecting client is told. The stream fixes its
-// target when the connection opens, so what it announces then is what anything else
-// describing "this session" must bind to. No live tmux, HOME or server is involved —
-// except via `binDir`, which supplies a directory already holding a `tmux` executable, used
-// by the real-tmux regression to point this same probe at its own private socket.
-export function paneStreamProbe({ session = 'A', windows = [], query = null, sessionId = '$9', binDir = null } = {}) {
-  const dir = binDir || tempDir('matrix-panestream-');
-  const dataFile = path.join(dir, 'tmux-data.json');
-  const argvLog = path.join(dir, 'argv.log');
-  const marker = path.join(dir, 'executed');
-  if (binDir) return runPaneStream(dir, { session, query, argvLog, marker });
-  fs.writeFileSync(dataFile, JSON.stringify({ session, sessionId, windows }));
-  // Renders whatever `-F` format it is handed and answers a session by name OR id, the way
-  // tmux does, so the same probe serves code that asks for different fields.
-  fs.writeFileSync(path.join(dir, 'tmux'), [
-    '#!/usr/bin/env node',
-    "const fs = require('fs');",
-    'const args = process.argv.slice(2);',
-    `fs.appendFileSync(${JSON.stringify(argvLog)}, args.join(' ') + '\\n');`,
-    `const d = JSON.parse(fs.readFileSync(${JSON.stringify(dataFile)}, 'utf8'));`,
-    'const at = f => { const i = args.indexOf(f); return i < 0 ? undefined : args[i + 1]; };',
-    'const render = (f, v) => String(f).replace(/#\\{([a-z_]+)\\}/g, (m, k) => (k in v ? String(v[k]) : m));',
-    "const out = s => process.stdout.write(s + '\\n');",
-    "if (args[0] === 'list-sessions') {",
-    "  out(render(at('-F') || '#{session_name}', { session_name: d.session, session_id: d.sessionId, session_created: 1 }));",
-    "} else if (args[0] === 'list-panes') {",
-    "  if (at('-t') !== d.session && at('-t') !== d.sessionId) process.exit(1);",
-    "  out(d.windows.map((w, i) => render(at('-F') || '#{window_name}', {",
-    "    window_index: i, window_id: '@' + i, window_name: w[0], window_active: i === 0 ? 1 : 0,",
-    "    pane_current_command: w[1], pane_id: '%' + i,",
-    "  })).join('\\n'));",
-    "} else if (args[0] === 'display-message') {",
-    '  out(render(args[args.length - 1], { pane_width: 80, pane_height: 24, history_size: 1 }));',
-    "} else if (args[0] === 'capture-pane') { out('fixture pane line'); }",
-  ].join('\n') + '\n', { mode: 0o755 });
-  return runPaneStream(dir, { session, query, argvLog, marker });
-}
-
-function runPaneStream(dir, { session, query, argvLog, marker }) {
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${dir}:${previousPath}`;
-  const paneStream = require(path.join(LIB, 'pane-stream.js'));
-  const sent = [];
-  const wsHandlers = new Map();
-  let closed = null;
-  const ws = {
-    readyState: 1,
-    send: raw => sent.push(JSON.parse(raw)),
-    on: (evt, cb) => wsHandlers.set(evt, cb),
-    close: (code, reason) => { closed = { code, reason }; ws.readyState = 3; }, ping: () => {},
-  };
-  let connect = null;
-  paneStream.attach({ on: (evt, cb) => { if (evt === 'connection') connect = cb; } }, { port: 0 });
-  try {
-    connect(ws, { url: `/?${query || `session=${encodeURIComponent(session)}`}` });
-  } finally {
-    const onClose = wsHandlers.get('close');
-    if (onClose) onClose();           // clears the poll and ping timers this connection made
-    process.env.PATH = previousPath;
-  }
-  const argv = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
-  return { sent, first: sent[0] || null, types: sent.map(m => m.type), closed, argv, marker };
-}
 
 // What the stream announces, and whether the brief follows it — returned as labelled
 // [actual, expected, detail] triples the runner asserts, plus a raw report to archive.
@@ -431,6 +358,50 @@ export async function timestampChecks({ clock, storeFile, pane1, pane2 }) {
   service = makeService({ stack: tmuxStack(fake), clock, generator: failing, storeFile });
   const restarted = await service.read('A');
   out.push([restarted.generatedAt, changed.generatedAt, 'timestamps: generatedAt survives a restart unchanged']);
+
+  // A GENERATION STILL IN FLIGHT must not move either timestamp's meaning: evidenceAt
+  // describes the changed source as soon as it is read, while generatedAt still describes
+  // the LAST SUCCESS until this job actually succeeds. Held at an explicit boundary, not
+  // timed, so "still pending" is observed rather than assumed.
+  const held = countingGenerator(briefGenerator.createExtractiveGenerator());
+  service = makeService({ stack: tmuxStack(fake), clock, generator: held, storeFile });
+  await service.read('A'); await service.settle();
+  const beforeHold = await service.read('A');
+  fake.set('A', claudeSession('A', pane2 + '\n> a distinct third turn for the held job\n'));
+  const enteredBefore = held.calls;
+  const release = held.hold();
+  clock.advance(31000);
+  const atCollect = clock.now();
+  await service.tick();
+  out.push([await waitUntil(() => held.calls > enteredBefore), true, 'timestamps: the held generation entered'],
+    [service.jobs.size > 0, true, 'timestamps: and is still pending, so nothing has succeeded yet']);
+  clock.advance(7000);
+  const pending = await service.read('A');
+  out.push(
+    [pending.generatedAt, beforeHold.generatedAt, 'timestamps: a pending generation does not advance generatedAt'],
+    [pending.stale, false, 'timestamps: and a job merely running is not a failure'],
+    [pending.evidenceAt, atCollect, 'timestamps: while evidenceAt already describes the changed source it is reading'],
+    [pending.evidenceAt > beforeHold.evidenceAt, true, 'timestamps: which is newer than the last successful generation\'s source'],
+  );
+  await release();
+  await service.settle();
+  const completed = await service.read('A');
+  out.push(
+    [completed.generatedAt > beforeHold.generatedAt, true, 'timestamps: generatedAt advances only once generation succeeds'],
+    [completed.evidenceAt, atCollect, 'timestamps: and evidenceAt still names when that source was read'],
+  );
+
+  // UNCHANGED evidence across a restart: the first background check must not make old
+  // evidence look freshly read. runJob compares against the runtime fingerprint, which is
+  // null in a new process, so this only holds if it also consults the persisted one.
+  service = makeService({ stack: tmuxStack(fake), clock, generator: briefGenerator.createExtractiveGenerator(), storeFile });
+  clock.advance(31000);
+  await service.read('A'); await service.settle();   // await the first background check
+  const unchangedRestart = await service.read('A');
+  out.push(
+    [unchangedRestart.evidenceAt, completed.evidenceAt, 'timestamps: unchanged evidence across a restart keeps its source freshness'],
+    [unchangedRestart.generatedAt, completed.generatedAt, 'timestamps: and its generation time'],
+  );
   return out;
 }
 

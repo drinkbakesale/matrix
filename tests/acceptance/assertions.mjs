@@ -1,4 +1,9 @@
-// Shared result envelope and dependency-free fixtures for the acceptance runners.
+// Shared result envelope and generic fixtures for the acceptance runners.
+//
+// This module imports nothing from the other acceptance modules, so it can never take part
+// in a cycle with them. The one delivered module it touches — pane-stream.js, loaded by the
+// pane-stream probe at the bottom — is `require`d inside the function, after that probe has
+// put its throwaway `tmux` on PATH, so merely importing this file loads no server code.
 //
 // Every expected case id is pre-registered as failed, so a runner that crashes before it
 // reaches a case reports that case as a failure rather than silently omitting (or skipping)
@@ -7,6 +12,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const LIB = path.join(import.meta.dirname, '..', '..', 'server', 'lib');
 
 export function createRun(expectedIds) {
   const results = new Map(expectedIds.map(id => [id, {
@@ -320,4 +329,69 @@ export function fakeTmuxProcess(initial = {}) {
     targetsFor(cmd) { return this.callsFor(cmd).map(c => c.args[c.args.indexOf('-t') + 1]); },
     reset() { calls.length = 0; },
   };
+}
+
+// Runs the delivered pane-stream module against a throwaway `tmux` on PATH and a fake
+// WebSocket, and records exactly what a connecting client is told. The stream fixes its
+// target when the connection opens, so what it announces then is what anything else
+// describing "this session" must bind to. No live tmux, HOME or server is involved —
+// except via `binDir`, which supplies a directory already holding a `tmux` executable, used
+// by the real-tmux regression to point this same probe at its own private socket.
+export function paneStreamProbe({ session = 'A', windows = [], query = null, sessionId = '$9', binDir = null } = {}) {
+  const dir = binDir || tempDir('matrix-panestream-');
+  const dataFile = path.join(dir, 'tmux-data.json');
+  const argvLog = path.join(dir, 'argv.log');
+  const marker = path.join(dir, 'executed');
+  if (binDir) return runPaneStream(dir, { session, query, argvLog, marker });
+  fs.writeFileSync(dataFile, JSON.stringify({ session, sessionId, windows }));
+  // Renders whatever `-F` format it is handed and answers a session by name OR id, the way
+  // tmux does, so the same probe serves code that asks for different fields.
+  fs.writeFileSync(path.join(dir, 'tmux'), [
+    '#!/usr/bin/env node',
+    "const fs = require('fs');",
+    'const args = process.argv.slice(2);',
+    `fs.appendFileSync(${JSON.stringify(argvLog)}, args.join(' ') + '\\n');`,
+    `const d = JSON.parse(fs.readFileSync(${JSON.stringify(dataFile)}, 'utf8'));`,
+    'const at = f => { const i = args.indexOf(f); return i < 0 ? undefined : args[i + 1]; };',
+    'const render = (f, v) => String(f).replace(/#\\{([a-z_]+)\\}/g, (m, k) => (k in v ? String(v[k]) : m));',
+    "const out = s => process.stdout.write(s + '\\n');",
+    "if (args[0] === 'list-sessions') {",
+    "  out(render(at('-F') || '#{session_name}', { session_name: d.session, session_id: d.sessionId, session_created: 1 }));",
+    "} else if (args[0] === 'list-panes') {",
+    "  if (at('-t') !== d.session && at('-t') !== d.sessionId) process.exit(1);",
+    "  out(d.windows.map((w, i) => render(at('-F') || '#{window_name}', {",
+    "    window_index: i, window_id: '@' + i, window_name: w[0], window_active: i === 0 ? 1 : 0,",
+    "    pane_current_command: w[1], pane_id: '%' + i,",
+    "  })).join('\\n'));",
+    "} else if (args[0] === 'display-message') {",
+    '  out(render(args[args.length - 1], { pane_width: 80, pane_height: 24, history_size: 1 }));',
+    "} else if (args[0] === 'capture-pane') { out('fixture pane line'); }",
+  ].join('\n') + '\n', { mode: 0o755 });
+  return runPaneStream(dir, { session, query, argvLog, marker });
+}
+
+function runPaneStream(dir, { session, query, argvLog, marker }) {
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}:${previousPath}`;
+  const paneStream = require(path.join(LIB, 'pane-stream.js'));
+  const sent = [];
+  const wsHandlers = new Map();
+  let closed = null;
+  const ws = {
+    readyState: 1,
+    send: raw => sent.push(JSON.parse(raw)),
+    on: (evt, cb) => wsHandlers.set(evt, cb),
+    close: (code, reason) => { closed = { code, reason }; ws.readyState = 3; }, ping: () => {},
+  };
+  let connect = null;
+  paneStream.attach({ on: (evt, cb) => { if (evt === 'connection') connect = cb; } }, { port: 0 });
+  try {
+    connect(ws, { url: `/?${query || `session=${encodeURIComponent(session)}`}` });
+  } finally {
+    const onClose = wsHandlers.get('close');
+    if (onClose) onClose();           // clears the poll and ping timers this connection made
+    process.env.PATH = previousPath;
+  }
+  const argv = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
+  return { sent, first: sent[0] || null, types: sent.map(m => m.type), closed, argv, marker };
 }

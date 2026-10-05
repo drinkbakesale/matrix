@@ -257,3 +257,22 @@ export async function startFixtureServer({ root, sessions, storeFile, literalReq
     async stop() { await new Promise(r => server.close(r)); },
   };
 }
+
+// The page-side callers for the control channel defined above, kept beside the endpoints
+// they drive so both ends of `/__control/*` live in one module.
+export const control = (page, op, params = {}) => page.evaluate(
+  ([o, p]) => fetch(`/__control/${o}?${new URLSearchParams(p)}`).then(r => r.json()),
+  [op, params],
+);
+
+// Polls a control endpoint until `predicate` holds, so a race waits on an observed
+// harness state rather than a guessed delay.
+export async function waitForControl(page, op, predicate, deadlineMs, label) {
+  const started = Date.now();
+  for (;;) {
+    const value = await control(page, op);
+    if (predicate(value)) return value;
+    if (Date.now() - started > deadlineMs) throw new Error(`${label}: ${op} never satisfied in ${deadlineMs}ms (last ${JSON.stringify(value)})`);
+    await page.waitForTimeout(50);
+  }
+}
