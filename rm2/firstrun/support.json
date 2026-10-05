@@ -1,0 +1,6 @@
+{
+  "model": "reMarkable 2.0",
+  "releases": ["3.28"],
+  "appload": "v0.6.0 (7ec0830c97570bf5c607f3f458ea78edfa03e5a3)",
+  "evidence": "rm-appload v0.6.0 carries qmd patches up to software 3.29 (commits cfd9be1, 5d060e5 'Support for 3.29', 2026-09-19); 3.28 is the newest stable release listed by reMarkable on 2026-10-04. Sourced from upstream source and release notes; not run on a physical device by this build."
+}

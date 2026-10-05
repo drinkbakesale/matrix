@@ -1,0 +1,7 @@
+{
+  "name": "Matrix",
+  "application": "launch.sh",
+  "qtfb": true,
+  "disablesWindowedMode": true,
+  "aspectRatio": "original"
+}

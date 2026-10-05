@@ -1,0 +1,41 @@
+{
+ "finding": "A14-1",
+ "splits": [
+  {
+   "what": "2-byte é split after byte 1",
+   "label": "2b@1",
+   "character": "é",
+   "source_text": "Complete café response #1",
+   "record_hex": "7b2274797065223a22617373697374616e74222c22697353696465636861696e223a66616c73652c2275756964223a22612d6d2d73706c69742d31222c226d657373616765223a7b226964223a226d2d73706c69742d31222c22726f6c65223a22617373697374616e74222c22636f6e74656e74223a5b7b2274797065223a2274657874222c2274657874223a22436f6d706c65746520636166c3a920726573706f6e7365202331227d5d7d7d0a",
+   "split_offset": 155,
+   "character_offset": 154,
+   "collections": [
+    1,
+    0
+   ],
+   "intermediate_snapshot": {
+    "state": "working",
+    "message": {
+     "available": false,
+     "text": "",
+     "reason": "No completed Claude message observed since the evidence hook attached"
+    },
+    "prompt": "split turn 1"
+   },
+   "final_snapshot": {
+    "state": "done",
+    "message": {
+     "available": true,
+     "text": "Complete caf�� response #1",
+     "reason": ""
+    },
+    "prompt": "split turn 1"
+   },
+   "rendered_digest": "alpha — done (turn ended)\n── Your last prompt ──\nsplit turn 1\n── Claude's last complete message ──\nComplete caf�� response #1\n── Files changed ──\nWritten by this turn's tools:\n  none\nWorking tree (not attributed to this session):\n  Unavailable: not a Git repository"
+  }
+ ],
+ "bytewise": null,
+ "resets": [],
+ "invalid": null,
+ "what": "RM2_evidence::full_turn splitCharacters on the pre-repair transcript reader (server/lib/eink/transcript.js of candidate e079204): the first case fails; final_snapshot shows the damaged text"
+}

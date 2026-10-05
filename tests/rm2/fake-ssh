@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test double for the ssh BINARY: runs the remote command locally against a
+# sandbox directory that stands in for the tablet's filesystem (RM2_ROOT).
+# The last argument is the remote command, exactly as the installer sent it.
+for last; do :; done
+echo "$last" >> "$FAKE_DEVICE_ROOT/../ssh.log"
+if [ -n "${FAKE_SSH_HOSTKEY_FAIL:-}" ]; then echo "Host key verification failed." >&2; exit 255; fi
+RM2_ROOT="$FAKE_DEVICE_ROOT" PATH="$FAKE_DEVICE_BIN:$PATH" exec sh -c "$last"

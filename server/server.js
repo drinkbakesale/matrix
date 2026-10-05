@@ -114,6 +114,9 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
+// E-ink workstation (RM2 display + iPad control): its own scoped API, mounted
+// before the legacy body parser so its limits and auth apply to its routes only.
+const eink = require('./lib/eink').mount(app, { home: MATRIX_HOME, webpush, vapid: () => vapid });
 app.use(express.json());
 
 // SSE: notification stream
@@ -1338,5 +1341,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`SSE notifications enabled (${sseClients.size} clients)`);
   if (!vapid) {
     console.log('WARNING: Push notifications disabled — run "npm run setup" to configure VAPID keys');
+  }
+  if (eink.router) {
+    const tlsPort = parseInt(process.env.MATRIX_EINK_TLS_PORT, 10) || 7779;
+    const tls = require('./lib/eink').listenTls({ router: eink.router, home: MATRIX_HOME, port: tlsPort });
+    console.log(tls.started ? `E-ink LAN endpoint (TLS) on ${tls.address}:${tlsPort} only` : `E-ink LAN endpoint not started: ${tls.reason}`);
   }
 });
