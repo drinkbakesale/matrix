@@ -5,7 +5,7 @@
 // — it measures the node under the finger during the long-press, which is the window iOS
 // needs and which a "defer while a selection exists" guard cannot see.
 
-import { emit, startStream, stopStream } from './browser-support.mjs';
+import { emit, startStream, stopStream, newPage, engineCapabilities, saveArtifact } from './browser-support.mjs';
 
 const TARGET = 'selection target café 日本語';
 // MAX_DOM_MESSAGES in both the base renderer and the delivered transcript controller.
@@ -231,3 +231,66 @@ export async function diagnose(page, label) {
 }
 
 export { TARGET };
+
+// The Copy::diagnosis_and_base_failure case itself. It lives here, beside the conditions
+// it asserts on, so a change to a measurement and the assertion that reads it cannot
+// drift apart in separate files.
+export async function copyDiagnosis(ctx, t) {
+  const results = {};
+  for (const variant of ['base', 'candidate']) {
+    const server = await ctx.startServer(variant === 'base' ? ctx.baseExport.dir : ctx.repoRoot);
+    try {
+      const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'] });
+      await page.goto(`${server.origin}/?open=A`);
+      results[variant] = await diagnose(page, variant);
+      results[variant].capabilities = await engineCapabilities(page);
+      await page.screenshot({ path: `${ctx.artifactDir}/diagnosis-${variant}.png` });
+      await context.close();
+    } finally {
+      await server.stop();
+    }
+  }
+  results.baseCommit = ctx.baseExport.commit;
+  results.baseHash = ctx.baseHash;
+  results.replay = [
+    'node tests/acceptance/browser.mjs --oracle <oracle> --artifacts <dir> --result <dir>/browser.json',
+    'node tests/acceptance/gesture-probe-webkit.cjs "$PWD" <dir>/gesture-webkit.json',
+  ];
+  saveArtifact(ctx.artifactDir, 'copy-diagnosis.json', results);
+
+  const base = results.base.conditions;
+  const cand = results.candidate.conditions;
+  t.ok(results.base.conditions.pre_selection_gesture.updates >= 5, 'the base fixture stream actually ran');
+  t.ok(results.candidate.conditions.pre_selection_gesture.updates >= 5, 'the candidate fixture stream actually ran');
+  t.eq(base.pre_selection_gesture.stable, false, 'BASE: the node under the finger is destroyed/moved during the long-press window');
+  t.eq(base.pre_selection_gesture.connected, false, 'BASE: the screen block is removed from the DOM mid-gesture');
+  t.eq(cand.pre_selection_gesture.stable, true, 'CANDIDATE: the touched node keeps its identity and position');
+  t.includes(cand.pre_selection_gesture.text, TARGET, 'CANDIDATE: the touched text is unchanged');
+  // Discrimination: the base already defers a screen refresh while a selection EXISTS (the
+  // t-20260915 change), so that is not the defect. The two it does fail are the
+  // pre-selection gesture window and the reconnect dump.
+  t.eq(base.screen_only.preserved, true, 'BASE: an already-established selection does survive a screen refresh (that guard worked)');
+  t.eq(base.reconnect_dump.preserved, false, 'BASE: a reconnect dump wipes an established selection');
+  t.ok([base.pre_selection_gesture.stable, base.reconnect_dump.preserved].includes(false),
+    'BASE: at least one relevant condition reproduces the reported failure');
+  t.eq(cand.screen_only.preserved, true, 'CANDIDATE: a screen refresh keeps the selection');
+  t.eq(cand.output_only.preserved, true, 'CANDIDATE: appended output keeps the selection');
+  t.eq(cand.reconnect_dump.preserved, true, 'CANDIDATE: a reconnect dump keeps the selection');
+  // Pruning only means something if the workload actually prunes: both variants must show
+  // the control capping the node count and dropping an identified old node.
+  for (const [variant, conds] of [['BASE', base], ['CANDIDATE', cand]]) {
+    const ctl = conds.pruning_control;
+    t.ok(ctl.messagesEmitted > ctl.pruneLimit, `${variant}: the pruning workload emits more than the ${ctl.pruneLimit}-node limit as separate messages`);
+    t.eq(ctl.cappedAtPruneLimit, true, `${variant}: unprotected control is capped exactly at the prune limit (${ctl.nodesBeforeFlood}+${ctl.messagesEmitted} emitted, ${ctl.nodesAfterFlood} left, limit ${ctl.pruneLimit})`);
+    t.eq(ctl.oldestNodeRemoved, true, `${variant}: unprotected control removed the identified oldest node`);
+    t.eq(ctl.newestMessageKept, true, `${variant}: pruning dropped the oldest nodes, not the newest`);
+    t.eq(conds.pruning.entryState.selection, '', `${variant}: the pruning condition starts with no inherited selection`);
+  }
+  t.eq(cand.pruning_control.stateBefore.mode, 'live', 'CANDIDATE: the unprotected control really is unprotected');
+  t.eq(cand.pruning.preserved, true, 'CANDIDATE: pruning past 1000 messages keeps the selection');
+  t.eq(cand.pruning.nodeConnected, true, 'CANDIDATE: the selected node survives the pruning workload');
+  t.eq(cand.list_header_refresh.preserved, true, 'CANDIDATE: a list/header/brief refresh keeps the selection');
+  t.eq(cand.ancestor_gestures.touchendDefaultPrevented, false, 'CANDIDATE: no ancestor preventDefaults a transcript touchend');
+  t.ok(cand.ancestor_gestures.chain.every(n => n.userSelect !== 'none'), 'CANDIDATE: no ancestor disables selection');
+  t.note('diagnosis', { base: base.pre_selection_gesture, candidate: cand.pre_selection_gesture });
+}

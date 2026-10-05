@@ -1,10 +1,15 @@
 // Copy:: acceptance cases — mobile selection under live streaming, the delivered copy
 // control, real clipboard readback, and the desktop scroll/lifecycle contract.
+//
+// Thresholds here are tied to measured quantities (viewport height, snapshot length,
+// observed growth) rather than round constants: a constant larger than the effect it
+// bounds makes an assertion pass with the feature switched off.
 
-import { diagnose, TARGET } from './browser-diagnosis.mjs';
+import { TARGET } from './browser-diagnosis.mjs';
 import {
   newPage, emit, SOCKET_STUB, startStream, stopStream, dragSelect, syntheticLongPress, sustainedTouch,
-  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch, assertNativeSelectionSurvives, readRealClipboard,
+  engineCapabilities, saveArtifact, STANDALONE_STUB, sustainedTouchOnChromium, recordCapabilityBranch,
+  assertNativeSelectionSurvives, readRealClipboard,
 } from './browser-support.mjs';
 
 const UNICODE_LINE = 'café 日本語 — copy me exactly\twith a tab';
@@ -18,66 +23,6 @@ async function openMobile(ctx, { init = [], session = 'A' } = {}) {
   await page.goto(`${ctx.origin}/?open=${session}`);
   await page.waitForFunction(() => window.__sockets.some(s => s.onmessage));
   return { context, page };
-}
-
-export async function copyDiagnosis(ctx, t) {
-  const results = {};
-  for (const variant of ['base', 'candidate']) {
-    const server = await ctx.startServer(variant === 'base' ? ctx.baseExport.dir : ctx.repoRoot);
-    try {
-      const { context, page } = await newPage(ctx.browser, { device: ctx.devices['iPhone 13'] });
-      await page.goto(`${server.origin}/?open=A`);
-      results[variant] = await diagnose(page, variant);
-      results[variant].capabilities = await engineCapabilities(page);
-      await page.screenshot({ path: `${ctx.artifactDir}/diagnosis-${variant}.png` });
-      await context.close();
-    } finally {
-      await server.stop();
-    }
-  }
-  results.baseCommit = ctx.baseExport.commit;
-  results.baseHash = ctx.baseHash;
-  results.replay = [
-    'node tests/acceptance/browser.mjs --oracle <oracle> --artifacts <dir> --result <dir>/browser.json',
-    'node tests/acceptance/gesture-probe-webkit.cjs "$PWD" <dir>/gesture-webkit.json',
-  ];
-  saveArtifact(ctx.artifactDir, 'copy-diagnosis.json', results);
-
-  const base = results.base.conditions;
-  const cand = results.candidate.conditions;
-  t.ok(results.base.conditions.pre_selection_gesture.updates >= 5, 'the base fixture stream actually ran');
-  t.ok(results.candidate.conditions.pre_selection_gesture.updates >= 5, 'the candidate fixture stream actually ran');
-  t.eq(base.pre_selection_gesture.stable, false, 'BASE: the node under the finger is destroyed/moved during the long-press window');
-  t.eq(base.pre_selection_gesture.connected, false, 'BASE: the screen block is removed from the DOM mid-gesture');
-  t.eq(cand.pre_selection_gesture.stable, true, 'CANDIDATE: the touched node keeps its identity and position');
-  t.includes(cand.pre_selection_gesture.text, TARGET, 'CANDIDATE: the touched text is unchanged');
-  // Discrimination: the base already defers a screen refresh while a selection EXISTS (the
-  // t-20260915 change), so that condition is not the defect. The two conditions it does fail
-  // are the pre-selection gesture window and the reconnect dump.
-  t.eq(base.screen_only.preserved, true, 'BASE: an already-established selection does survive a screen refresh (that guard worked)');
-  t.eq(base.reconnect_dump.preserved, false, 'BASE: a reconnect dump wipes an established selection');
-  t.ok([base.pre_selection_gesture.stable, base.reconnect_dump.preserved].includes(false),
-    'BASE: at least one relevant condition reproduces the reported failure');
-  t.eq(cand.screen_only.preserved, true, 'CANDIDATE: a screen refresh keeps the selection');
-  t.eq(cand.output_only.preserved, true, 'CANDIDATE: appended output keeps the selection');
-  t.eq(cand.reconnect_dump.preserved, true, 'CANDIDATE: a reconnect dump keeps the selection');
-  // Pruning only means something if the workload actually prunes. Both variants must show
-  // the unprotected control capping the node count and dropping an identified old node.
-  for (const [variant, conds] of [['BASE', base], ['CANDIDATE', cand]]) {
-    const ctl = conds.pruning_control;
-    t.ok(ctl.messagesEmitted > ctl.pruneLimit, `${variant}: the pruning workload emits more than the ${ctl.pruneLimit}-node limit as separate messages`);
-    t.eq(ctl.cappedAtPruneLimit, true, `${variant}: unprotected control is capped exactly at the prune limit (${ctl.nodesBeforeFlood}+${ctl.messagesEmitted} emitted, ${ctl.nodesAfterFlood} left, limit ${ctl.pruneLimit})`);
-    t.eq(ctl.oldestNodeRemoved, true, `${variant}: unprotected control removed the identified oldest node`);
-    t.eq(ctl.newestMessageKept, true, `${variant}: pruning dropped the oldest nodes, not the newest`);
-    t.eq(conds.pruning.entryState.selection, '', `${variant}: the pruning condition starts with no inherited selection`);
-  }
-  t.eq(cand.pruning_control.stateBefore.mode, 'live', 'CANDIDATE: the unprotected control really is unprotected');
-  t.eq(cand.pruning.preserved, true, 'CANDIDATE: pruning past 1000 messages keeps the selection');
-  t.eq(cand.pruning.nodeConnected, true, 'CANDIDATE: the selected node survives the pruning workload');
-  t.eq(cand.list_header_refresh.preserved, true, 'CANDIDATE: a list/header/brief refresh keeps the selection');
-  t.eq(cand.ancestor_gestures.touchendDefaultPrevented, false, 'CANDIDATE: no ancestor preventDefaults a transcript touchend');
-  t.ok(cand.ancestor_gestures.chain.every(n => n.userSelect !== 'none'), 'CANDIDATE: no ancestor disables selection');
-  t.note('diagnosis', { base: base.pre_selection_gesture, candidate: cand.pre_selection_gesture });
 }
 
 export async function mobileStreamSelection(ctx, t) {
@@ -94,8 +39,7 @@ export async function mobileStreamSelection(ctx, t) {
   await page.waitForTimeout(250);
 
   // 1a. TRUSTED-INPUT capability attempt: the engine generates the events itself
-  // (isTrusted=true), exactly as it would for a user. This is the only evidence that can
-  // speak to whether a real press-and-hold selects text; a scripted dispatchEvent cannot.
+  // (isTrusted=true). Only this can speak to a real press-and-hold; dispatchEvent cannot.
   const targetBox = await page.evaluate(() => {
     const el = document.querySelector('#terminal .msg-screen');
     const r = el.getBoundingClientRect();
@@ -114,10 +58,10 @@ export async function mobileStreamSelection(ctx, t) {
   t.eq(wk.allTouchEventsTrusted, true, 'every touch event WebKit delivered was engine-generated (isTrusted)');
   t.includes(wk.textAtPress, TARGET, 'the touched node holds real transcript text');
   t.eq(wk.textDuringHold, wk.textAtPress, 'the touched text is byte-identical across the WebKit touch');
-  // Honest capability split, and written so the capability is TRACKED rather than frozen:
-  // if this engine ever gains a way to hold a touch down, the first branch takes over and
-  // the sustained hold must then actually survive. Today it does not have one, so the
-  // limitation must be recorded with the exact missing protocol facility named.
+  // Honest capability split, written so the capability is TRACKED rather than frozen: if
+  // this engine ever gains a way to hold a touch down, the first branch takes over and the
+  // hold must then actually survive. Today it has none, so the limitation names the exact
+  // missing protocol facility.
   if (wk.sustained) {
     await assertNativeSelectionSurvives(page, context, t, { touch: wk, readClipboard: readRealClipboard });
   } else {
@@ -133,8 +77,8 @@ export async function mobileStreamSelection(ctx, t) {
   // capability evidence about touch delivery; it is explicitly NOT a WebKit long-press.
   const chromiumHold = await sustainedTouchOnChromium(ctx, t, { target: TARGET, unicodeLine: UNICODE_LINE });
 
-  // 1b. SYNTHETIC gesture, recorded separately and never conflated with the above: it is
-  // what proves the DOM race causally, and it completes with a release.
+  // 1b. SYNTHETIC gesture, never conflated with the above: it proves the DOM race causally
+  // and completes with a release.
   await page.evaluate(() => transcript.resume());
   await page.waitForTimeout(250);
   const synthetic = await syntheticLongPress(page, '#terminal .msg-screen', 900);
@@ -155,7 +99,9 @@ export async function mobileStreamSelection(ctx, t) {
     const ta = document.getElementById('copy-text');
     return { value: ta.value, start: ta.selectionStart, end: ta.selectionEnd };
   });
-  t.ok(before.end > before.start && before.value.includes(UNICODE_LINE), 'the snapshot holds the transcript text and is selected');
+  t.includes(before.value, UNICODE_LINE, 'the snapshot holds the transcript text');
+  // Select ALL means all of it: `end > start` would be satisfied by a single character.
+  t.eq([before.start, before.end], [0, before.value.length], 'Select all really selected the whole snapshot');
 
   // Keep both stream types running, force a reconnect dump and a brief refresh.
   await page.evaluate(async () => {
@@ -272,7 +218,7 @@ export async function clipboardAndFailure(ctx, t) {
       }
 
       // A NONEMPTY subset, offsets from the fixture literal: Copy selection must deliver
-      // exactly that subset and not the whole snapshot.
+      // exactly that subset, not the whole snapshot.
       const subStart = COPY_FIXTURE.indexOf(UNICODE_LINE);
       await page.evaluate(([s, e]) => {
         const ta = document.getElementById('copy-text');
@@ -284,8 +230,7 @@ export async function clipboardAndFailure(ctx, t) {
       const subState = await page.getAttribute('#copy-sheet', 'data-copy-state');
       const subClip = subState === 'copied' ? await readRealClipboard(page, context) : null;
       // An engine whose clipboard just carried the whole snapshot has no excuse for failing
-      // the subset: only a genuine whole-clipboard platform limitation earns the documented
-      // failure branch, and a selection-only failure must not hide behind it.
+      // the subset, so a selection-only failure cannot hide behind the documented branch.
       if (clipboardWorks) {
         t.eq(subState, 'copied', `${engineName}: Copy selection succeeds on an engine whose Copy all just succeeded`);
         t.ok(subClip && subClip.ok, `${engineName}: the selection copy is readable back from the real clipboard`);
@@ -375,7 +320,8 @@ export async function desktopScrollLifecycle(ctx, t) {
   });
   t.ok(box.count > 10, 'the desktop transcript has many separate message nodes');
   const selected = await dragSelect(page, box, { holdMs: 400 });
-  t.ok(selected.length > 0, 'a real mouse drag selected transcript text');
+  t.ok(selected.length >= 10, `a real mouse drag selected a substantial run of text (${selected.length} chars)`);
+  t.includes(await page.evaluate(() => transcript.snapshotText()), selected, 'the dragged selection is real transcript text');
   const scrolledTop = await page.evaluate(() => document.getElementById('terminal').scrollTop);
   await startStream(page, 100);
   await page.waitForTimeout(3100);
@@ -397,15 +343,17 @@ export async function desktopScrollLifecycle(ctx, t) {
   t.eq(caught.last, 1, 'the newest held line appears exactly once after Resume');
   t.eq(caught.first, 1, 'the oldest held line appears exactly once after Resume');
 
-  // Pausing while reading history must bring you back to where you were reading, not to
-  // the bottom — including across a reconnect snapshot that arrives while paused.
+  // Pausing while reading history must return you to where you were reading, not to the
+  // bottom — including across a reconnect snapshot that arrives while paused.
   const readingTop = await page.evaluate(() => {
     const v = document.getElementById('terminal');
     v.scrollTop = Math.floor(v.scrollHeight * 0.25);
     v.dispatchEvent(new Event('scroll'));
-    return { top: v.scrollTop, following: transcript.following(), height: v.scrollHeight };
+    return { top: v.scrollTop, following: transcript.following(), height: v.scrollHeight,
+      clientHeight: v.clientHeight, gap: v.scrollHeight - v.scrollTop - v.clientHeight };
   });
-  t.ok(readingTop.top > 0, 'the reader scrolled up into history');
+  t.ok(readingTop.gap > readingTop.clientHeight,
+    `the reader is a full viewport or more up into history (${readingTop.gap}px above the bottom, viewport ${readingTop.clientHeight}px)`);
   t.eq(readingTop.following, false, 'the transcript knows the reader is not following the bottom');
   await page.click('#copy-open');
   await page.waitForSelector('#copy-sheet:not([hidden])');
@@ -416,8 +364,7 @@ export async function desktopScrollLifecycle(ctx, t) {
     if (s.onclose) s.onclose({});
   });
   await page.waitForTimeout(1700);
-  // The server re-sends the whole scrollback as the first output of every connection, so
-  // the reconnect dump restores comparable content to be positioned in.
+  // Every connection re-sends the whole scrollback, so the dump restores comparable content.
   await page.evaluate((line) => {
     const s = window.__sockets.at(-1);
     const dump = Array.from({ length: 80 }, (_, i) => `history line ${i} ${line}`).join('\n');
@@ -430,23 +377,41 @@ export async function desktopScrollLifecycle(ctx, t) {
     const v = document.getElementById('terminal');
     return {
       top: v.scrollTop, bottom: v.scrollHeight - v.scrollTop - v.clientHeight,
-      following: transcript.following(), mode: transcript.mode(),
+      clientHeight: v.clientHeight, following: transcript.following(), mode: transcript.mode(),
     };
   });
   t.eq(afterResume.mode, 'live', 'Resume returns to live');
   t.eq(afterResume.following, false, 'Resume does not silently re-enable bottom-following for a history reader');
-  t.ok(afterResume.bottom > 100, 'Resume did not yank the reader to the bottom');
+  t.ok(afterResume.bottom > afterResume.clientHeight,
+    `Resume did not yank the reader to the bottom (${afterResume.bottom}px above it, viewport ${afterResume.clientHeight}px)`);
   t.ok(Math.abs(afterResume.top - readingTop.top) <= 2, 'the reading position is preserved across pause, updates, reconnect and Resume');
 
-  // At the bottom, live streaming follows the bottom.
-  await page.evaluate(() => { const v = document.getElementById('terminal'); v.scrollTop = v.scrollHeight; v.dispatchEvent(new Event('scroll')); });
-  await emit(page, 'output', 'tail line\n');
-  await page.waitForTimeout(100);
-  const atBottom = await page.evaluate(() => {
+  // At the bottom, live streaming follows the bottom. Appending ONE short line under a
+  // 120px tolerance proved nothing: the growth was smaller than the tolerance, so the gap
+  // stayed inside it whether or not autoScroll ran. Append enough to dwarf any tolerance,
+  // then require the viewport to have TRAVELLED with it and to end flush at the bottom.
+  const bottomStart = await page.evaluate(() => {
     const v = document.getElementById('terminal');
-    return v.scrollHeight - v.scrollTop - v.clientHeight < 120;
+    v.scrollTop = v.scrollHeight;
+    v.dispatchEvent(new Event('scroll'));
+    return { top: v.scrollTop, height: v.scrollHeight, following: transcript.following() };
   });
-  t.ok(atBottom, 'streaming keeps following the bottom when the user is at the bottom');
+  t.eq(bottomStart.following, true, 'the reader is following the bottom before the append');
+  await page.evaluate(() => {
+    const s = window.__sockets.at(-1);
+    for (let i = 0; i < 60; i += 1) s.onmessage({ data: JSON.stringify({ type: 'output', data: `tail line ${i}\n` }) });
+  });
+  // Bounded wait on observable rendering, not a guessed sleep.
+  await page.waitForFunction(h => document.getElementById('terminal').scrollHeight > h + 600,
+    bottomStart.height, { timeout: 5000 });
+  await page.waitForTimeout(150);
+  const atBottom = await page.evaluate((s) => {
+    const v = document.getElementById('terminal');
+    return { grew: v.scrollHeight - s.height, moved: v.scrollTop - s.top, gap: v.scrollHeight - v.scrollTop - v.clientHeight };
+  }, bottomStart);
+  t.ok(atBottom.grew > 600, `the append grew the transcript well past any tolerance (${atBottom.grew}px)`);
+  t.ok(atBottom.moved >= atBottom.grew - 4, `the viewport travelled with the new content (scrollTop moved ${atBottom.moved}px of ${atBottom.grew}px)`);
+  t.ok(atBottom.gap <= 4, `streaming keeps following the bottom when the user is at the bottom (final gap ${atBottom.gap}px)`);
 
   // Switch away and back; a reconnect dump is never duplicated and stale callbacks are dropped.
   const detached = await page.evaluate(() => {
@@ -470,7 +435,7 @@ export async function desktopScrollLifecycle(ctx, t) {
   t.ok(!afterSwitch.includes('STALE A OUTPUT'), 'a stale callback never lands on another session');
   t.ok(!afterSwitch.includes('session B dump'), 'session B text is gone after switching back to A');
 
-  // Bounded buffer: overflow keeps the stable snapshot and asks for a fresh one on resume.
+  // Bounded buffer: overflow keeps the snapshot and asks for a fresh one on resume.
   await page.click('#copy-open');
   await page.waitForSelector('#copy-sheet:not([hidden])');
   const frozen = await page.inputValue('#copy-text');

@@ -434,7 +434,8 @@ export async function isolationAndFailures(ctx, t) {
   // A persistence failure can never be acknowledged as saved.
   await control(page, 'readonly');
   await settleAndRefresh(page);
-  const rev = await page.evaluate(() => (briefView.current() ? briefView.current().revision : 0));
+  const rev = await page.evaluate(() => (briefView.current() ? briefView.current().revision : null));
+  t.ok(Number.isInteger(rev), `the brief carried a real revision before the rejected edit (${rev})`);
   await page.click('#brief-edit-goal');
   await page.waitForSelector('#brief-input-goal');
   await page.fill('#brief-input-goal', 'this cannot be saved');
@@ -443,11 +444,13 @@ export async function isolationAndFailures(ctx, t) {
   const storageFail = await page.evaluate(() => ({
     note: document.getElementById('brief-status').textContent,
     goal: document.getElementById('brief-goal').textContent,
+    revision: briefView.current() ? briefView.current().revision : null,
   }));
   t.includes(storageFail.note, 'Edit not saved', 'a storage failure is reported, never acknowledged as saved');
-  t.ok(!storageFail.goal.includes('this cannot be saved') || storageFail.note.includes('Edit not saved'),
-    'the unsaved edit is not presented as stored');
-  t.ok(rev >= 0, 'a revision was in play for the rejected edit');
+  // Was a disjunction whose right-hand side the line above had just asserted true, so it
+  // could never fail. The claim that matters is the left-hand side on its own.
+  t.ok(!storageFail.goal.includes('this cannot be saved'), 'the unsaved edit is never presented as the stored goal');
+  t.eq(storageFail.revision, rev, 'a rejected edit does not advance the revision');
 
   saveArtifact(ctx.artifactDir, 'brief-failure-states.json', states);
   t.note('briefFailureStates', Object.fromEntries(Object.entries(states).map(([k, v]) => [k, v.status])));
