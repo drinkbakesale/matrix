@@ -4,11 +4,16 @@
 // instead of guessing.
 const SUPPORTED = 'claude-code-jsonl/1';
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+const NEWLINE = 0x0a; // never part of a multi-byte UTF-8 character, so records are split on raw bytes
+const NO_BYTES = Buffer.alloc(0);
 
 function createTranscriptReader({ path: file, fs = require('fs') }) {
   let offset = 0;
   let ino = null;
-  let tail = ''; // bytes after the last newline: an incomplete record, never parsed
+  // Raw bytes after the last newline: an incomplete record. It is kept as bytes and neither decoded
+  // nor parsed until its newline arrives, so a read that ends inside a character cannot damage it.
+  let tail = NO_BYTES;
+  const utf8 = new TextDecoder('utf-8', { fatal: true });
   let lineNo = 0;
   let resetThisPoll = false;
   let promptThisPoll = false;
@@ -25,7 +30,7 @@ function createTranscriptReader({ path: file, fs = require('fs') }) {
 
   function reset(reason) {
     offset = 0;
-    tail = '';
+    tail = NO_BYTES; // pending bytes belonged to the old file contents
     lineNo = 0;
     state.lastPrompt = null;
     state.assistant = null;
@@ -108,7 +113,7 @@ function createTranscriptReader({ path: file, fs = require('fs') }) {
       try {
         const buf = Buffer.alloc(st.size - offset);
         const n = fs.readSync(fd, buf, 0, buf.length, offset);
-        chunk = buf.subarray(0, n).toString('utf8');
+        chunk = buf.subarray(0, n);
         offset += n;
       } finally {
         fs.closeSync(fd);
@@ -117,11 +122,20 @@ function createTranscriptReader({ path: file, fs = require('fs') }) {
       state.fileError = `transcript unreadable: ${err.message}`;
       return { grew: false };
     }
-    const text = tail + chunk;
-    const lines = text.split('\n');
-    tail = lines.pop(); // incomplete trailing line stays buffered
-    for (const line of lines) {
+    const data = tail.length ? Buffer.concat([tail, chunk]) : chunk;
+    let start = 0;
+    for (let nl = data.indexOf(NEWLINE, start); nl !== -1; nl = data.indexOf(NEWLINE, start)) {
+      const bytes = data.subarray(start, nl);
+      start = nl + 1;
       lineNo += 1;
+      let line;
+      try {
+        line = utf8.decode(bytes);
+      } catch {
+        state.malformed += 1;
+        state.recordError = `transcript line ${lineNo} is not valid UTF-8`;
+        continue;
+      }
       if (!line.trim()) continue;
       let rec;
       try {
@@ -133,6 +147,7 @@ function createTranscriptReader({ path: file, fs = require('fs') }) {
       }
       apply(rec);
     }
+    tail = start < data.length ? Buffer.from(data.subarray(start)) : NO_BYTES; // incomplete trailing record stays buffered as bytes
     // A truncation/replacement stays reported for the read that discovered it.
     if (!resetThisPoll && promptThisPoll) state.resetNote = null;
     return { grew: true };
