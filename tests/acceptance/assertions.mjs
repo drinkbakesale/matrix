@@ -364,7 +364,9 @@ export function paneStreamProbe({ session = 'A', windows = [], query = null, ses
     "    pane_current_command: w[1], pane_id: '%' + i,",
     "  })).join('\\n'));",
     "} else if (args[0] === 'display-message') {",
-    '  out(render(args[args.length - 1], { pane_width: 80, pane_height: 24, history_size: 1 }));',
+    "  const semi = args.indexOf(';');",  // pane-stream chains `display-message ; capture-pane` in one call
+    '  out(render(semi > 0 ? args[semi - 1] : args[args.length - 1], { pane_width: 80, pane_height: 24, history_size: 1 }));',
+    "  if (semi > 0 && args[semi + 1] === 'capture-pane') out('fixture pane line');",
     "} else if (args[0] === 'capture-pane') { out('fixture pane line'); }",
   ].join('\n') + '\n', { mode: 0o755 });
   return runPaneStream(dir, { session, query, argvLog, marker });

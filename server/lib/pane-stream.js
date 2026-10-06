@@ -39,6 +39,32 @@ function tmux(args, extra) {
 const ENTER_GAP_MS = 80;
 const hexKeys = text => Buffer.from(text).toString('hex').match(/.{2}/g).map(h => '0x' + h);
 
+// One tmux invocation reports the history count and captures the tail of history plus the
+// visible screen, so nothing can scroll by between the count and the capture. `window` caps
+// how many history lines are captured (null = all of it).
+const HISTORY_WINDOW = 2000;
+function snapshot(target, window, run = tmux) {
+  const start = window === null ? '-' : String(-window);
+  const out = run(['display-message', '-p', '-t', target, '#{history_size}', ';',
+    'capture-pane', '-p', '-t', target, '-S', start, '-E', '-'], { maxBuffer: 64 * 1024 * 1024 });
+  const nl = out.indexOf('\n');
+  const history = parseInt(out.slice(0, nl), 10);
+  if (!Number.isFinite(history)) throw new Error('tmux did not report a history size');
+  const body = out.slice(nl + 1).replace(/\n$/, '');
+  const lines = body.split('\n');
+  const historyInCapture = window === null ? history : Math.min(history, window);
+  return { history, lines, historyInCapture };
+}
+
+// Which history lines are new since `previous`: exactly the last (history - previous) of the
+// captured history. More than the capture holds means a resync from the full history.
+function planHistory(previous, snap) {
+  const grew = snap.history - previous;
+  if (grew <= 0) return { lines: [] };
+  if (grew > snap.historyInCapture) return { lines: [], resync: true };
+  return { lines: snap.lines.slice(snap.historyInCapture - grew, snap.historyInCapture) };
+}
+
 async function typeInto(target, data, { run = tmux, wait = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
   const text = String(data);
   if (!text) return;
@@ -135,8 +161,6 @@ function attach(wss, { port }) {
 
     let pollInterval = null;
     let captureErrors = 0;
-    let lastLineCount = 0;
-    let lastFullText = '';
 
     // Never resize the pane — the local iTerm2 owns its size.
     function getPaneSize() {
@@ -149,54 +173,49 @@ function attach(wss, { port }) {
       }
     }
 
-    // maxBuffer must be large — a long Claude session's scrollback easily exceeds Node's
-    // 1 MB execSync default and would otherwise fail with ENOBUFS (the empty-terminal
-    // symptom: pane-size sent, output never sent).
-    function captureAll() {
-      try {
-        return tmux(['capture-pane', '-t', target, '-p', '-S', '-'], { maxBuffer: 64 * 1024 * 1024 });
-      } catch {
-        return '';
-      }
-    }
+    // The pane is two different things. Lines that have scrolled into tmux's HISTORY never
+    // change again, and tmux counts them (#{history_size}); the VISIBLE screen at the bottom is
+    // redrawn in place — Claude's spinner, input box, status bar and "Update installed" banner
+    // live there. So history lines are sent once, as permanent `output`, by exact count; the
+    // visible screen is only ever the replaceable `screen` block. Counting all lines instead
+    // committed the redrawn bottom rows to the transcript (repeated banners) and skipped the
+    // reply lines that were later drawn into those rows (missing chunks).
+    let lastHistory = 0;
+    let lastVisibleText = '';
 
     function initStreaming() {
       sendStreamTarget();
       const size = getPaneSize();
       ws.send(JSON.stringify({ type: 'pane-size', cols: size.cols, rows: size.rows }));
 
-      // Always send the full scrollback on connect — the client replaces its viewer with
-      // this first output, for a fresh open and an automatic reconnect alike.
-      const all = captureAll();
-      if (all.trim()) ws.send(JSON.stringify({ type: 'output', data: all.replace(/\n/g, '\r\n') }));
-      lastLineCount = all.split('\n').length;
-      lastFullText = all;
+      // Always send the full history on connect — the client replaces its viewer with this
+      // first output, for a fresh open and an automatic reconnect alike.
+      const first = snapshot(target, null);
+      lastHistory = first.history;
+      const history = first.lines.slice(0, first.historyInCapture);
+      ws.send(JSON.stringify({ type: 'output', data: history.length ? history.join('\r\n') + '\r\n' : '' }));
+      lastVisibleText = '';
+      sendVisible(first);
 
-      let lastVisibleText = '';
       if (pollInterval) clearInterval(pollInterval);
       pollInterval = setInterval(() => {
         if (ws.readyState !== 1) { clearInterval(pollInterval); return; }
         try {
-          const current = captureAll();
+          const snap = snapshot(target, HISTORY_WINDOW);
           captureErrors = 0;
-          if (current === lastFullText) return;
-
-          const currentLines = current.split('\n');
-          if (currentLines.length > lastLineCount) {
-            // Scrollback grew — send genuinely new lines
-            ws.send(JSON.stringify({ type: 'output', data: currentLines.slice(lastLineCount).join('\r\n') + '\r\n' }));
-            lastVisibleText = '';
-          } else if (currentLines.length === lastLineCount) {
-            // Same line count, changed content — a visible screen update
-            const size = getPaneSize();
-            const visibleText = currentLines.slice(-size.rows).join('\n');
-            if (visibleText !== lastVisibleText) {
-              ws.send(JSON.stringify({ type: 'screen', data: visibleText }));
-              lastVisibleText = visibleText;
-            }
+          const added = planHistory(lastHistory, snap);
+          if (added.resync) {
+            // More scrolled by than the window holds: read exactly the missing span from history.
+            const full = snapshot(target, null);
+            const lines = full.lines.slice(lastHistory, full.historyInCapture);
+            if (lines.length) ws.send(JSON.stringify({ type: 'output', data: lines.join('\r\n') + '\r\n' }));
+            lastHistory = full.history;
+            sendVisible(full);
+            return;
           }
-          lastLineCount = currentLines.length;
-          lastFullText = current;
+          if (added.lines.length) ws.send(JSON.stringify({ type: 'output', data: added.lines.join('\r\n') + '\r\n' }));
+          lastHistory = snap.history;   // also follows a cleared history down
+          sendVisible(snap);
         } catch {
           captureErrors++;
           if (captureErrors > MAX_CAPTURE_ERRORS) {
@@ -208,6 +227,14 @@ function attach(wss, { port }) {
           }
         }
       }, POLL_MS);
+    }
+
+    function sendVisible(snap) {
+      const visibleText = snap.lines.slice(snap.historyInCapture).join('\n').replace(/\s+$/, '');
+      if (visibleText !== lastVisibleText) {
+        ws.send(JSON.stringify({ type: 'screen', data: visibleText }));
+        lastVisibleText = visibleText;
+      }
     }
 
     initStreaming();
@@ -245,4 +272,4 @@ function attach(wss, { port }) {
   });
 }
 
-module.exports = { attach, typeInto, ENTER_GAP_MS };
+module.exports = { attach, typeInto, ENTER_GAP_MS, snapshot, planHistory };
