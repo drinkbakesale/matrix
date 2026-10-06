@@ -10,7 +10,8 @@ const notifyRoutes = require('./lib/notify-routes');
 const voiceRoutes = require('./lib/voice-routes');
 const projectRoutes = require('./lib/project-routes');
 const paneStream = require('./lib/pane-stream');
-const { listLiveSessions, sweepAttention } = require('./lib/sessions');
+const { listLiveSessions, sweepAttention, setGoalSource } = require('./lib/sessions');
+const { createRowGoals } = require('./lib/row-goals');
 const { createTmux, createSessionResolver, createPaneCapture } = require('./lib/brief-tmux');
 const { createEvidenceCollector } = require('./lib/brief-evidence');
 const { createRecapReader } = require('./lib/brief-recap');
@@ -129,6 +130,14 @@ app.get('/api/build-inbox', async (req, res) => {
 paneStream.attach(wss, { port: config.PORT });
 
 setInterval(sweepAttention, 10000);
+
+// Row goal lines: refreshed in the background from each session's latest recap.
+const rowGoals = createRowGoals({ linksDir: path.join(config.MATRIX_HOME, 'session-links') });
+setGoalSource(name => rowGoals.get(name));
+const refreshRowGoals = () => listLiveSessions().then(list => rowGoals.refresh(list.map(s => s.name)),
+  err => console.error('[row-goals] session list failed:', err.message));
+refreshRowGoals();
+setInterval(refreshRowGoals, 15000);
 
 server.listen(config.PORT, '0.0.0.0', () => {
   console.log(`Matrix running on http://0.0.0.0:${config.PORT}`);

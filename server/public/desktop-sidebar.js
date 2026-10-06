@@ -91,7 +91,9 @@ function renderSidebar() {
     const selected = s.name === currentSession ? ' selected' : '';
     const attention = needsAtt ? ' attention' : '';
     const dimmed = isDismissed ? ' dismissed' : '';
-    const descHtml = s.description ? `<div class="project-desc">${escapeHtml(s.description)}</div>` : '';
+    // Line 2: what this session is for (its recap goal), else the project description.
+    const second = s.goal || s.description;
+    const descHtml = second ? `<div class="project-desc">${escapeHtml(second)}</div>` : '';
     const dismissHtml = needsAtt ? `<button class="dismiss-btn" data-dismiss="${escapeHtml(s.name)}">dismiss</button>` : '';
 
     return `

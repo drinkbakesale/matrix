@@ -154,8 +154,10 @@ async function loadSessions() {
       const dotClass = showAttention ? 'attention' : (s.claudeRunning ? 'claude' : (s.attached ? 'running' : 'idle'));
       const badge = showAttention ? 'Waiting' : (isDismissed && s.needsAttention ? 'Snoozed' : (s.claudeRunning ? 'Claude' : (s.attached ? 'attached' : `${s.windows} win`)));
       const cardClass = showAttention ? 'session-card attention' : (isDismissed ? 'session-card dismissed' : 'session-card');
-      const descHtml = s.description
-        ? `<div class="session-desc">${escapeHtml(s.description)}</div>`
+      // Line 2: what this session is for (its recap goal), else the project description.
+      const second = s.goal || s.description;
+      const descHtml = second
+        ? `<div class="session-desc">${escapeHtml(second)}</div>`
         : '';
       return `
         <div class="${cardClass}" data-session="${escapeHtml(s.name)}" data-attention="${s.needsAttention ? '1' : '0'}">

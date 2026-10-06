@@ -133,8 +133,12 @@ async function collectSessions(run = runTmux) {
 
 // Attention changes between listings (a hook fires, the user answers), so it is applied
 // and the order recomputed each time the list is served, not frozen into the cache.
+// Supplies each row's goal line (server/lib/row-goals.js); null until the server installs it.
+let goalFor = () => null;
+function setGoalSource(fn) { goalFor = typeof fn === 'function' ? fn : () => null; }
+
 function decorate(list) {
-  const served = list.map(s => ({ ...s, needsAttention: !!attention.pendingAttention[s.name] }));
+  const served = list.map(s => ({ ...s, goal: goalFor(s.name), needsAttention: !!attention.pendingAttention[s.name] }));
   // Sort: attention first, then identified projects above fallback names, then by activity
   served.sort((a, b) => {
     if (a.needsAttention !== b.needsAttention) return a.needsAttention ? -1 : 1;
@@ -208,5 +212,5 @@ function sweepAttention() {
 // request can block on tmux and no session name can reach a shell.
 
 module.exports = {
-  listLiveSessions, resolveLiveNotificationTarget, sweepAttention, collectSessions, resetSessionCache,
+  listLiveSessions, resolveLiveNotificationTarget, sweepAttention, collectSessions, resetSessionCache, setGoalSource,
 };

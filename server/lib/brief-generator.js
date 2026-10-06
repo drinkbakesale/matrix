@@ -250,6 +250,7 @@ function validateBriefOutput(output, items, { literalRequired = false } = {}) {
 
 module.exports = {
   BriefGenerationError,
+  recapFields,
   createExtractiveGenerator,
   createClaudeCliGenerator,
   validateBriefOutput,
