@@ -30,11 +30,8 @@ const briefView = MatrixBrief.create({});
 function selectProject(name) {
   if (currentSession === name) return;
 
-  // Dismiss the alert on the session we're leaving
-  if (currentSession && sessionAttention[currentSession]) {
-    dismissSession(currentSession);
-    delete sessionAttention[currentSession];
-  }
+  // Looking at a waiting session is not answering it: its alert stays (and the row stays on
+  // top) until the user dismisses it or sends it input.
 
   currentSession = name;
   detectedPorts = [];
