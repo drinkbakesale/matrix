@@ -291,8 +291,22 @@ module.exports = (L) => {
       for (const existingXovi of [false, true]) {
         const sb = sandbox({ existingXovi });
         const before = tree(sb.root, notTmp);
-        let r = sb.install('install');
+        // One of the two installs also gets a travel route, as for a gateway on an internet server.
+        const gwDir = L.tmp('gwcert');
+        const ssl = L.spawnSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '2', '-subj', '/CN=matrix-gateway.lan', '-addext', 'subjectAltName=DNS:matrix-gateway.lan', '-keyout', path.join(gwDir, 'key.pem'), '-out', path.join(gwDir, 'cert.pem')], { encoding: 'utf8' });
+        assert.equal(ssl.status, 0, ssl.stderr);
+        const travel = existingXovi ? ['--travel-url', 'https://203.0.113.7:8443', '--travel-cert', path.join(gwDir, 'cert.pem'), '--travel-name', 'matrix-gateway.lan'] : [];
+        let r = sb.install('install', travel);
         assert.equal(r.status, 0, `install failed: ${r.stderr}${r.stdout}`);
+        const printed = /--public --token-sha256 ([0-9a-f]{64})\b/.exec(r.stdout);
+        const onTablet = JSON.parse(sb.read('home/root/.config/matrix-rm2/config.json'));
+        if (travel.length) {
+          assert.deepEqual([onTablet.endpoints[1].name, onTablet.endpoints[1].url, onTablet.endpoints[1].server_name], ['travel-gateway', 'https://203.0.113.7:8443', 'matrix-gateway.lan']);
+          assert.equal(printed && printed[1], L.crypto.createHash('sha256').update(onTablet.token).digest('hex'), 'the Mac prints the hash of exactly the token the tablet received');
+          assert.ok(!r.stdout.includes(onTablet.token) && !r.stderr.includes(onTablet.token), 'the token itself is never printed');
+        } else {
+          assert.equal(printed, null, 'no gateway hash without a travel route');
+        }
         assert.match(r.stdout, /Tablet software version: 3\.28\.0\.162/, 'the Mac shows the exact detected version');
         const app = 'home/root/xovi/exthome/appload/matrix-rm2';
         for (const f of ['matrix-rm2', 'launch.sh', 'external.manifest.json', 'icon.png']) assert.ok(sb.exists(`${app}/${f}`), `${f} installed`);

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -20,6 +21,8 @@ import (
 )
 
 const apiBase = "/api/eink/v1"
+
+const connectTimeout = 8 * time.Second
 
 // Endpoint is one private route to Matrix. The digest protocol does not care
 // which one is in use; the list is tried in order with backoff.
@@ -98,7 +101,10 @@ func client(e Endpoint, timeout time.Duration) (*http.Client, error) {
 	}
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: &http.Transport{TLSClientConfig: tc, ForceAttemptHTTP2: false, ResponseHeaderTimeout: 10 * time.Second, Proxy: nil},
+		// Away from home the LAN address goes nowhere and no refusal comes back: without a
+		// connect timeout the operating system's own (minutes) would hold up the next route.
+		Transport: &http.Transport{TLSClientConfig: tc, ForceAttemptHTTP2: false, ResponseHeaderTimeout: 10 * time.Second, Proxy: nil,
+			DialContext: (&net.Dialer{Timeout: connectTimeout}).DialContext, TLSHandshakeTimeout: connectTimeout},
 		// A redirect could send the token to another host or to plaintext: never follow.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}, nil

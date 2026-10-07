@@ -14,11 +14,11 @@ module.exports = (L) => {
   }
 
   // Starts the production gateway proxy in front of a Matrix TLS endpoint.
-  async function gateway(srv, cert, { port, upstreamPort } = {}) {
+  async function gateway(srv, cert, { port, upstreamPort, extra = [] } = {}) {
     port = port || await L.freePort();
     const ca = path.join(L.tmp('upca'), 'up.pem');
     fs.writeFileSync(ca, srv.pin.cert_pem);
-    const proc = L.spawn(L.hostBin(), ['gateway', '--listen', `127.0.0.1:${port}`, '--upstream', `https://127.0.0.1:${upstreamPort || srv.tlsPort}`, '--upstream-ca', ca, '--upstream-name', srv.pin.server_name, '--cert', cert.cert, '--key', cert.key], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const proc = L.spawn(L.hostBin(), ['gateway', '--listen', `127.0.0.1:${port}`, '--upstream', `https://127.0.0.1:${upstreamPort || srv.tlsPort}`, '--upstream-ca', ca, '--upstream-name', srv.pin.server_name, '--cert', cert.cert, '--key', cert.key, ...extra], { stdio: ['ignore', 'ignore', 'pipe'] });
     const g = { proc, port, stderr: '', endpoint: (name) => ({ name, url: `https://127.0.0.1:${port}`, cert_pem: cert.pem, server_name: cert.name, pin_sha256: cert.pin }) };
     proc.stderr.on('data', (d) => { g.stderr += d; });
     g.stop = async () => { if (proc.exitCode === null && proc.signalCode === null) { proc.kill('SIGKILL'); await new Promise((r) => proc.once('exit', r)); } };
@@ -50,6 +50,75 @@ module.exports = (L) => {
   }
 
   return {
+    // No router: the gateway runs on an internet server. It may take a public address only when
+    // asked to and only with the paired tablet's token hash, and then it answers every other
+    // request itself.
+    async public_gateway(t) {
+      const { srv, device } = await base();
+      const gc = makeCert('travel-gateway.test');
+      const hash = (s) => L.crypto.createHash('sha256').update(s).digest('hex');
+      const stranger = srv.token('device'); // Matrix would accept it; this gateway is not paired with it
+      const start = (args) => L.spawnSync(L.hostBin(), ['gateway', '--upstream', 'https://mac.example.ts.net', '--cert', gc.cert, '--key', gc.key, ...args], { encoding: 'utf8', timeout: 5000 });
+      const refused = [
+        [['--listen', '8.8.8.8:8443'], /needs --public and --token-sha256/],
+        [['--listen', '8.8.8.8:8443', '--public'], /--public needs --token-sha256/],
+        [['--listen', '8.8.8.8:8443', '--token-sha256', hash(device)], /needs --public and --token-sha256/],
+        [['--listen', '8.8.8.8:8443', '--public', '--token-sha256', 'abc123'], /64 hex characters/],
+        [['--listen', '0.0.0.0:8443', '--public', '--token-sha256', hash(device)], /not listen on every interface/],
+        [['--listen', '[::]:8443', '--public', '--token-sha256', hash(device)], /not listen on every interface/],
+      ];
+      for (const [args, why] of refused) {
+        const r = start(args);
+        assert.equal(r.status, 1, `gateway ${args.join(' ')} must not start`);
+        assert.match(r.stderr, why);
+        assert.doesNotMatch(r.stderr, /listening/);
+      }
+      // With both, a public address passes every check; here it stops only at the bind, because this machine does not have that address.
+      const pub = start(['--listen', '8.8.8.8:8443', '--public', '--token-sha256', hash(device)]);
+      assert.match(pub.stderr, /listening on https:\/\/8\.8\.8\.8:8443 .*paired tablet only, PUBLIC address/);
+      assert.match(pub.stderr, /assign requested address/);
+      // Paired tablet only.
+      const g = await gateway(srv, gc, { extra: ['--token-sha256', hash(device)] });
+      const gw = g.endpoint('travel-gateway');
+      const snap = (ep, token) => tlsRequest(ep, 'GET', '/api/eink/v1/snapshot', { token });
+      assert.equal((await snap(gw, device)).status, 200, 'the paired tablet is forwarded');
+      for (const [who, tok] of [['another valid device token', stranger], ['a controller token', srv.token('controller')], ['no token', null]]) {
+        const res = await snap(gw, tok);
+        assert.deepEqual([res.status, /paired tablet/.test(res.text)], [401, true], `${who} is answered by the gateway`);
+      }
+      assert.equal((await tlsRequest(gw, 'GET', '/control/', { token: device })).status, 403, 'the route list still applies to the paired tablet');
+      // The refusal happens before forwarding: with Matrix unreachable the stranger still gets 401, the tablet 502.
+      const dead = await gateway(srv, gc, { upstreamPort: await L.freePort(), extra: ['--token-sha256', hash(device)] });
+      assert.equal((await snap(dead.endpoint('x'), stranger)).status, 401, 'an unpaired request never reaches the upstream');
+      assert.equal((await snap(dead.endpoint('x'), device)).status, 502);
+      // The whole route still works for the client, and preflight names the stage for a tablet the gateway does not know.
+      assert.equal(preflight({ endpoints: [gw], token: device }, 'travel-gateway').code, 0);
+      const wrong = preflight({ endpoints: [gw], token: stranger }, 'travel-gateway');
+      assert.deepEqual([wrong.code, wrong.results[0].stage], [1, 'auth']);
+      const client = await L.startClient({ endpoints: [gw], token: device });
+      const d = await client.waitDump((q) => q.conn.Status === 'fresh', 10000, 'fresh through the token-checking gateway');
+      assert.match(d.visible.status, /LIVE · travel-gateway/);
+      assert.ok(!(g.stderr + dead.stderr + pub.stderr).includes(device), 'no token in gateway output');
+      t.note(`${refused.length} public starts refused (no --public, no hash, bad hash, wildcard); public + hash passes validation; paired token → 200 and live stream, 3 other credentials → 401 at the gateway, also with Matrix down (tablet → 502)`);
+    },
+
+    // Away from home the LAN address is silent: the client must give up on it and reach the next route.
+    async silent_route_failover(t) {
+      const { srv, device } = await base();
+      const g = await gateway(srv, makeCert('travel-gateway.test'));
+      const lan = srv.endpoint('home-lan');
+      const silent = { ...lan, url: 'https://192.0.2.1:7779' }; // TEST-NET-1: routed nowhere, nothing answers
+      const net = require('net');
+      const probe = await new Promise((res) => { const c = net.connect({ host: '192.0.2.1', port: 7779 }); c.setTimeout(3000, () => { c.destroy(); res('silent'); }); c.on('error', (e) => res(e.code)); c.on('connect', () => { c.destroy(); res('open'); }); });
+      assert.equal(probe, 'silent', 'this check needs a network where 192.0.2.1 does not answer or refuse');
+      const t0 = Date.now();
+      const client = await L.startClient({ endpoints: [silent, g.endpoint('travel-gateway')], token: device });
+      const d = await client.waitDump((q) => q.conn.Status === 'fresh', 20000, 'fresh on the travel route after the silent home route');
+      const ms = Date.now() - t0;
+      assert.equal(d.conn.Endpoint, 'travel-gateway');
+      t.note(`home route silent (no answer, no refusal) → live on travel-gateway after ${ms}ms`);
+    },
+
     async endpoint_failover(t) {
       const { tm, srv, device } = await base();
       const c1 = makeCert('lan-proxy.test'); const c2 = makeCert('travel-gateway.test');
@@ -183,7 +252,7 @@ module.exports = (L) => {
       for (const addr of ['0.0.0.0:8443', '[::]:8443', '8.8.8.8:8443']) {
         const run = L.spawnSync(L.hostBin(), ['gateway', '--listen', addr, '--upstream', 'https://mac.example.ts.net', '--cert', gc.cert, '--key', gc.key], { encoding: 'utf8', timeout: 5000 });
         assert.equal(run.status, 1, `gateway refuses to listen on ${addr}`);
-        assert.match(run.stderr, /private address|not listen on its uplink/);
+        assert.match(run.stderr, /private address|not listen on every interface/);
       }
       const insecure = L.spawnSync(L.hostBin(), ['gateway', '--listen', '127.0.0.1:1', '--upstream', 'http://mac.example.ts.net', '--cert', gc.cert, '--key', gc.key], { encoding: 'utf8', timeout: 5000 });
       assert.match(insecure.stderr, /must be an https/);

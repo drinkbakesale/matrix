@@ -124,8 +124,8 @@ Go (`brew install go`).
 
 ## 4. On the road
 
-**This needs one extra piece of equipment that you do not have yet: a small travel router that can run Tailscale**
-(for example a GL.iNet model, or any OpenWrt/Linux box). The RM2 cannot run Tailscale itself, and a phone hotspot is not
+**This needs one extra piece: a small travel router that can run Tailscale** (for example a GL.iNet model, or any
+OpenWrt/Linux box) **— or, with no router, an internet server on your tailnet (see the end of this section).** The RM2 cannot run Tailscale itself, and a phone hotspot is not
 assumed to pass the phone's VPN to other devices. Nothing was bought or deployed by this build.
 
 Layout: iPhone hotspot (internet) → travel router (uplink to the hotspot, Tailscale on the router) → RM2 on the
@@ -164,6 +164,43 @@ It fetches one authenticated snapshot through tablet → gateway → tailnet →
 route: each endpoint is reported separately. The RM2 tries the endpoints in order and reconnects by itself; the status
 bar names the one in use.
 
+### Without a router: the gateway on an internet server
+
+If you have a Linux server that is on your tailnet and has a public address, the gateway can run there and the RM2
+reaches it over any internet connection (an iPhone hotspot, hotel Wi-Fi). No router is needed.
+
+**This is a deliberate step down from "nothing is reachable from the internet".** One port on the server answers the
+whole internet. What limits it: the gateway serves only the five RM2 device routes (no typing, no sending, no legacy
+views); it forwards only requests that carry this one tablet's token and answers everything else itself (`401`), so
+nothing else reaches the Mac; the tablet pins the gateway's certificate. The server itself can read what passes through
+it (session names, your last prompt, Claude's last message) and sees the tablet's token: use a server only you control.
+The Mac still opens no port.
+
+```bash
+# on the Mac: the certificate the tablet will pin, and the gateway built for the server's CPU
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+  -subj /CN=matrix-gateway.lan -addext subjectAltName=DNS:matrix-gateway.lan -keyout gw-key.pem -out gw-cert.pem
+GOOS=linux GOARCH=amd64 scripts/rm2-build gateway            # prints the binary path (arm64 for an ARM server)
+scripts/rm2-install install --host 10.11.99.1 --url https://<mac-LAN-address>:7779 \
+  --travel-url https://<server public address>:8443 --travel-cert gw-cert.pem --travel-name matrix-gateway.lan
+# the installer ends with:  --public --token-sha256 <64 hex characters>   ← copy that value
+
+# on the server (copy the binary, gw-cert.pem and gw-key.pem there first; chmod 600 gw-key.pem)
+tailscale status                                              # the server must be logged in to your tailnet
+./matrix-rm2-gateway gateway --listen <server public address>:8443 --public --token-sha256 <value from the installer> \
+  --upstream https://<mac-name>.<tailnet>.ts.net --cert gw-cert.pem --key gw-key.pem
+```
+
+- `--listen` must name the server's one public address; `0.0.0.0` is still refused. Without both `--public` and
+  `--token-sha256` a public address is refused.
+- Open TCP 8443 in the server's firewall (and the provider's, if it has one). Open nothing else for this.
+- Installing on the tablet again issues a new token: restart the gateway with the new value. To cut the road route off
+  at once, stop the gateway, or revoke the tablet's token on the Mac.
+- Prove it with the tablet on the hotspot: `scripts/rm2-preflight --host <tablet address> --endpoint travel-gateway`
+  (stage `auth` means the gateway was started with another install's value).
+- Away from home the tablet waits up to 8 seconds for the home address before it tries the road route, so expect the
+  first connection to take about 15 seconds.
+
 ## 5. What the RM2 screen tells you
 
 - Status bar: `LIVE · <route>`; or, inverted: `STALE — last confirmed HH:MM:SS` (no heartbeat for 6 s),
@@ -190,6 +227,7 @@ bar names the one in use.
 | Notifications | Outbox, dedupe, retries with a simulated push provider; worker handlers executed | Apple push delivery, the permission prompt, notification tap on iPadOS |
 | Home LAN route | Pinned-TLS client against the real server on loopback | The Mac's firewall and your Wi-Fi |
 | Road route | Production gateway proxy and preflight on loopback | The travel router, hotspot uplink, Tailscale on the router — untested in the physical topology |
+| Road route without a router | Start-up refusals, paired-token-only forwarding and a silent home address, all on loopback | The server, its firewall and Tailscale login, the hotspot — never run on a public address |
 
 Hardware checklist (in order): `rm2-install check` shows 3.28.x and passes → install → `rebuild_hashtable` → activate →
 Matrix appears in AppLoad → first-run screen shows every check `[PASS]` and accepts your tap → rows appear → tap selects

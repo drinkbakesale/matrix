@@ -3,7 +3,7 @@
 // reMarkable 2 over SSH. See docs/RM2_SETUP.md for the exact steps.
 //
 //   rm2-install check     --host H            first-run compatibility report only (changes nothing)
-//   rm2-install install   --host H --url URL  [--travel-url URL --travel-cert FILE]
+//   rm2-install install   --host H --url URL  [--travel-url URL --travel-cert FILE --travel-name NAME]
 //   rm2-install activate  --host H            start XOVI for this boot
 //   rm2-install stock     --host H            return to the stock interface now
 //   rm2-install uninstall --host H            remove only what this installer added
@@ -107,7 +107,8 @@ function clientConfig() {
     endpoints.push({ name: 'travel-gateway', url: opt('travel-url'), cert_pem: pem, server_name: opt('travel-name', ''), pin_sha256: crypto.createHash('sha256').update(new crypto.X509Certificate(pem).raw).digest('hex') });
   }
   const token = createAuth({ store: createStore({ dir: EINK }) }).issueToken('device', { label: `rm2 ${host}` });
-  return { config: { endpoints, token: token.token, display: {} }, tokenId: token.id };
+  // The hash is what a gateway on a public address is started with (--token-sha256); it is not the token.
+  return { config: { endpoints, token: token.token, display: {} }, tokenId: token.id, tokenSha256: endpoints.length > 1 ? crypto.createHash('sha256').update(token.token).digest('hex') : null };
 }
 
 function revokeToken(id) {
@@ -208,6 +209,7 @@ if (cmd === 'check' || cmd === 'install') {
   console.log(`  1. One time per software version, build the XOVI hashtable (interactive; asks for the tablet passcode):\n       ssh -t root@${host} /home/root/xovi/rebuild_hashtable`);
   console.log(`  2. Start it for this boot:   scripts/rm2-install activate --host ${host}`);
   console.log('  3. On the tablet open AppLoad and tap Matrix. The first-run report appears; tap the screen to confirm touch.');
+  if (made.tokenSha256) console.log(`\nTravel gateway on an internet server: start it with\n  --public --token-sha256 ${made.tokenSha256}\n(this tablet's token only; installing again issues a new token and a new value).`);
   finish(0);
 } else {
   // activate/stock/uninstall need device.sh on the tablet: send just the script.

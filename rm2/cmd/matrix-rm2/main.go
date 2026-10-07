@@ -13,7 +13,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: matrix-rm2 <command>
   run       connect to Matrix and drive the display (device: QTFB, host: --backend capture)
   firstrun  check device model, software version and display/touch backend; prints a report
-  gateway   travel gateway: private TLS proxy that forwards only the device API to Matrix over the tailnet
+  gateway   travel gateway: TLS proxy that forwards only the device API to Matrix over the tailnet (private address, or --public)
   probe     whole-route preflight for each configured endpoint
   script    host capture: drive the production renderer from a JSON script on stdin
   version   print build information`)

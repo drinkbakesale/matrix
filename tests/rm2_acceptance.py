@@ -16,7 +16,7 @@ EXPECTED = {
     "control": ["bidirectional_selection", "keyboard_mouse_ime", "literal_submit", "selection_race", "pending_answer", "quick_access"],
     "push": ["all_transitions", "durable_dedup", "failure_health", "click_routing"],
     "recovery": ["stale_and_reconnect", "epoch_gap", "draft_persistence", "uncertain_delivery", "session_survival"],
-    "network": ["endpoint_failover", "route_preflight", "private_transport"],
+    "network": ["public_gateway", "silent_route_failover", "endpoint_failover", "route_preflight", "private_transport"],
     "device": ["arm_package", "firmware_preflight", "install_restore", "rollback_failures", "unsupported_report"],
     "security": ["capabilities", "identity_and_paths", "injection_and_secrets", "persistence_failure"],
     "compatibility": ["old_views", "worker_isolation"],
