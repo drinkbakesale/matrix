@@ -73,6 +73,44 @@ $todo"; d=$(dirname "$d"); done
   echo "$todo" | while IFS= read -r n; do [ -n "$n" ] || continue; mkdir "$ROOT$n" || exit 1; own "$n"; done
 }
 
+link() { # link <target device path> <link device path>: never replaces something we did not create
+  target="$1"; dst="$2"
+  if [ -L "$ROOT$dst" ] && [ "$(readlink "$ROOT$dst")" = "$target" ]; then return 0; fi
+  if [ -e "$ROOT$dst" ] || [ -L "$ROOT$dst" ]; then
+    grep -qxF "$dst" "$OWNED" 2>/dev/null || fail "dependency incompatibility: $dst already exists and was not installed by Matrix; it was left untouched"
+    rm -f "$ROOT$dst"
+  fi
+  ln -s "$target" "$ROOT$dst" || fail "cannot link $dst"
+  own "$dst"
+}
+
+drop_sidecars() { # an earlier installer version shipped macOS "._name" files; remove the ones it recorded
+  [ -f "$OWNED" ] || return 0
+  grep -E '/\._[^/]*$' "$OWNED" | while IFS= read -r p; do rm -f "$ROOT$p"; done
+  grep -vE '/\._[^/]*$' "$OWNED" > "$OWNED.tmp"; mv "$OWNED.tmp" "$OWNED"
+}
+
+# The stock interface crashes while it is being stopped (seen on 3.28), and the tablet's failure
+# handler answers any xochitl failure with a reboot, which would undo the start. The handler is
+# set aside in /run for the moment of the restart only and is back before this returns.
+FAIL_UNIT=remarkable-fail.service
+restart_interface() { # restart_interface <xovi start|stock script>
+  systemctl mask --runtime "$FAIL_UNIT" >/dev/null 2>&1 || { echo "device: ERROR: could not set the failure handler aside; nothing was restarted" >&2; return 1; }
+  "$1"; rc=$?
+  systemctl unmask --runtime "$FAIL_UNIT" >/dev/null 2>&1 || { echo "device: ERROR: the tablet's failure handler is still set aside; reboot the tablet to restore it" >&2; return 1; }
+  return $rc
+}
+
+extensions_loaded() { # real tablet only: the running interface has AppLoad in it
+  [ -z "$ROOT" ] || return 0
+  n=0
+  while [ $n -lt 30 ]; do
+    pid=$(pidof xochitl 2>/dev/null) && grep -q 'appload' "/proc/$pid/maps" 2>/dev/null && return 0
+    n=$((n + 1)); sleep 1
+  done
+  return 1
+}
+
 cmd_check() { # first-run check with the staged client; prints the JSON report
   "$STAGE/matrix-rm2" firstrun --root "${ROOT:-/}" --json
 }
@@ -86,12 +124,18 @@ cmd_install() {
   if [ -e "$XOVI/xovi.so" ] && ! grep -qxF "/home/root/xovi/xovi.so" "$OWNED" 2>/dev/null; then
     say "using the existing XOVI installation; its files are not modified"
   else
+    drop_sidecars
     (cd "$STAGE/xovi" && find . -type f | sed 's|^\./||') | while IFS= read -r rel; do
-      case "$rel" in inactive-extensions/*|debug|scripts/debug/*) continue ;; esac
+      case "$rel" in inactive-extensions/*|debug|scripts/debug/*|._*|*/._*) continue ;; esac
       mode=644; case "$rel" in start|stock|rebuild_hashtable|*.so) mode=755 ;; esac
       place "xovi/$rel" "/home/root/xovi/$rel" "$mode" || exit 1
     done || exit 1
     for d in scripts/pre-start scripts/post-start scripts/pre-stock scripts/post-stock exthome/qt-resource-rebuilder; do mkdirs "/home/root/xovi/$d"; done
+    # The bundle ships these two as symbolic links; XOVI looks for its extensions only through them.
+    if [ -d "$XOVI/services/xochitl.service" ]; then
+      link /home/root/xovi/extensions.d /home/root/xovi/services/xochitl.service/extensions.d
+      link /home/root/xovi/exthome /home/root/xovi/services/xochitl.service/exthome
+    fi
   fi
   place "appload.so" "/home/root/xovi/extensions.d/appload.so" 755
   place "app/matrix-rm2" "/home/root/xovi/exthome/appload/matrix-rm2/matrix-rm2" 755
@@ -106,20 +150,25 @@ cmd_install() {
 
 cmd_activate() { # start XOVI for this boot (tmpfs override: a reboot returns to stock)
   [ -x "$XOVI_START" ] || fail "xovi start script missing"
-  "$XOVI_START" || { "$XOVI_STOCK" 2>/dev/null; fail "starting XOVI failed; the stock interface was restored"; }
+  svc="$XOVI/services/xochitl.service"
+  if [ -d "$svc" ]; then
+    [ -L "$svc/extensions.d" ] && [ -e "$ROOT$(readlink "$svc/extensions.d")/appload.so" ] || fail "XOVI cannot see its extensions ($svc/extensions.d does not lead to appload.so); run rm2-install install again. Nothing was started"
+  fi
+  restart_interface "$XOVI_START" || { restart_interface "$XOVI_STOCK" 2>/dev/null; fail "starting XOVI failed; the stock interface was restored"; }
+  extensions_loaded || { restart_interface "$XOVI_STOCK" 2>/dev/null; fail "XOVI started but AppLoad did not load within 30 seconds; the stock interface was restored"; }
   say "XOVI started: open AppLoad on the tablet and choose Matrix. Reboot or run 'stock' to return to the stock interface."
 }
 
 cmd_stock() {
   [ -x "$XOVI_STOCK" ] || { say "xovi is not installed; the tablet is already stock"; return 0; }
-  "$XOVI_STOCK" || { echo "device: ERROR: restoring stock failed; reboot the tablet to return to stock" >&2; exit 1; }
+  restart_interface "$XOVI_STOCK" || { echo "device: ERROR: restoring stock failed; reboot the tablet to return to stock" >&2; exit 1; }
   say "stock interface restored"
 }
 
 cmd_uninstall() {
   if [ ! -f "$OWNED" ]; then say "nothing installed by Matrix; nothing changed"; return 0; fi
   # If we installed XOVI itself, make sure the stock interface is running before removing it.
-  if grep -qxF "/home/root/xovi/xovi.so" "$OWNED" && [ -x "$XOVI_STOCK" ]; then "$XOVI_STOCK" || { echo "device: ERROR: could not return to stock; nothing was removed. Reboot and run uninstall again." >&2; exit 1; }; fi
+  if grep -qxF "/home/root/xovi/xovi.so" "$OWNED" && [ -x "$XOVI_STOCK" ]; then restart_interface "$XOVI_STOCK" || { echo "device: ERROR: could not return to stock; nothing was removed. Reboot and run uninstall again." >&2; exit 1; }; fi
   tac_file "$OWNED" | while IFS= read -r p; do
     [ -n "$p" ] || continue
     if [ -d "$ROOT$p" ] && [ ! -L "$ROOT$p" ]; then rmdir "$ROOT$p" 2>/dev/null || true; else rm -f "$ROOT$p"; fi

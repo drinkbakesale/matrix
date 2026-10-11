@@ -45,6 +45,8 @@ function cleanup() {
 }
 const finish = (code) => { cleanup(); process.exit(code); };
 const die = (msg, code = 1) => { console.error(`rm2-install: ${msg}`); finish(code); };
+// macOS tar otherwise adds a "._name" file beside every file and link it packs; they must not reach the tablet.
+const TAR_ENV = { ...process.env, COPYFILE_DISABLE: '1' };
 const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 function ssh(remote, { allowFail = false } = {}) {
@@ -139,7 +141,7 @@ function stage(binary, deps, config) {
   walk(root);
   fs.writeFileSync(path.join(root, 'SHA256SUMS'), sums.join('\n') + '\n');
   const tarball = path.join(dir, 'stage.tar');
-  execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2']);
+  execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2'], { env: TAR_ENV });
   return { dir, tarball };
 }
 
@@ -218,7 +220,7 @@ if (cmd === 'check' || cmd === 'install') {
   fs.mkdirSync(path.join(dir, 'matrix-rm2'));
   fs.copyFileSync(path.join(REPO, 'rm2', 'app', 'device.sh'), path.join(dir, 'matrix-rm2', 'device.sh'));
   const tarball = path.join(dir, 'stage.tar');
-  execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2']);
+  execFileSync('tar', ['cf', tarball, '-C', dir, 'matrix-rm2'], { env: TAR_ENV });
   upload(tarball);
   const r = ssh(device(cmd), { allowFail: true });
   process.stdout.write(r.stdout);

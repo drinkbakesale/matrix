@@ -8,7 +8,7 @@ module.exports = (L) => {
 
   function tree(root, skip = () => false) {
     const out = {};
-    const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); const rel = path.relative(root, p); if (skip(rel)) continue; if (e.isDirectory()) { out[rel + '/'] = 'dir'; walk(p); } else out[rel] = sha(p); } };
+    const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); const rel = path.relative(root, p); if (skip(rel)) continue; if (e.isSymbolicLink()) { out[rel] = `link:${fs.readlinkSync(p)}`; continue; } if (e.isDirectory()) { out[rel + '/'] = 'dir'; walk(p); } else out[rel] = sha(p); } };
     walk(root);
     return out;
   }
@@ -31,12 +31,17 @@ module.exports = (L) => {
     const deps = path.join(top, 'deps'); const src = path.join(top, 'src');
     const s = (rel, text, mode = 0o644) => { const f = path.join(src, rel); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text, { mode }); };
     const state = '"${RM2_ROOT}/var/xovi-state"';
+    const order = '"${RM2_ROOT}/var/order"'; // start, stock and the systemctl double, in the order they ran
     s('xovi/xovi.so', 'XOVI-LOADER');
     s('xovi/extensions.d/qt-resource-rebuilder.so', 'QRR');
     s('xovi/inactive-extensions/webserver-remote.so', 'MUST NOT BE INSTALLED');
     s('xovi/rebuild_hashtable', '#!/bin/sh\nexit 0\n', 0o755);
-    s('xovi/start', `#!/bin/sh\nmkdir -p "\${RM2_ROOT}/var"\n${startFails ? 'echo "xochitl failed to restart" >&2; exit 1' : `echo started >> ${state}`}\n`, 0o755);
-    s('xovi/stock', `#!/bin/sh\nmkdir -p "\${RM2_ROOT}/var"\necho stock >> ${state}\n`, 0o755);
+    s('xovi/start', `#!/bin/sh\nmkdir -p "\${RM2_ROOT}/var"\n${startFails ? `echo start-failed >> ${order}; echo "xochitl failed to restart" >&2; exit 1` : `echo started >> ${state}; echo started >> ${order}`}\n`, 0o755);
+    s('xovi/stock', `#!/bin/sh\nmkdir -p "\${RM2_ROOT}/var"\necho stock >> ${state}; echo stock >> ${order}\n`, 0o755);
+    // As in the real bundle: XOVI finds its extensions only through these two links.
+    s('xovi/services/xochitl.service/qt-resource-rebuilder.conf', 'CONF');
+    fs.symlinkSync('/home/root/xovi/extensions.d', path.join(src, 'xovi/services/xochitl.service/extensions.d'));
+    fs.symlinkSync('/home/root/xovi/exthome', path.join(src, 'xovi/services/xochitl.service/exthome'));
     s('appload.so', 'APPLOAD-EXTENSION');
     fs.mkdirSync(deps);
     L.spawnSync('tar', ['czf', path.join(deps, 'xovi-arm32.tar.gz'), '-C', src, 'xovi']);
@@ -50,8 +55,8 @@ module.exports = (L) => {
       w('home/root/xovi/extensions.d/user-extension.so', 'USER EXT');
       w('home/root/xovi/exthome/appload/other-app/external.manifest.json', '{"name":"Other"}');
       w('home/root/xovi/exthome/qt-resource-rebuilder/hashtab', 'USER HASHTAB');
-      w('home/root/xovi/start', '#!/bin/sh\nmkdir -p "${RM2_ROOT}/var"\n' + `echo started >> ${state}\n`, 0o755);
-      w('home/root/xovi/stock', '#!/bin/sh\nmkdir -p "${RM2_ROOT}/var"\n' + `echo stock >> ${state}\n`, 0o755);
+      w('home/root/xovi/start', '#!/bin/sh\nmkdir -p "${RM2_ROOT}/var"\n' + `echo started >> ${state}; echo started >> ${order}\n`, 0o755);
+      w('home/root/xovi/stock', '#!/bin/sh\nmkdir -p "${RM2_ROOT}/var"\n' + `echo stock >> ${state}; echo stock >> ${order}\n`, 0o755);
       w('home/root/xovi/rebuild_hashtable', '#!/bin/sh\nexit 0\n', 0o755);
     }
     const home = path.join(top, 'machome');
@@ -62,9 +67,11 @@ module.exports = (L) => {
     for (const f of ['fake-ssh', 'fake-scp']) { fs.copyFileSync(path.join(L.candidate, 'tests/rm2', f), path.join(doubles, f)); fs.chmodSync(path.join(doubles, f), 0o755); }
     const env = { ...process.env, MATRIX_HOME: home, RM2_SSH: path.join(doubles, 'fake-ssh'), RM2_SCP: path.join(doubles, 'fake-scp'), FAKE_DEVICE_ROOT: root, FAKE_DEVICE_BIN: path.join(top, 'bin'), RM2_DEPS_MANIFEST: manifest, MATRIX_RM2_DEPS: deps };
     fs.mkdirSync(path.join(top, 'bin'));
+    // systemctl double: records what the tablet script asked systemd for; FAKE_SYSTEMCTL_FAIL makes one verb fail.
+    fs.writeFileSync(path.join(top, 'bin', 'systemctl'), `#!/bin/sh\nmkdir -p "\${RM2_ROOT}/var"\necho "$*" >> ${order}\n[ "$1" = "\${FAKE_SYSTEMCTL_FAIL:-}" ] && exit 1\nexit 0\n`, { mode: 0o755 });
     const install = (cmd, extra = [], more = {}) => L.spawnSync(process.execPath, [path.join(L.candidate, 'scripts', 'rm2-install'), cmd, '--host', 'tablet.sandbox', '--binary', L.hostBin(), '--report-dir', reportDir, ...(cmd === 'install' ? ['--url', 'https://192.168.68.63:7779'] : []), ...extra], { encoding: 'utf8', env: { ...env, ...more } });
     const argv = (cmd, extra = []) => [path.join(L.candidate, 'scripts', 'rm2-install'), cmd, '--host', 'tablet.sandbox', '--binary', L.hostBin(), '--report-dir', reportDir, ...(cmd === 'install' ? ['--url', 'https://192.168.68.63:7779'] : []), ...extra];
-    return { argv, top, root, deps, home, env, install, reportDir, writeManifest, manifest, read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'), exists: (rel) => fs.existsSync(path.join(root, rel)), xoviState: () => (fs.existsSync(path.join(root, 'var/xovi-state')) ? fs.readFileSync(path.join(root, 'var/xovi-state'), 'utf8').trim().split('\n') : []) };
+    return { argv, top, root, deps, home, env, install, reportDir, writeManifest, manifest, read: (rel) => fs.readFileSync(path.join(root, rel), 'utf8'), exists: (rel) => fs.existsSync(path.join(root, rel)), order: () => (fs.existsSync(path.join(root, 'var/order')) ? fs.readFileSync(path.join(root, 'var/order'), 'utf8').trim().split('\n') : []), xoviState: () => (fs.existsSync(path.join(root, 'var/xovi-state')) ? fs.readFileSync(path.join(root, 'var/xovi-state'), 'utf8').trim().split('\n') : []) };
   }
   // L3-1: the installer's temporary files on the tablet are its own. Whatever already exists under
   // /tmp, including a /tmp/matrix-rm2 it used to claim, is never adopted, followed or deleted.
@@ -321,6 +328,13 @@ module.exports = (L) => {
         assert.equal(auth.verify(`Bearer ${cfg.token}`).scope, 'device', 'the tablet holds a device-scope capability only');
         assert.ok(!/BEGIN (OPENSSH|RSA|EC) PRIVATE KEY/.test(sb.read('home/root/.config/matrix-rm2/config.json')), 'no private key or Mac login credential on the tablet');
         const owned = sb.read('home/root/.local/share/matrix-rm2/owned.txt').trim().split('\n');
+        if (!existingXovi) {
+          const svc = 'home/root/xovi/services/xochitl.service';
+          assert.deepEqual([fs.readlinkSync(path.join(sb.root, svc, 'extensions.d')), fs.readlinkSync(path.join(sb.root, svc, 'exthome'))], ['/home/root/xovi/extensions.d', '/home/root/xovi/exthome'], "the bundle's two links are on the tablet: XOVI finds its extensions through them");
+          assert.ok(owned.includes('/home/root/xovi/services/xochitl.service/extensions.d'), 'the links are recorded, so uninstall removes them');
+        }
+        const sidecars = Object.keys(tree(sb.root)).filter((f) => /(^|\/)\._/.test(f));
+        assert.deepEqual(sidecars, [], 'no macOS "._" files reach the tablet');
         assert.ok(owned.includes('/home/root/xovi/exthome/appload/matrix-rm2/matrix-rm2'));
         assert.equal(owned.includes('/home/root/xovi/xovi.so'), !existingXovi, 'a pre-existing XOVI is not claimed as ours');
         // The hashtable is a human step on a fresh tablet; with it in place the check passes.
@@ -337,6 +351,8 @@ module.exports = (L) => {
         r = sb.install('activate');
         assert.equal(r.status, 0, `activate: ${r.stderr}${r.stdout}`);
         assert.deepEqual(sb.xoviState(), ['started']);
+        // The stock interface crashes when stopped and the tablet reboots on any such failure: the handler is set aside for the restart only.
+        assert.deepEqual(sb.order(), ['mask --runtime remarkable-fail.service', 'started', 'unmask --runtime remarkable-fail.service']);
         // The installed client launches from the installed files and exits cleanly on Exit and on the stock gesture.
         const tm = L.fakeTmux(); tm.setPanes([tm.pane({})]);
         const srv = await L.startServer({ env: tm.env, tls: true });
@@ -362,6 +378,7 @@ module.exports = (L) => {
         assert.equal(r.status, 0, r.stderr);
         assert.match(r.stdout, /stock interface restored/);
         assert.deepEqual(sb.xoviState(), ['started', 'stock']);
+        assert.deepEqual(sb.order().slice(3), ['mask --runtime remarkable-fail.service', 'stock', 'unmask --runtime remarkable-fail.service'], 'returning to stock is guarded the same way');
         // Repeat install: idempotent.
         r = sb.install('install');
         assert.equal(r.status, 0, `second install: ${r.stderr}`);
@@ -450,6 +467,22 @@ module.exports = (L) => {
       assert.equal(r.status, 1);
       assert.match(r.stderr, /starting XOVI failed; the stock interface was restored/);
       assert.deepEqual(sb.xoviState(), ['stock'], 'the stock script ran after the failed start');
+      assert.deepEqual(sb.order(), ['mask --runtime remarkable-fail.service', 'start-failed', 'unmask --runtime remarkable-fail.service', 'mask --runtime remarkable-fail.service', 'stock', 'unmask --runtime remarkable-fail.service'], 'the failure handler is back after a failed start and after the return to stock');
+      // The failure handler cannot be set aside: nothing is restarted.
+      sb = sandbox();
+      assert.equal(sb.install('install').status, 0);
+      r = sb.install('activate', [], { FAKE_SYSTEMCTL_FAIL: 'mask' });
+      assert.equal(r.status, 1);
+      assert.deepEqual(sb.xoviState(), [], 'neither XOVI script ran');
+      assert.ok(!sb.order().includes('started'));
+      // The links are missing (as an earlier installer left them): activate refuses before touching the interface.
+      sb = sandbox();
+      assert.equal(sb.install('install').status, 0);
+      fs.rmSync(path.join(sb.root, 'home/root/xovi/services/xochitl.service/extensions.d'));
+      r = sb.install('activate');
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /cannot see its extensions.*run rm2-install install again/);
+      assert.deepEqual(sb.order(), [], 'nothing was restarted');
       notes.push('XOVI start failure → stock restored, exit 1');
       // 6. Untrusted host key: stop with instructions.
       sb = sandbox(); before = tree(sb.root, notTmp);
