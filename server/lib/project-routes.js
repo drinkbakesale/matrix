@@ -9,6 +9,7 @@ const { execSync } = require('child_process');
 const { CONF_PATH, searchDirs } = require('./matrix-config');
 const { readProjects, readClaudeProjectHistory } = require('./projects');
 const attention = require('./attention');
+const { acceptStartupDialogs } = require('./trust-prompt');
 
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'];
 const DEV_PORT_RANGES = [
@@ -185,9 +186,13 @@ function mount(app) {
       return res.json({ ok: true, message: 'already running' });
     } catch {}
     try {
-      execSync(`tmux new-session -d -s '${name}' -n claude -c '${projectPath}'`);
-      execSync(`tmux send-keys -t '${name}:claude' 'exec claude --dangerously-skip-permissions' Enter`);
+      const pane = execSync(`tmux new-session -d -P -F '#{pane_id}' -s '${name}' -n claude -c '${projectPath}'`, { encoding: 'utf8' }).trim();
+      execSync(`tmux send-keys -t '${pane}' 'exec claude --dangerously-skip-permissions' Enter`);
       execSync(`tmux new-window -t '${name}' -n shell -c '${projectPath}'`);
+      // Nobody can press the trust-this-folder keys from the phone, so Matrix answers for it.
+      acceptStartupDialogs(pane).then(
+        accepted => { if (accepted.length) console.log(`[trust] ${name}: accepted ${accepted.join(', ')}`); },
+        err => console.error(`[trust] ${name}: ${err.message}`));
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ error: e.message });

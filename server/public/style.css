@@ -164,10 +164,9 @@ body {
 }
 
 .session-name {
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 400;
   flex: 1;
-  text-shadow: 0 0 4px var(--green-glow);
 }
 
 .session-badge {
@@ -181,9 +180,11 @@ body {
 }
 
 .session-desc {
-  font-size: 11px;
-  color: var(--dim);
-  margin-top: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--bright);
+  text-shadow: 0 0 4px var(--green-glow);
+  margin-top: 4px;
   padding-left: 18px;
   line-height: 1.4;
   white-space: nowrap;
