@@ -123,7 +123,9 @@ function sendText() {
   if (!text || !currentSession) return;
   if (ws && ws.readyState === 1) {
     transcript.echo(text);
-    ws.send(JSON.stringify({ type: 'input', data: text + '\r' }));
+    const parts = MatrixFiles.parts(input, text);   // attached files go as pastes
+    ws.send(JSON.stringify(parts ? { type: 'input', parts } : { type: 'input', data: text + '\r' }));
+    MatrixFiles.reset(input);
     input.value = '';
     input.style.height = 'auto';
     document.getElementById('slash-autocomplete').style.display = 'none';

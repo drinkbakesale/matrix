@@ -183,12 +183,13 @@ async function startNewSession() {
     const res = await fetch('/api/sessions/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request }),
+      body: JSON.stringify({ request, parts: MatrixFiles.parts(input, request) || undefined }),
     });
     const data = await res.json().catch(() => ({ error: `server answered ${res.status}` }));
     if (!res.ok || !data.ok) throw new Error(data.error || `server answered ${res.status}`);
     await loadSessions();
     document.getElementById('new-project-view').style.display = 'none';
+    MatrixFiles.reset(input);
     returnChatBar();
     sessionBeforeNew = null;
     selectProject(data.session);
@@ -201,6 +202,7 @@ async function startNewSession() {
   }
 }
 
+MatrixFiles.install(document.getElementById('chat-input'));
 document.getElementById('new-project-btn').addEventListener('click', showNewProject);
 document.getElementById('np-close').addEventListener('click', closeNewProject);
 document.addEventListener('keydown', (e) => {

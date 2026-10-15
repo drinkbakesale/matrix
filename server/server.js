@@ -52,6 +52,7 @@ app.use(express.json());
 notifyRoutes.mount(app);
 voiceRoutes.mount(app);
 projectRoutes.mount(app);
+require('./lib/file-routes').mount(app, { uploadsRoot: path.join(config.MATRIX_HOME, 'uploads') });
 require('./lib/new-session-routes').mount(app, {
   router: require('./lib/session-router').createSessionRouter({
     cli: createClaudeCli({ bin: process.env.MATRIX_CLAUDE_BIN || 'claude', timeoutMs: 120000 }),

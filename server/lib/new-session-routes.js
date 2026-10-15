@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { CONF_PATH, MATRIX_HOME } = require('./matrix-config');
 const { readProjects, readClaudeProjectHistory } = require('./projects');
+const { checkParts } = require('./type-parts');
 const { listCandidates, readProjectFolders, readSessionFolders } = require('./session-router');
 
 const MAX_REQUEST_CHARS = 4000;
@@ -17,6 +18,11 @@ function mount(app, {
 }) {
   app.post('/api/sessions/new', async (req, res) => {
     const request = typeof (req.body && req.body.request) === 'string' ? req.body.request.trim() : '';
+    // With attached files the request also comes as parts (text typed, paths pasted).
+    let parts = null;
+    if (req.body && req.body.parts !== undefined) {
+      try { parts = checkParts(req.body.parts); } catch (err) { return res.status(400).json({ error: err.message }); }
+    }
     if (!request) return res.status(400).json({ error: 'Say what you want to work on.' });
     if (request.length > MAX_REQUEST_CHARS) return res.status(400).json({ error: `Keep it under ${MAX_REQUEST_CHARS} characters.` });
     let step = 'choosing the project';
@@ -32,7 +38,7 @@ function mount(app, {
         }
       }
       step = 'starting Claude';
-      const { session } = await launcher.launch({ cwd: project.path, request });
+      const { session } = await launcher.launch({ cwd: project.path, request, parts });
       console.log(`[new-session] ${session} in ${project.path}${project.created ? ' (new project)' : ''}`);
       res.json({ ok: true, session, project });
     } catch (err) {

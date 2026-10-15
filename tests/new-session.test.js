@@ -107,7 +107,7 @@ test('route: a new project gets its folder and a projects.conf line before Claud
   assert.equal(r.json.session, '9');
   assert.ok(fs.statSync(path.join(dir, 'garden')).isDirectory());
   assert.equal(fs.readFileSync(conf, 'utf8'), `garden|${path.join(dir, 'garden')}|server|\n`);
-  assert.deepEqual(launched, [{ cwd: path.join(dir, 'garden'), request: 'plan my garden' }]);
+  assert.deepEqual(launched, [{ cwd: path.join(dir, 'garden'), request: 'plan my garden', parts: null }]);
 });
 
 test('route: empty request is refused and a failure names its step', async () => {

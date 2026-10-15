@@ -6,6 +6,7 @@
 
 const { execFile } = require('child_process');
 const { acceptStartupDialogs, isReady, tmuxRunner } = require('./trust-prompt');
+const { typeParts: typePartsImpl } = require('./type-parts');
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
@@ -28,18 +29,22 @@ const ITERM_SCRIPT = (tmuxBin, name) => [
   'end tell',
 ].join('\n');
 
-function createSessionLauncher({ exec = run, tmux = tmuxRunner(), acceptDialogs = acceptStartupDialogs, sleep = wait } = {}) {
+function createSessionLauncher({ exec = run, tmux = tmuxRunner(), acceptDialogs = acceptStartupDialogs, sleep = wait, typeParts = typePartsImpl } = {}) {
   return {
-    async launch({ cwd, request }) {
+    async launch({ cwd, request, parts = null }) {
       const [name, pane] = (await exec('tmux', ['new-session', '-d', '-P', '-F', '#{session_name}\t#{pane_id}', '-c', cwd])).trim().split('\t');
       if (!/^\d+$/.test(name || '') || !/^%\d+$/.test(pane || '')) throw new Error(`tmux returned an unexpected session "${name}" / pane "${pane}"`);
       await exec('tmux', ['send-keys', '-t', pane, 'exec claude --dangerously-skip-permissions', 'Enter']);
       await acceptDialogs(pane, { tmux, timeoutMs: 30000 });
       if (!isReady(await tmux.capture(pane))) throw new Error(`Claude in session ${name} did not reach its input box in bypass mode`);
-      // Text and its Enter go as separate writes: one burst loses long messages.
-      await exec('tmux', ['send-keys', '-t', pane, '-l', request]);
-      await sleep(150);
-      await exec('tmux', ['send-keys', '-t', pane, 'Enter']);
+      if (parts) {
+        await typeParts(pane, parts);
+      } else {
+        // Text and its Enter go as separate writes: one burst loses long messages.
+        await exec('tmux', ['send-keys', '-t', pane, '-l', request]);
+        await sleep(150);
+        await exec('tmux', ['send-keys', '-t', pane, 'Enter']);
+      }
       const tmuxBin = (await exec('/usr/bin/which', ['tmux'])).trim();
       if (!/^\/[\w./-]+$/.test(tmuxBin)) throw new Error(`could not find tmux for iTerm2 (got "${tmuxBin}")`);
       await exec('osascript', ['-e', ITERM_SCRIPT(tmuxBin, name)]);

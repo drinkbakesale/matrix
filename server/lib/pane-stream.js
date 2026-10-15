@@ -77,6 +77,8 @@ async function typeInto(target, data, { run = tmux, wait = ms => new Promise(r =
   }
 }
 
+const { typeParts } = require('./type-parts');
+
 const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
 
 // Listing rows put the NAME last, so a name containing `|` cannot shift the other columns.
@@ -246,7 +248,9 @@ function attach(wss, { port }) {
       try {
         const msg = JSON.parse(raw);
         if (msg.type === 'input') {
-          typing = typing.then(() => typeInto(target, msg.data)).catch(err => {
+          // A message with attached files arrives as parts: text typed, file paths pasted.
+          const send = Array.isArray(msg.parts) ? () => typeParts(target, msg.parts) : () => typeInto(target, msg.data);
+          typing = typing.then(send).catch(err => {
             console.error(`[pane-stream] typing into ${session} failed: ${err.message}`);
             if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input-error', message: err.message }));
           });
