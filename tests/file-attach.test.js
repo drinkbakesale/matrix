@@ -29,9 +29,10 @@ test('message parts: attached paths split out wherever they appear', () => {
 });
 
 test('typeParts types text, pastes paths, then submits', async () => {
-  const calls = []; const waits = [];
+  const calls = []; const waits = []; const checks = [];
   await typeParts('%3', [{ text: 'look at ' }, { paste: '/Users/me/a b.png' }, { text: ' please' }],
-    { run: a => calls.push(a), wait: async ms => { waits.push(ms); } });
+    { run: async a => { if (a[0] === 'display-message') { checks.push(a); return '0'; } calls.push(a); return ''; }, wait: async ms => { waits.push(ms); } });
+  assert.equal(checks.length, 1, 'checks for scroll mode once before typing');
   assert.equal(calls[0][0], 'send-keys');
   assert.deepEqual(calls[1].slice(0, 2), ['set-buffer', '-b']);
   assert.deepEqual(calls[1].slice(3), ['--', '/Users/me/a b.png']);
@@ -87,4 +88,14 @@ test('upload route saves the file under uploads/<date>/ and returns its path', a
     assert.match(path.basename(data.paths[0]), /^123456-[0-9a-f]{6}-note one\.txt$/);
     assert.equal(fs.readFileSync(data.paths[0], 'utf8'), 'hello');
   } finally { server.close(); }
+});
+
+test('a scrolled-up pane is brought out of scroll mode before typing; a stuck mode is refused', async () => {
+  const { leaveScrollMode } = require('../server/lib/type-parts');
+  let inMode = '1'; const calls = [];
+  const run = async a => { calls.push(a.join(' ')); if (a[0] === 'display-message') return inMode; if (a.includes('cancel')) inMode = '0'; return ''; };
+  assert.equal(await leaveScrollMode('@0', run), true);
+  assert.deepEqual(calls, ['display-message -p -t @0 #{pane_in_mode}', 'send-keys -t @0 -X cancel', 'display-message -p -t @0 #{pane_in_mode}']);
+  const stuck = async a => (a[0] === 'display-message' ? '1' : '');
+  await assert.rejects(leaveScrollMode('@0', stuck), /could not leave/);
 });

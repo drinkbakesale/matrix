@@ -12,7 +12,11 @@ function recorder() {
   const events = [];
   return {
     events,
-    run: args => events.push({ type: 'keys', text: decode(args), target: args[args.indexOf('-t') + 1] }),
+    run: async args => {
+      if (args[0] === 'display-message') { events.push({ type: 'mode-check' }); return '0\n'; }
+      events.push({ type: 'keys', text: decode(args), target: args[args.indexOf('-t') + 1] });
+      return '';
+    },
     wait: async ms => events.push({ type: 'wait', ms }),
   };
 }
@@ -22,6 +26,7 @@ test('a message and its return are separate writes with a gap between them', asy
   const message = 'Please refactor the session list so it builds from three tmux listings and caches them.';
   await typeInto('@4', message + '\r', r);
   assert.deepEqual(r.events, [
+    { type: 'mode-check' },
     { type: 'keys', text: message, target: '@4' },
     { type: 'wait', ms: ENTER_GAP_MS },
     { type: 'keys', text: '\r', target: '@4' },
@@ -33,6 +38,6 @@ test('keys without a trailing return, or a bare return, are one write', async ()
   for (const data of ['\x1b[A', '\r', 'y']) {
     const r = recorder();
     await typeInto('@4', data, r);
-    assert.deepEqual(r.events, [{ type: 'keys', text: data, target: '@4' }], JSON.stringify(data));
+    assert.deepEqual(r.events, [{ type: 'mode-check' }, { type: 'keys', text: data, target: '@4' }], JSON.stringify(data));
   }
 });

@@ -31,6 +31,8 @@ function tmux(args, extra) {
   return execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], ...extra });
 }
 
+const { typeParts, leaveScrollMode, tmux: typingTmux } = require('./type-parts');
+
 // Claude Code reads a burst of keystrokes that arrives in one write as a paste, and a return
 // at the end of a paste is not a submit. Typing "message + \r" as one send-keys call left
 // messages of roughly 90+ characters sitting fully typed in the input box (measured on a live
@@ -65,19 +67,21 @@ function planHistory(previous, snap) {
   return { lines: snap.lines.slice(snap.historyInCapture - grew, snap.historyInCapture) };
 }
 
-async function typeInto(target, data, { run = tmux, wait = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+// Typing is asynchronous and time-limited, and leaves tmux's scroll mode first (see
+// server/lib/type-parts.js): a send into a scrolled-up pane once froze the whole server.
+async function typeInto(target, data, { run = typingTmux, wait = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
   const text = String(data);
   if (!text) return;
+  await leaveScrollMode(target, run);
   const submits = text.length > 1 && text.endsWith('\r');
   const body = submits ? text.slice(0, -1) : text;
-  run(['send-keys', '-t', target, '-H', ...hexKeys(body)]);
+  await run(['send-keys', '-t', target, '-H', ...hexKeys(body)]);
   if (submits) {
     await wait(ENTER_GAP_MS);
-    run(['send-keys', '-t', target, '-H', '0x0d']);
+    await run(['send-keys', '-t', target, '-H', '0x0d']);
   }
 }
 
-const { typeParts } = require('./type-parts');
 
 const isClaudeCmd = cmd => cmd.includes('claude') || /^\d+\.\d+\.\d+$/.test(cmd.trim());
 
