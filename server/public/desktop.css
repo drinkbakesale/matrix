@@ -705,6 +705,24 @@ body {
 
 .np-field input::placeholder { color: var(--dim); }
 
+#np-close {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--green);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 2px 9px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+#np-close:hover { border-color: var(--green); }
+
+.np-hint { font-size: 12px; color: var(--dim); line-height: 1.5; margin: 0; }
+.np-status { font-size: 13px; margin: 0; min-height: 1.4em; }
+.np-status.error { color: var(--red); }
+#chat-send:disabled { opacity: 0.6; cursor: wait; }
+
 /* ── Switch Toast ── */
 #switch-toast {
   position: fixed;

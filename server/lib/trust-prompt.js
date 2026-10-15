@@ -12,6 +12,8 @@
 const { execFile } = require('child_process');
 
 const ACCEPT_OPTIONS = ['Yes, I trust this folder', 'Yes, I accept'];
+// Claude's input box is up and running in bypass mode: nothing left to answer.
+const isReady = text => /bypass permissions on/.test(String(text));
 
 // Which accepting option is on screen, and whether the ❯ cursor is on it.
 function readDialog(text) {
@@ -37,9 +39,9 @@ function tmuxRunner(execFileImpl = execFile) {
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// Watches `pane` for up to timeoutMs and accepts each dialog it finds. Resolves with the
-// list of options it accepted; rejects if a dialog is still on screen when time runs out or
-// the cursor never lands on the accepting option.
+// Watches `pane` until Claude is ready (or timeoutMs) and accepts each dialog it finds.
+// Resolves with the list of options it accepted; rejects if a dialog is still on screen when
+// time runs out or the cursor never lands on the accepting option.
 async function acceptStartupDialogs(pane, {
   tmux = tmuxRunner(), timeoutMs = 20000, intervalMs = 400, settleMs = 150, sleep = wait, now = Date.now,
 } = {}) {
@@ -47,8 +49,10 @@ async function acceptStartupDialogs(pane, {
   const deadline = now() + timeoutMs;
   let lastSeen = null;
   while (now() < deadline) {
-    const dialog = readDialog(await tmux.capture(pane));
+    const screen = await tmux.capture(pane);
+    const dialog = readDialog(screen);
     lastSeen = dialog;
+    if (!dialog && isReady(screen)) return accepted;
     if (dialog) {
       let current = dialog;
       for (let moves = 0; !current.selected; moves++) {
@@ -69,4 +73,4 @@ async function acceptStartupDialogs(pane, {
   return accepted;
 }
 
-module.exports = { acceptStartupDialogs, readDialog, tmuxRunner };
+module.exports = { acceptStartupDialogs, readDialog, isReady, tmuxRunner };

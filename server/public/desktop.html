@@ -13,7 +13,7 @@
       <div id="sidebar-header">
         <h1>MATRIX</h1>
       </div>
-      <button id="new-project-btn">Start a New Project</button>
+      <button id="new-project-btn">Start a New Session</button>
       <div id="project-list"></div>
     </aside>
     <main id="main-panel">
@@ -81,22 +81,14 @@
       </div>
       <div id="new-project-view" style="display:none">
         <header id="new-project-header">
-          <span>New Project</span>
+          <span>New Session</span>
+          <button id="np-close" title="Close (Esc)" aria-label="Close">✕</button>
         </header>
         <div id="new-project-form">
-          <div class="np-field">
-            <label>Project Name</label>
-            <input type="text" id="np-name" placeholder="my-project" autocomplete="off">
-          </div>
-          <div class="np-field">
-            <label>Project Path</label>
-            <input type="text" id="np-path" placeholder="~/Projects/my-project" autocomplete="off">
-          </div>
+          <p class="np-hint">Say what you want to do. Matrix picks the project it belongs to (or starts a new one in ~/Projects), opens Claude there in iTerm2 and sends it your message.</p>
+          <p id="np-status" class="np-status" role="status"></p>
         </div>
-        <div id="chat-input-bar">
-          <input type="text" id="np-prompt" placeholder="What do you want to work on?" autocomplete="off">
-          <button id="np-send">Start</button>
-        </div>
+        <div id="np-input-slot"></div>
       </div>
     </main>
     <!-- Output panel (disabled for now — re-enable later)
@@ -108,9 +100,9 @@
   <script src="matrix-transcript.js?v=1"></script>
   <script src="matrix-copy.js?v=1"></script>
   <script src="matrix-brief.js?v=1"></script>
-  <script src="desktop-sidebar.js?v=1"></script>
+  <script src="desktop-sidebar.js?v=2"></script>
   <script src="desktop-output.js?v=1"></script>
-  <script src="desktop-compose.js?v=1"></script>
-  <script src="desktop.js?v=28"></script>
+  <script src="desktop-compose.js?v=3"></script>
+  <script src="desktop.js?v=29"></script>
 </body>
 </html>

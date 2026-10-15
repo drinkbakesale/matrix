@@ -28,6 +28,12 @@ const briefView = MatrixBrief.create({});
 // ── Project Selection ──
 
 function selectProject(name) {
+  // Picking a session while the New Session panel is open closes it and returns the bar.
+  if (typeof newSessionOpen === 'function' && newSessionOpen()) {
+    document.getElementById('new-project-view').style.display = 'none';
+    returnChatBar();
+    sessionBeforeNew = null;
+  }
   if (currentSession === name) return;
 
   // Looking at a waiting session is not answering it: its alert stays (and the row stays on
@@ -113,6 +119,7 @@ function connectWS(session) {
 function sendText() {
   const input = document.getElementById('chat-input');
   const text = input.value.trim();
+  if (newSessionOpen()) { startNewSession(); return; }
   if (!text || !currentSession) return;
   if (ws && ws.readyState === 1) {
     transcript.echo(text);

@@ -99,9 +99,44 @@ document.getElementById('chat-input').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { document.getElementById('chat-input').blur(); }
 });
 
-// ── New Project ──
+// ── New Session ──
+// The panel borrows the regular message bar (same box, Send button, slash menu and voice)
+// while it is open, and hands it back to the chat view when it closes.
+
+let sessionBeforeNew = null;
+let newSessionStarting = false;
+const chatBarHome = (() => {
+  const bar = document.getElementById('chat-input-bar');
+  return { parent: bar.parentNode, next: bar.nextSibling };
+})();
+
+function borrowChatBar() {
+  document.getElementById('np-input-slot').appendChild(document.getElementById('chat-input-bar'));
+  const input = document.getElementById('chat-input');
+  input.placeholder = 'What do you want to work on?';
+  input.value = '';
+  autoResizeInput(input);
+}
+
+function returnChatBar() {
+  chatBarHome.parent.insertBefore(document.getElementById('chat-input-bar'), chatBarHome.next);
+  const input = document.getElementById('chat-input');
+  input.placeholder = 'Type a message...';
+  input.value = '';
+  autoResizeInput(input);
+  setNewSessionBusy(false);
+}
+
+function setNewSessionBusy(busy) {
+  newSessionStarting = busy;
+  const send = document.getElementById('chat-send');
+  send.disabled = busy;
+  send.textContent = busy ? 'Starting...' : 'Send';
+}
 
 function showNewProject() {
+  if (newSessionOpen()) { document.getElementById('chat-input').focus(); return; }
+  sessionBeforeNew = currentSession;
   document.getElementById('empty-state').style.display = 'none';
   document.getElementById('chat-view').style.display = 'none';
   document.getElementById('new-project-view').style.display = 'flex';
@@ -109,69 +144,67 @@ function showNewProject() {
   currentSession = null;
   renderSidebar();
 
-  const nameInput = document.getElementById('np-name');
-  const pathInput = document.getElementById('np-path');
-  nameInput.value = '';
-  pathInput.value = '~/Projects/';
-  document.getElementById('np-prompt').value = '';
-  nameInput.focus();
-
-  nameInput.oninput = () => {
-    const name = nameInput.value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
-    pathInput.value = `~/Projects/${name}`;
-  };
+  const status = document.getElementById('np-status');
+  status.textContent = '';
+  status.classList.remove('error');
+  borrowChatBar();
+  document.getElementById('chat-input').focus();
 }
 
-async function startNewProject() {
-  const name = document.getElementById('np-name').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const projectPath = document.getElementById('np-path').value.trim();
-  const prompt = document.getElementById('np-prompt').value.trim();
+function newSessionOpen() {
+  return document.getElementById('new-project-view').style.display !== 'none';
+}
 
-  if (!name) { document.getElementById('np-name').focus(); return; }
-  if (!projectPath) { document.getElementById('np-path').focus(); return; }
+// Back to whatever was on screen before the panel opened.
+function closeNewProject() {
+  if (newSessionStarting) return;
+  document.getElementById('new-project-view').style.display = 'none';
+  returnChatBar();
+  const back = sessionBeforeNew && sessions.find(s => s.name === sessionBeforeNew) ? sessionBeforeNew : null;
+  sessionBeforeNew = null;
+  if (back) { selectProject(back); focusChatInput(); }
+  else document.getElementById('empty-state').style.display = '';
+}
 
-  const sendBtn = document.getElementById('np-send');
-  sendBtn.textContent = 'Starting...';
-  sendBtn.disabled = true;
+// Called by sendText() while the panel is open.
+async function startNewSession() {
+  if (newSessionStarting) return;
+  const input = document.getElementById('chat-input');
+  const request = input.value.trim();
+  if (!request) { input.focus(); return; }
+
+  const status = document.getElementById('np-status');
+  setNewSessionBusy(true);
+  document.getElementById('slash-autocomplete').style.display = 'none';
+  status.classList.remove('error');
+  status.textContent = 'Picking the project and starting Claude…';
 
   try {
-    const res = await fetch('/api/projects/start', {
+    const res = await fetch('/api/sessions/new', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, projectPath }),
+      body: JSON.stringify({ request }),
     });
-    const data = await res.json();
-    if (data.ok) {
-      fetch('/api/projects/open-iterm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session: name }),
-      }).catch(() => {});
-
-      await new Promise(r => setTimeout(r, 2000));
-      await loadSessions();
-      document.getElementById('new-project-view').style.display = 'none';
-      selectProject(name);
-
-      if (prompt) {
-        setTimeout(() => {
-          if (ws && ws.readyState === 1) {
-            transcript.echo(prompt);
-            ws.send(JSON.stringify({ type: 'input', data: prompt + '\r' }));
-          }
-        }, 1000);
-      }
-    }
+    const data = await res.json().catch(() => ({ error: `server answered ${res.status}` }));
+    if (!res.ok || !data.ok) throw new Error(data.error || `server answered ${res.status}`);
+    await loadSessions();
+    document.getElementById('new-project-view').style.display = 'none';
+    returnChatBar();
+    sessionBeforeNew = null;
+    selectProject(data.session);
+    focusChatInput();
   } catch (err) {
-    sendBtn.textContent = 'Start';
-    sendBtn.disabled = false;
+    status.classList.add('error');
+    status.textContent = err.message;
+    setNewSessionBusy(false);
+    input.focus();
   }
 }
 
 document.getElementById('new-project-btn').addEventListener('click', showNewProject);
-document.getElementById('np-send').addEventListener('click', startNewProject);
-document.getElementById('np-prompt').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); startNewProject(); }
+document.getElementById('np-close').addEventListener('click', closeNewProject);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && newSessionOpen()) { e.preventDefault(); closeNewProject(); }
 });
 
 // ── PTT (Push-to-Talk) — Live SpeechRecognition + server-side sounds ──

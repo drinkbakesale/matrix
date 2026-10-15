@@ -13,6 +13,8 @@ const paneStream = require('./lib/pane-stream');
 const { listLiveSessions, sweepAttention, setGoalSource } = require('./lib/sessions');
 const { createRowGoals } = require('./lib/row-goals');
 const { createRowLabeler } = require('./lib/row-labeler');
+const { createClaudeCli } = require('./lib/claude-cli');
+const claudeCli = createClaudeCli({ bin: process.env.MATRIX_CLAUDE_BIN || 'claude' });
 const { createTmux, createSessionResolver, createPaneCapture } = require('./lib/brief-tmux');
 const { createEvidenceCollector } = require('./lib/brief-evidence');
 const { createRecapReader } = require('./lib/brief-recap');
@@ -50,6 +52,13 @@ app.use(express.json());
 notifyRoutes.mount(app);
 voiceRoutes.mount(app);
 projectRoutes.mount(app);
+require('./lib/new-session-routes').mount(app, {
+  router: require('./lib/session-router').createSessionRouter({
+    cli: createClaudeCli({ bin: process.env.MATRIX_CLAUDE_BIN || 'claude', timeoutMs: 120000 }),
+    model: process.env.MATRIX_ROUTER_MODEL || undefined,
+  }),
+  launcher: require('./lib/session-launcher').createSessionLauncher(),
+});
 
 app.get('/api/sessions', (req, res) => {
   listLiveSessions().then(sessions => res.json({ sessions }), err => {
@@ -136,7 +145,7 @@ setInterval(sweepAttention, 10000);
 const rowGoals = createRowGoals({
   linksDir: path.join(config.MATRIX_HOME, 'session-links'),
   labelsFile: path.join(config.MATRIX_HOME, 'row-labels.json'),
-  labeler: createRowLabeler({ bin: process.env.MATRIX_CLAUDE_BIN || 'claude', model: process.env.MATRIX_ROW_LABEL_MODEL || undefined }),
+  labeler: createRowLabeler({ cli: claudeCli, model: process.env.MATRIX_ROW_LABEL_MODEL || undefined }),
 });
 setGoalSource(name => rowGoals.get(name));
 const refreshRowGoals = () => listLiveSessions().then(list => rowGoals.refresh(list.map(s => s.name)),

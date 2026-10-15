@@ -4,7 +4,7 @@
 // tools, no MCP and no saved session. Output that is not a short label is an error, never
 // trimmed into one.
 
-const { execFile } = require('child_process');
+const { createClaudeCli } = require('./claude-cli');
 
 const DEFAULT_MODEL = 'claude-sonnet-5-5';
 const MAX_WORDS = 10;
@@ -27,25 +27,10 @@ function cleanLabel(raw) {
   return text;
 }
 
-function createRowLabeler({ execFileImpl = execFile, bin = 'claude', model = DEFAULT_MODEL, timeoutMs = 60000 } = {}) {
-  const args = ['-p', '--model', model, '--output-format', 'text', '--tools', '', '--strict-mcp-config', '--no-session-persistence'];
+function createRowLabeler({ cli = createClaudeCli({}), model = DEFAULT_MODEL } = {}) {
   return {
-    label({ source, project }) {
-      const stdin = `${PROMPT(project || 'unknown')}\n\n${source}\n`;
-      return new Promise((resolve, reject) => {
-        const child = execFileImpl(bin, args, {
-          timeout: timeoutMs,
-          maxBuffer: 64 * 1024,
-          cwd: require('os').tmpdir(),
-          // USER is needed for the CLI to find its login in the keychain.
-          env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER, TERM: 'dumb' },
-          windowsHide: true,
-        }, (err, stdout) => {
-          if (err) { reject(new Error(err.killed ? 'claude CLI timed out' : `claude CLI failed (${err.code})`)); return; }
-          try { resolve(cleanLabel(stdout)); } catch (e) { reject(e); }
-        });
-        if (child && child.stdin) child.stdin.end(stdin);
-      });
+    async label({ source, project }) {
+      return cleanLabel(await cli.run({ model, stdin: `${PROMPT(project || 'unknown')}\n\n${source}\n` }));
     },
   };
 }
