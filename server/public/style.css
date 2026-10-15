@@ -187,9 +187,13 @@ body {
   margin-top: 4px;
   padding-left: 18px;
   line-height: 1.4;
-  white-space: nowrap;
+  /* Up to two lines, then an ellipsis. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 /* ── Pinned Build Inbox Row ── */

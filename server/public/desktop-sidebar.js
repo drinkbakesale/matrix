@@ -135,6 +135,7 @@ function renderSidebar() {
   list.querySelectorAll('.project-item:not(.recent) .project-content').forEach(content => {
     content.addEventListener('click', () => {
       selectProject(content.closest('.project-item').dataset.session);
+      focusChatInput();
     });
   });
 
@@ -154,6 +155,7 @@ function renderSidebar() {
         setTimeout(async () => {
           await loadSessions();
           selectProject(name);
+          focusChatInput();
         }, 2000);
       } catch {}
     });
@@ -216,3 +218,9 @@ document.addEventListener('keydown', (e) => {
     removeSwitchToast();
   }
 });
+
+// Clicking a project row puts the cursor in the message box, ready to type.
+function focusChatInput() {
+  const input = document.getElementById('chat-input');
+  if (input && input.offsetParent !== null) input.focus();
+}
